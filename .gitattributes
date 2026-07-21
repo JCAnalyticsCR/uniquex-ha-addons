@@ -1,0 +1,4 @@
+# Los scripts de shell DEBEN quedar con saltos de línea LF aunque se editen en
+# Windows — si quedan CRLF, el add-on falla al arrancar ("bad interpreter").
+*.sh text eol=lf
+run.sh text eol=lf

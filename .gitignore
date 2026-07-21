@@ -1,0 +1,20 @@
+# Secretos y datos — NUNCA subir al repo del add-on (fix B7)
+.env
+.env.*
+*.key
+*.pem
+mirror_api_key
+session_secret
+iframe_token_secret
+*.sqlite3
+*.sqlite3-*
+/data/
+secrets/
+
+# Artefactos de Python (no van al repo)
+__pycache__/
+*.py[cod]
+*.egg-info/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/

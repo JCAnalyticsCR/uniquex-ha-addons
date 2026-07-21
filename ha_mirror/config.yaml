@@ -1,0 +1,35 @@
+name: UniquexCR Mirror
+version: "0.1.0"
+slug: ha_mirror
+description: >-
+  Mirror del frontend de lujo UniquexCR. Se conecta a Home Assistant de forma
+  LOCAL (token del Supervisor, sin LLAT ni túnel) y expone estado + control por
+  WebSocket para la app remota.
+url: https://github.com/JCAnalyticsCR/uniquex-ha-addons/tree/main/ha_mirror
+# Arquitecturas soportadas: mini PC Intel (amd64) y ARM 64-bit (aarch64 / Pi 4-5 64-bit)
+arch:
+  - amd64
+  - aarch64
+startup: application
+boot: auto
+init: false
+# homeassistant_api: true → HA inyecta SUPERVISOR_TOKEN y da acceso al Core API
+# local (http://supervisor/core y ws://supervisor/core/websocket). Con esto el
+# Mirror NO necesita el LLAT de 10 años.
+homeassistant_api: true
+hassio_api: false
+host_network: false
+# Expone el puerto interno 8000 del Mirror en el puerto 8099 del host, para que
+# el add-on de Cloudflared lo pueda enrutar por el túnel hacia el frontend.
+ports:
+  "8000/tcp": 8099
+ports_description:
+  "8000/tcp": "Puerto del Mirror — se expone por el túnel Cloudflare hacia el frontend"
+options:
+  mirror_api_key: ""
+  frontend_origin: ""
+  log_level: INFO
+schema:
+  mirror_api_key: "password"
+  frontend_origin: "str?"
+  log_level: "list(DEBUG|INFO|WARNING|ERROR)?"

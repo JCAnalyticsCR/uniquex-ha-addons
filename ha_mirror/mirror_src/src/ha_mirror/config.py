@@ -1,0 +1,252 @@
+"""
+Configuración del mirror vía pydantic-settings.
+
+Lee variables de entorno (o .env) y descifra el LLAT con Fernet.
+El LLAT nunca queda expuesto en repr ni en logs gracias a SecretStr.
+"""
+
+from __future__ import annotations
+
+from functools import lru_cache
+from pathlib import Path
+
+from cryptography.fernet import Fernet, InvalidToken
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from ha_mirror.errors import MirrorConfigError
+
+
+class Settings(BaseSettings):
+    """Variables de configuración del mirror. Todas vienen de env o .env."""
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        case_sensitive=False,
+    )
+
+    # -------------------------------------------------------------------------
+    # Home Assistant upstream
+    # -------------------------------------------------------------------------
+    ha_url: str = Field(
+        description="URL WebSocket de HA: ws://100.x.x.x:8123/api/websocket "
+        "o ws://supervisor/core/websocket cuando corre como add-on de HA"
+    )
+
+    # --- Autenticación a HA: dos modos mutuamente excluyentes ---
+    # Modo add-on (recomendado): token crudo del Supervisor de HA. Se lee de
+    # HA_TOKEN o SUPERVISOR_TOKEN (esta última la inyecta HA al add-on cuando
+    # tiene homeassistant_api: true). No requiere LLAT ni Fernet.
+    ha_token: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("ha_token", "supervisor_token"),
+        description=(
+            "Token de acceso crudo a HA. En modo add-on es el token del "
+            "Supervisor (SUPERVISOR_TOKEN). Si se define, se ignoran el LLAT "
+            "cifrado y la Fernet key."
+        ),
+    )
+    # Modo standalone (legacy): LLAT cifrado con Fernet. Solo se usa si ha_token
+    # NO está definido.
+    ha_llat_enc_path: Path | None = Field(
+        default=None,
+        description="Path al archivo LLAT cifrado con Fernet (modo standalone)",
+    )
+    fernet_key_path: Path | None = Field(
+        default=None,
+        description="Path a la Fernet master key (modo standalone)",
+    )
+
+    # -------------------------------------------------------------------------
+    # Seguridad del mirror
+    # -------------------------------------------------------------------------
+    mirror_api_key: SecretStr = Field(
+        description=(
+            "API key primaria para autenticar el frontend. "
+            "Longitud minima: 32 caracteres (256 bits de entropía). "
+            "Si se define MIRROR_API_KEYS, este campo sirve como fallback."
+        )
+    )
+    mirror_api_keys: SecretStr | None = Field(
+        default=None,
+        description=(
+            "Lista de API keys activas separadas por coma para rotacion "
+            "zero-downtime. Ej: MIRROR_API_KEYS=key1,key2,key3. "
+            "Cuando esta definida, MIRROR_API_KEY queda como fallback ignorado. "
+            "Permite hasta 3 keys simultaneas: dar de alta la nueva key, "
+            "actualizar el cliente para usarla, luego revocar la vieja."
+        ),
+    )
+    session_secret: SecretStr = Field(
+        description="Secret para firmar cookies de sesión"
+    )
+    iframe_token_secret: SecretStr = Field(
+        description="Secret para firmar URLs de iframe (itsdangerous)"
+    )
+
+    # -------------------------------------------------------------------------
+    # Red
+    # -------------------------------------------------------------------------
+    mirror_host: str = Field(default="127.0.0.1")
+    mirror_port: int = Field(default=8000)
+    frontend_origin: str | None = Field(
+        default=None,
+        description=(
+            "Origen(es) del frontend en producción para CORS, separados por coma "
+            "(ej. https://fortunatta.up.railway.app)."
+        ),
+    )
+    tailscale_serve_ha_hostname: str = Field(
+        default="ha-gateway.example.ts.net",
+        description="Hostname del HA en el tailnet con TLS"
+    )
+    tailscale_serve_mirror_hostname: str = Field(
+        default="mirror.example.ts.net",
+        description="Hostname del mirror en el tailnet (para CORS)"
+    )
+
+    # -------------------------------------------------------------------------
+    # Storage y logs
+    # -------------------------------------------------------------------------
+    mirror_db_path: Path = Field(default=Path("/var/lib/ha-mirror/mirror.sqlite3"))
+    log_level: str = Field(default="INFO")
+    # Fix C3 — /docs, /redoc y /openapi.json NO se exponen en producción.
+    # Solo se habilitan si EXPOSE_DOCS=true (útil en desarrollo).
+    expose_docs: bool = Field(
+        default=False,
+        description="Si true, expone /docs, /redoc y /openapi.json. Default false (prod).",
+    )
+
+    # -------------------------------------------------------------------------
+    # Parámetros operacionales (con defaults razonables)
+    # -------------------------------------------------------------------------
+    upstream_ping_interval: float = Field(default=30.0, description="Segundos entre pings")
+    upstream_ping_timeout: float = Field(default=10.0, description="Timeout espera pong")
+    service_call_timeout: float = Field(default=5.0, description="Timeout service call (202 fallback)")
+    ws_queue_maxsize: int = Field(default=1000, description="Tamaño máx de queue por suscriptor WS")
+    events_log_retention_days: int = Field(default=7, description="Retención del log de eventos")
+    iframe_token_ttl_seconds: int = Field(default=900, description="TTL de tokens iframe (15 min)")
+
+    # -------------------------------------------------------------------------
+    # Multi-tenant en frío: tenant_id constante
+    # -------------------------------------------------------------------------
+    tenant_id: int = Field(default=1, description="ID del tenant único (N=1)")
+
+    @field_validator("ha_url")
+    @classmethod
+    def validate_ha_url(cls, v: str) -> str:
+        """Asegura que la URL sea ws:// o wss://."""
+        if not v.startswith(("ws://", "wss://")):
+            raise ValueError("ha_url debe comenzar con ws:// o wss://")
+        return v
+
+    @field_validator("mirror_api_key")
+    @classmethod
+    def validate_mirror_api_key_length(cls, v: SecretStr) -> SecretStr:
+        """
+        Exige longitud minima de 32 bytes (256 bits) para la API key primaria.
+        Genera un openssl rand -hex 32 para cumplir este requisito.
+        """
+        raw = v.get_secret_value()
+        if len(raw.encode()) < 32:
+            raise ValueError(
+                "MIRROR_API_KEY debe tener al menos 32 bytes (256 bits). "
+                "Generar con: openssl rand -hex 32"
+            )
+        return v
+
+    @model_validator(mode="after")
+    def validate_auth_config(self) -> "Settings":
+        """
+        Valida la configuración de autenticación a HA.
+
+        Modo add-on: ha_token definido → no se requieren archivos Fernet.
+        Modo standalone: ha_token ausente → ha_llat_enc_path y fernet_key_path
+        deben existir en disco.
+        """
+        if self.ha_token is not None:
+            return self  # Modo add-on/Supervisor: token directo, sin Fernet
+
+        # Modo standalone: exige el LLAT cifrado + Fernet key
+        if self.ha_llat_enc_path is None or self.fernet_key_path is None:
+            raise MirrorConfigError(
+                "Sin HA_TOKEN definido: se requieren HA_LLAT_ENC_PATH y "
+                "FERNET_KEY_PATH (modo standalone), o bien definir HA_TOKEN "
+                "(modo add-on de HA)."
+            )
+        for p, label in [
+            (self.ha_llat_enc_path, "LLAT cifrado"),
+            (self.fernet_key_path, "Fernet key"),
+        ]:
+            if not p.exists():
+                raise MirrorConfigError(
+                    f"Archivo de {label} no encontrado: {p}. "
+                    "Verificar que el agente #5 (secrets) haya corrido."
+                )
+        return self
+
+    def get_ha_token(self) -> str:
+        """
+        Retorna el token de acceso a HA en texto plano.
+
+        Modo add-on: devuelve ha_token (token del Supervisor) directamente.
+        Modo standalone: descifra el LLAT con Fernet.
+        Mantener el resultado en memoria solo el tiempo necesario.
+        """
+        if self.ha_token is not None:
+            return self.ha_token.get_secret_value()
+        return self.load_llat()
+
+    def load_llat(self) -> str:
+        """
+        Descifra y retorna el LLAT en texto plano.
+
+        El resultado solo debe mantenerse en memoria el tiempo necesario.
+        Nunca loggear, nunca persistir en variables de larga vida fuera de HAUpstream.
+        """
+        if self.fernet_key_path is None or self.ha_llat_enc_path is None:
+            raise MirrorConfigError(
+                "load_llat() requiere ha_llat_enc_path y fernet_key_path (modo standalone)"
+            )
+        try:
+            key = self.fernet_key_path.read_bytes().strip()
+            f = Fernet(key)
+            ciphertext = self.ha_llat_enc_path.read_bytes()
+            return f.decrypt(ciphertext).decode("utf-8")
+        except InvalidToken as exc:
+            raise MirrorConfigError(
+                "No se pudo descifrar el LLAT — Fernet key incorrecta o archivo corrupto"
+            ) from exc
+        except OSError as exc:
+            raise MirrorConfigError(f"Error al leer archivos de secretos: {exc}") from exc
+
+    @property
+    def ha_https_url(self) -> str:
+        """URL HTTP(S) base de HA derivada del WS URL."""
+        return self.ha_url.replace("ws://", "http://").replace("wss://", "https://").replace(
+            "/api/websocket", ""
+        )
+
+    @property
+    def allowed_origins(self) -> list[str]:
+        """
+        Orígenes permitidos para CORS.
+
+        Fix M2 — en producción (con frontend_origin definido) NO se permiten
+        los orígenes localhost; solo el/los frontend real(es).
+        """
+        if self.frontend_origin:
+            return [o.strip() for o in self.frontend_origin.split(",") if o.strip()]
+        # Modo dev: sin frontend_origin de producción.
+        return [
+            f"https://{self.tailscale_serve_mirror_hostname}",
+            "http://localhost:3000",
+            "http://localhost:5173",
+        ]
+
+
+@lru_cache(maxsize=1)
+def get_settings() -> Settings:
+    """Instancia única de Settings (cacheada). Usar como dependencia FastAPI."""
+    return Settings()  # type: ignore[call-arg]
