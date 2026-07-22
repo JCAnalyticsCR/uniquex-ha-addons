@@ -18,6 +18,13 @@ gen_secret() { python3 -c "import secrets; print(secrets.token_hex(32))"; }
 API_KEY="$(opt mirror_api_key)"
 FRONTEND_ORIGIN="$(opt frontend_origin)"
 LOG_LEVEL="$(opt log_level)"; LOG_LEVEL="${LOG_LEVEL:-INFO}"
+GO2RTC_BASE_URL="$(opt go2rtc_base_url)"
+GO2RTC_USERNAME="$(opt go2rtc_username)"
+GO2RTC_PASSWORD="$(opt go2rtc_password)"
+CAMERA_STREAM_MAP="$(opt camera_stream_map)"
+if [ -z "${CAMERA_STREAM_MAP}" ] || [ "${CAMERA_STREAM_MAP}" = "null" ]; then
+  CAMERA_STREAM_MAP='{}'
+fi
 
 # --- MIRROR_API_KEY (se comparte con el frontend) ---
 # Fix C5/A2/M6 — la key es OBLIGATORIA (config.yaml la exige) y NUNCA se
@@ -57,6 +64,16 @@ export LOG_LEVEL="${LOG_LEVEL}"
 if [ -n "${FRONTEND_ORIGIN}" ] && [ "${FRONTEND_ORIGIN}" != "null" ]; then
   export FRONTEND_ORIGIN="${FRONTEND_ORIGIN}"
 fi
+if [ -n "${GO2RTC_BASE_URL}" ] && [ "${GO2RTC_BASE_URL}" != "null" ]; then
+  export GO2RTC_BASE_URL="${GO2RTC_BASE_URL}"
+fi
+if [ -n "${GO2RTC_USERNAME}" ] && [ "${GO2RTC_USERNAME}" != "null" ]; then
+  export GO2RTC_USERNAME="${GO2RTC_USERNAME}"
+fi
+if [ -n "${GO2RTC_PASSWORD}" ] && [ "${GO2RTC_PASSWORD}" != "null" ]; then
+  export GO2RTC_PASSWORD="${GO2RTC_PASSWORD}"
+fi
+export CAMERA_STREAM_MAP="${CAMERA_STREAM_MAP}"
 
 echo "[mirror] Arrancando → HA local (ws://supervisor/core/websocket) en :8000"
 exec python3 -m uvicorn ha_mirror.main:app \

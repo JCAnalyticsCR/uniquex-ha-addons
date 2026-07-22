@@ -13,9 +13,15 @@ Usa el **token del Supervisor** (el add-on tiene `homeassistant_api: true`), con
 
 | Opción | Requerido | Descripción |
 |---|---|---|
-| `mirror_api_key` | Recomendado | Clave que autentica al frontend. Debe ser la **misma** que configurás en el frontend (Railway). Mínimo 32 bytes (`openssl rand -hex 32`). Si la dejás vacía, el add-on genera una y la muestra en el Log. |
+| `mirror_api_key` | Sí | Clave que autentica al frontend. Debe ser la **misma** que configurás en Railway. Mínimo 32 bytes (`openssl rand -hex 32`). El add-on no arranca si está vacía. |
 | `frontend_origin` | Opcional | Origen del frontend en producción para CORS, ej. `https://fortunatta.up.railway.app`. Separá varios con coma. |
 | `log_level` | Opcional | `DEBUG` \| `INFO` \| `WARNING` \| `ERROR`. Default `INFO`. |
+| `go2rtc_base_url` | Opcional | URL interna del API go2rtc, nunca una URL pública. |
+| `go2rtc_username` | Opcional | Usuario HTTP Basic configurado en go2rtc. |
+| `go2rtc_password` | Opcional | Password HTTP Basic configurado en go2rtc. |
+| `camera_stream_map` | Opcional | JSON que relaciona cada `camera.entity_id` con su stream go2rtc. |
+
+Sin las opciones go2rtc, snapshots funciona normalmente y WebRTC queda deshabilitado.
 
 ## Puerto
 

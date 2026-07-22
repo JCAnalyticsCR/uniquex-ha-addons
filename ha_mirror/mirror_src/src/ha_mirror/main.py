@@ -18,24 +18,26 @@ corriendo (health endpoint muestra AUTH_FAILED, servicio disponible para diagnó
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
-from typing import AsyncIterator
 
 import structlog
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
-from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from ha_mirror.api.areas import router as areas_router
+from ha_mirror.api.camera_media import router as camera_media_router
 from ha_mirror.api.entities import router as entities_router
 from ha_mirror.api.health import router as health_router
 from ha_mirror.api.iframe_token import router as iframe_router
 from ha_mirror.api.service import router as service_router
 from ha_mirror.api.ws_state import router as ws_router
 from ha_mirror.auth import require_api_key
+from ha_mirror.camera_media import CameraMediaClient
 from ha_mirror.config import get_settings
 from ha_mirror.correlations import CorrelationTracker
 from ha_mirror.db import Database
@@ -169,6 +171,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         service_call_timeout=settings.service_call_timeout,
     )
 
+    # Cliente HTTP interno para snapshots HA y señalizacion go2rtc. Las
+    # credenciales viven solo en memoria dentro del add-on Mirror.
+    camera_media = CameraMediaClient(
+        ha_base_url=settings.ha_http_url,
+        ha_token=ha_token,
+        go2rtc_base_url=settings.go2rtc_base_url,
+        go2rtc_username=settings.go2rtc_username,
+        go2rtc_password=(
+            settings.go2rtc_password.get_secret_value()
+            if settings.go2rtc_password is not None
+            else None
+        ),
+        camera_streams=settings.camera_streams,
+    )
+    await camera_media.start()
+
     # Borrar el token de la variable local lo antes posible
     # (Python no garantiza wipe de memoria, pero reducimos ventana de exposición)
     del ha_token
@@ -179,6 +197,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.correlations = correlations
     app.state.db = db
     app.state.settings = settings
+    app.state.camera_media = camera_media
 
     # 6. Lanzar el upstream como task supervisado
     upstream_task = asyncio.create_task(upstream.run_forever(), name="ha_upstream")
@@ -209,6 +228,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         upstream_task.cancel()
         with suppress(asyncio.CancelledError, Exception):
             await upstream_task
+        await camera_media.close()
         await db.close()
         logger.info("mirror.stopped")
 
@@ -252,6 +272,7 @@ def create_app() -> FastAPI:
     app.include_router(areas_router)
     app.include_router(service_router)
     app.include_router(iframe_router)
+    app.include_router(camera_media_router)
 
     # Router WebSocket
     app.include_router(ws_router)

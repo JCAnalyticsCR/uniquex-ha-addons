@@ -1,5 +1,5 @@
 name: UniquexCR Mirror
-version: "0.1.0"
+version: "0.2.0"
 slug: ha_mirror
 description: >-
   Mirror del frontend de lujo UniquexCR. Se conecta a Home Assistant de forma
@@ -29,7 +29,15 @@ options:
   mirror_api_key: ""
   frontend_origin: ""
   log_level: INFO
+  go2rtc_base_url: ""
+  go2rtc_username: ""
+  go2rtc_password: ""
+  camera_stream_map: "{}"
 schema:
   mirror_api_key: "password"
   frontend_origin: "str?"
   log_level: "list(DEBUG|INFO|WARNING|ERROR)?"
+  go2rtc_base_url: "str?"
+  go2rtc_username: "str?"
+  go2rtc_password: "password?"
+  camera_stream_map: "str?"

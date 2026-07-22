@@ -7,6 +7,8 @@ El LLAT nunca queda expuesto en repr ni en logs gracias a SecretStr.
 
 from __future__ import annotations
 
+import json
+import re
 from functools import lru_cache
 from pathlib import Path
 
@@ -97,6 +99,28 @@ class Settings(BaseSettings):
             "(ej. https://fortunatta.up.railway.app)."
         ),
     )
+    go2rtc_base_url: str | None = Field(
+        default=None,
+        description=(
+            "URL interna de go2rtc (por ejemplo http://go2rtc:1984). "
+            "Nunca debe apuntar a una interfaz publica."
+        ),
+    )
+    go2rtc_username: str | None = Field(
+        default=None,
+        description="Usuario HTTP Basic de go2rtc, si esta habilitado.",
+    )
+    go2rtc_password: SecretStr | None = Field(
+        default=None,
+        description="Password HTTP Basic de go2rtc, si esta habilitado.",
+    )
+    camera_stream_map: str = Field(
+        default="{}",
+        description=(
+            "JSON que relaciona camera.entity_id con un nombre de stream go2rtc. "
+            'Ejemplo: {"camera.entrada":"entrada_sub"}'
+        ),
+    )
     tailscale_serve_ha_hostname: str = Field(
         default="ha-gateway.example.ts.net",
         description="Hostname del HA en el tailnet con TLS"
@@ -141,6 +165,34 @@ class Settings(BaseSettings):
             raise ValueError("ha_url debe comenzar con ws:// o wss://")
         return v
 
+    @field_validator("go2rtc_base_url")
+    @classmethod
+    def validate_go2rtc_base_url(cls, v: str | None) -> str | None:
+        if v is None or not v.strip():
+            return None
+        value = v.strip().rstrip("/")
+        if not value.startswith(("http://", "https://")):
+            raise ValueError("go2rtc_base_url debe comenzar con http:// o https://")
+        return value
+
+    @field_validator("camera_stream_map")
+    @classmethod
+    def validate_camera_stream_map(cls, v: str) -> str:
+        try:
+            parsed = json.loads(v or "{}")
+        except json.JSONDecodeError as exc:
+            raise ValueError("camera_stream_map debe ser JSON valido") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("camera_stream_map debe ser un objeto JSON")
+        entity_pattern = re.compile(r"^camera\.[a-z0-9_]+$")
+        stream_pattern = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+        for entity_id, stream_name in parsed.items():
+            if not isinstance(entity_id, str) or not entity_pattern.fullmatch(entity_id):
+                raise ValueError(f"Entidad de camara invalida en camera_stream_map: {entity_id!r}")
+            if not isinstance(stream_name, str) or not stream_pattern.fullmatch(stream_name):
+                raise ValueError(f"Nombre de stream go2rtc invalido para {entity_id}")
+        return json.dumps(parsed, separators=(",", ":"), sort_keys=True)
+
     @field_validator("mirror_api_key")
     @classmethod
     def validate_mirror_api_key_length(cls, v: SecretStr) -> SecretStr:
@@ -157,7 +209,7 @@ class Settings(BaseSettings):
         return v
 
     @model_validator(mode="after")
-    def validate_auth_config(self) -> "Settings":
+    def validate_auth_config(self) -> Settings:
         """
         Valida la configuración de autenticación a HA.
 
@@ -224,9 +276,22 @@ class Settings(BaseSettings):
     @property
     def ha_https_url(self) -> str:
         """URL HTTP(S) base de HA derivada del WS URL."""
-        return self.ha_url.replace("ws://", "http://").replace("wss://", "https://").replace(
-            "/api/websocket", ""
-        )
+        return self.ha_http_url
+
+    @property
+    def ha_http_url(self) -> str:
+        """URL HTTP(S) base de HA, compatible con Core y proxy del Supervisor."""
+        value = self.ha_url.replace("ws://", "http://", 1).replace("wss://", "https://", 1)
+        for suffix in ("/api/websocket", "/websocket"):
+            if value.endswith(suffix):
+                return value[: -len(suffix)]
+        return value.rstrip("/")
+
+    @property
+    def camera_streams(self) -> dict[str, str]:
+        """Mapa validado de entidades HA a nombres internos de go2rtc."""
+        parsed = json.loads(self.camera_stream_map)
+        return {str(key): str(value) for key, value in parsed.items()}
 
     @property
     def allowed_origins(self) -> list[str]:
