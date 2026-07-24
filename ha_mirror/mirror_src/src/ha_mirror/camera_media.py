@@ -60,9 +60,10 @@ class CameraMediaClient:
         )
         self._camera_streams = dict(camera_streams)
         self._session: aiohttp.ClientSession | None = None
-        self._snapshot_slots = asyncio.Semaphore(4)
+        self._snapshot_slots = asyncio.Semaphore(24)
         self._webrtc_slots = asyncio.Semaphore(4)
-        self._stream_slots = asyncio.Semaphore(6)
+        # La cuadrícula de Fortunata muestra 20 substreams simultáneos.
+        self._stream_slots = asyncio.Semaphore(24)
 
     async def start(self) -> None:
         """Crea una sesion HTTP reutilizable; llamar durante lifespan."""
@@ -88,7 +89,10 @@ class CameraMediaClient:
         return self._session
 
     async def get_snapshot(self, entity_id: str) -> SnapshotPayload:
-        """Obtiene una imagen fija desde el proxy de camara de HA."""
+        """Obtiene una imagen fija desde go2rtc o el proxy de camara de HA."""
+        if self.has_stream(entity_id):
+            return await self._get_go2rtc_snapshot(entity_id)
+
         session = self._require_session()
         url = f"{self._ha_base_url}/api/camera_proxy/{entity_id}"
         headers = {
@@ -127,6 +131,49 @@ class CameraMediaClient:
             raise CameraMediaError("ha_snapshot_timeout", 504) from exc
         except aiohttp.ClientError as exc:
             raise CameraMediaError("ha_snapshot_connection_failed", 502) from exc
+
+    async def _get_go2rtc_snapshot(self, entity_id: str) -> SnapshotPayload:
+        """Extrae un JPEG del stream go2rtc allowlisted para camaras virtuales."""
+        session = self._require_session()
+        if not self._go2rtc_base_url:
+            raise CameraMediaError("go2rtc_not_configured", 503)
+        stream_name = self._camera_streams.get(entity_id)
+        if stream_name is None:
+            raise CameraMediaError("camera_stream_not_configured", 404)
+
+        encoded = quote(stream_name, safe="")
+        url = f"{self._go2rtc_base_url}/api/frame.jpeg?src={encoded}"
+        try:
+            async with self._snapshot_slots, session.get(
+                url,
+                headers={"Accept": "image/jpeg"},
+                auth=self._go2rtc_auth,
+                allow_redirects=False,
+            ) as response:
+                if response.status == 404:
+                    raise CameraMediaError("go2rtc_stream_not_found", 404)
+                if response.status in {401, 403}:
+                    raise CameraMediaError("go2rtc_auth_failed", 502)
+                if response.status >= 400:
+                    raise CameraMediaError("go2rtc_snapshot_failed", 502)
+
+                content_type = (
+                    response.headers.get("Content-Type", "").split(";", 1)[0].lower()
+                )
+                if content_type != "image/jpeg":
+                    raise CameraMediaError("invalid_snapshot_content_type", 502)
+                body = await response.content.read(self._MAX_SNAPSHOT_BYTES + 1)
+                if not body:
+                    raise CameraMediaError("empty_snapshot", 502)
+                if len(body) > self._MAX_SNAPSHOT_BYTES:
+                    raise CameraMediaError("snapshot_too_large", 502)
+                return SnapshotPayload(body=body, content_type=content_type)
+        except CameraMediaError:
+            raise
+        except TimeoutError as exc:
+            raise CameraMediaError("go2rtc_snapshot_timeout", 504) from exc
+        except aiohttp.ClientError as exc:
+            raise CameraMediaError("go2rtc_connection_failed", 502) from exc
 
     async def exchange_webrtc_offer(
         self,

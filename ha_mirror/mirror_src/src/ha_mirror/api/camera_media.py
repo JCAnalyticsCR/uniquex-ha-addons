@@ -18,9 +18,11 @@ _MAX_SDP_CHARS = 256 * 1024
 
 
 def _validate_camera(request: Request, entity_id: str) -> None:
-    """Solo permite entidades camera existentes en el cache de HA."""
+    """Permite camaras de HA o IDs virtuales presentes en el mapa allowlist."""
     if not _ENTITY_ID_PATTERN.fullmatch(entity_id):
         raise HTTPException(status_code=400, detail="Invalid camera entity")
+    if request.app.state.camera_media.has_stream(entity_id):
+        return
     summary = request.app.state.store.get_entity_summary(entity_id)
     if summary is None or summary.domain != "camera":
         raise HTTPException(status_code=404, detail="Camera not found")
