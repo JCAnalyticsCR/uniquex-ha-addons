@@ -3,12 +3,14 @@ Modelos Pydantic v2 para el dominio del mirror.
 
 HaState y derivados: shape de los objetos que vienen de HA.
 ServiceCallRequest: shape de los requests del frontend al mirror.
+Scene / SceneInput / SceneStep: escenas custom del cliente (CRUD /api/scenes).
 """
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -180,6 +182,123 @@ class HealthResponse(BaseModel):
     ws_reconnects_total: int
     connected_ws_clients: int
     tenant_id: int
+
+
+# ---------------------------------------------------------------------------
+# Escenas custom del cliente (CRUD /api/scenes)
+#
+# Concepto PARALELO a las entidades `scene.*` de HA: estas viven en la SQLite
+# del mirror, las arma el usuario desde la app y son una lista ordenada de
+# service calls. El contrato (slugs de icono/acento, límites) está congelado:
+# el frontend depende de él, no cambiar sin coordinar ambos lados.
+# ---------------------------------------------------------------------------
+
+# Set fijo de iconos — el frontend mapea cada slug a un SVG propio.
+SceneIcon = Literal[
+    "moon",
+    "sun",
+    "home",
+    "away",
+    "movie",
+    "gym",
+    "party",
+    "sleep",
+    "shield",
+    "sparkles",
+]
+
+# Set fijo de acentos — cada uno es un gradiente del tema "Cálido hogareño".
+SceneAccent = Literal["warm", "cool", "gold", "green", "neutral"]
+
+# Límites del contrato. Se validan acá (no en el router) para que el CRUD y
+# cualquier otro consumidor del modelo compartan exactamente las mismas reglas.
+SCENE_NAME_MAX = 60
+SCENE_DESCRIPTION_MAX = 160
+SCENE_STEPS_MAX = 64
+SCENE_CAMERAS_MAX = 12
+SCENE_STEP_DATA_MAX_KEYS = 12
+
+# Máximo de escenas por tenant. Es un tope de cordura: la lista completa viaja
+# en cada GET /api/scenes y se renderiza entera en la app.
+SCENES_PER_TENANT_MAX = 60
+
+_SCENE_STEP_SCALARS = (str, int, float, bool)
+_SCENE_CAMERA_PATTERN = re.compile(r"^camera\.[a-z0-9_]+$")
+
+
+def _es_valor_de_paso_valido(valor: Any) -> bool:
+    """Escalar simple o lista plana de escalares. Nada anidado más profundo."""
+    if isinstance(valor, _SCENE_STEP_SCALARS):
+        return True
+    if isinstance(valor, list):
+        return all(isinstance(item, _SCENE_STEP_SCALARS) for item in valor)
+    return False
+
+
+class SceneStep(BaseModel):
+    """Una acción de la escena: un service call de HA sobre una entidad."""
+
+    domain: str = Field(pattern=r"^[a-z_]{1,32}$")
+    service: str = Field(pattern=r"^[a-z_]{1,32}$")
+    entity_id: str = Field(pattern=r"^[a-z_]+\.[a-z0-9_]+$")
+    data: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validar_paso(self) -> SceneStep:
+        """
+        El entity_id tiene que pertenecer al domain del paso.
+
+        Sin esto se podría guardar {"domain":"light","entity_id":"hassio.x"} y
+        pasar la deny-list (que mira el domain declarado) mientras HA ejecuta
+        sobre otra cosa. El chequeo cierra ese hueco en el momento de guardar.
+        """
+        if self.entity_id.split(".", 1)[0] != self.domain:
+            raise ValueError(f"entity_id '{self.entity_id}' no pertenece al domain '{self.domain}'")
+        if len(self.data) > SCENE_STEP_DATA_MAX_KEYS:
+            raise ValueError(f"data admite como maximo {SCENE_STEP_DATA_MAX_KEYS} claves")
+        for clave, valor in self.data.items():
+            if not isinstance(clave, str):
+                raise ValueError("las claves de data deben ser strings")
+            if not _es_valor_de_paso_valido(valor):
+                raise ValueError(
+                    f"valor invalido en data['{clave}']: solo str, int, float, bool "
+                    "o listas planas de esos tipos"
+                )
+        return self
+
+
+class SceneInput(BaseModel):
+    """Body de POST /api/scenes y PUT /api/scenes/{scene_id}."""
+
+    name: str = Field(min_length=1, max_length=SCENE_NAME_MAX)
+    icon: SceneIcon
+    accent: SceneAccent
+    description: str = Field(default="", max_length=SCENE_DESCRIPTION_MAX)
+    confirm_required: bool = False
+    steps: list[SceneStep] = Field(min_length=1, max_length=SCENE_STEPS_MAX)
+    cameras: list[str] = Field(default_factory=list, max_length=SCENE_CAMERAS_MAX)
+
+    @model_validator(mode="after")
+    def validar_escena(self) -> SceneInput:
+        """Nombre sin espacios de relleno y cámaras destacadas del dominio camera."""
+        self.name = self.name.strip()
+        if not self.name:
+            raise ValueError("name no puede ser solo espacios")
+        for entity_id in self.cameras:
+            if not _SCENE_CAMERA_PATTERN.fullmatch(entity_id):
+                raise ValueError(f"camara invalida: {entity_id!r}")
+        if len(set(self.cameras)) != len(self.cameras):
+            raise ValueError("cameras no admite entidades repetidas")
+        return self
+
+
+class Scene(SceneInput):
+    """Escena persistida — lo que devuelve el mirror al frontend."""
+
+    id: str
+    created_at: str
+    updated_at: str
+    last_activated_at: str | None = None
 
 
 # ---------------------------------------------------------------------------

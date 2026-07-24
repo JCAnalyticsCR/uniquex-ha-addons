@@ -28,6 +28,67 @@ sin volver a desplegar el frontend.
 
 Sin las opciones go2rtc, snapshots funciona normalmente y WebRTC queda deshabilitado.
 
+## Escenas custom (desde 0.5.0)
+
+Las **escenas** son listas ordenadas de acciones que el usuario arma desde la app ("Buenas noches" =
+apagar switches + bajar persianas). Se guardan en la SQLite del add-on (`/data`, sobreviven
+reinicios y actualizaciones) y **no** son las entidades `scene.*` de Home Assistant: son un concepto
+paralelo, propio de UniquexCR. No hay ninguna opción de configuración nueva que tocar.
+
+Todos los endpoints exigen el header `X-API-Key`, igual que el resto del Mirror.
+
+| Método | Ruta | Respuesta |
+|---|---|---|
+| `GET` | `/api/scenes` | `200 {"scenes":[...],"count":N}` |
+| `POST` | `/api/scenes` | `201` con la escena creada (el `id` lo genera el Mirror) |
+| `GET` | `/api/scenes/{scene_id}` | `200` con la escena, o `404` |
+| `PUT` | `/api/scenes/{scene_id}` | `200` con la escena reemplazada, o `404` |
+| `DELETE` | `/api/scenes/{scene_id}` | `204`, o `404` |
+| `POST` | `/api/scenes/{scene_id}/activate` | `202 {"scene_id":...,"steps":N,"correlation_ids":[...]}` |
+
+Cuerpo de `POST` / `PUT`:
+
+```json
+{
+  "name": "Buenas noches",
+  "icon": "moon",
+  "accent": "warm",
+  "description": "Apaga todo y baja las persianas",
+  "confirm_required": false,
+  "steps": [
+    {"domain": "switch", "service": "turn_off", "entity_id": "switch.10016f4c4b", "data": {}},
+    {"domain": "cover", "service": "set_cover_position", "entity_id": "cover.terraza_1",
+     "data": {"position": 0}}
+  ],
+  "cameras": ["camera.nvr_c08_garaje"]
+}
+```
+
+Límites validados por el add-on (devuelve `422` si no se cumplen):
+
+| Campo | Regla |
+|---|---|
+| `name` | 1 a 60 caracteres |
+| `icon` | `moon` \| `sun` \| `home` \| `away` \| `movie` \| `gym` \| `party` \| `sleep` \| `shield` \| `sparkles` |
+| `accent` | `warm` \| `cool` \| `gold` \| `green` \| `neutral` |
+| `description` | hasta 160 caracteres |
+| `steps` | 1 a 64 pasos; el prefijo del `entity_id` tiene que coincidir con el `domain` del paso |
+| `steps[].data` | hasta 12 claves; valores `str`, `int`, `float`, `bool` o listas planas de esos |
+| `cameras` | hasta 12 entidades `camera.*`, sin repetidos |
+| Total | hasta 60 escenas guardadas |
+
+**Seguridad.** Cada paso pasa por la misma lista negra de servicios administrativos que
+`/api/service/...` (`hassio`, `supervisor`, `backup`, `host`, `addon`, `homeassistant.restart`,
+`recorder.purge`, etc.), y la revisa **dos veces**: al guardar y otra vez al activar. Si algún paso
+está en la lista, el Mirror responde `403 {"detail":"service not allowed"}` y no guarda ni ejecuta
+nada. Una API key comprometida sigue sin poder administrar el gateway.
+
+**Activación.** `POST .../activate` responde `202` de inmediato con un `correlation_id` por paso; la
+ejecución sigue en background, en el orden guardado. Cada paso confirma por `/ws/state` con
+`service_complete` o `service_timeout`, igual que un service call suelto. Un paso que falla queda
+registrado y **no** aborta los siguientes. Si el upstream de HA está caído, responde `502` sin
+ejecutar nada.
+
 ## Puerto
 
 El Mirror escucha en el **8000** interno, publicado en el **8099** del host. Exponelo por el túnel

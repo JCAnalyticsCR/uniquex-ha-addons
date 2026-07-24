@@ -9,7 +9,9 @@ pendiente y se resuelve, permitiendo el fan-out de 'service_complete'.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import uuid
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
@@ -44,8 +46,14 @@ class CorrelationTracker:
     def __init__(self) -> None:
         # correlation_id → PendingCorrelation
         self._pending: dict[str, PendingCorrelation] = {}
-        # entity_id → correlation_id (para resolver por entidad afectada)
-        self._entity_map: dict[str, str] = {}
+        # entity_id → cola FIFO de correlation_ids pendientes para esa entidad.
+        # Es una deque (no un solo str) para que varios pasos sobre la MISMA
+        # entidad —una escena que hace set_hvac_mode + set_temperature +
+        # set_fan_mode sobre un climate produce 3 registraciones seguidas— no se
+        # pisen: antes la 2da registracion sobrepasaba a la 1ra y esa 1ra nunca
+        # se resolvia (agotaba su timeout garantizado). Con la cola, cada
+        # state_changed resuelve la correlacion mas antigua todavia pendiente.
+        self._entity_map: dict[str, deque[str]] = {}
         self._lock = asyncio.Lock()
 
     def generate_id(self) -> str:
@@ -68,8 +76,9 @@ class CorrelationTracker:
         async with self._lock:
             self._pending[correlation_id] = corr
             if entity_id:
-                # Si ya hay una correlación para esta entidad, la reemplaza
-                self._entity_map[entity_id] = correlation_id
+                # Encolar (no reemplazar): preserva TODAS las correlaciones
+                # pendientes de la entidad en orden de registracion.
+                self._entity_map.setdefault(entity_id, deque()).append(correlation_id)
 
         logger.debug(
             "correlation.registered",
@@ -85,12 +94,17 @@ class CorrelationTracker:
         Resuelve la correlación pendiente para una entidad.
 
         Retorna el correlation_id resuelto, o None si no había pendiente.
-        Llamado cuando llega un state_changed del upstream.
+        Llamado cuando llega un state_changed del upstream. Resuelve la
+        correlacion MAS ANTIGUA de la entidad (FIFO): si un climate tiene varios
+        pasos encolados, cada state_changed va cerrando de a uno en orden.
         """
         async with self._lock:
-            corr_id = self._entity_map.pop(entity_id, None)
-            if corr_id is None:
+            cola = self._entity_map.get(entity_id)
+            if not cola:
                 return None
+            corr_id = cola.popleft()
+            if not cola:
+                del self._entity_map[entity_id]
             corr = self._pending.pop(corr_id, None)
 
         if corr is None:
@@ -112,7 +126,14 @@ class CorrelationTracker:
         async with self._lock:
             corr = self._pending.pop(correlation_id, None)
             if corr and corr.entity_id:
-                self._entity_map.pop(corr.entity_id, None)
+                # Sacar SOLO este correlation_id de la cola de la entidad, sin
+                # tocar las otras correlaciones que sigan pendientes.
+                cola = self._entity_map.get(corr.entity_id)
+                if cola is not None:
+                    with contextlib.suppress(ValueError):
+                        cola.remove(correlation_id)
+                    if not cola:
+                        del self._entity_map[corr.entity_id]
 
     @property
     def pending_count(self) -> int:

@@ -34,6 +34,7 @@ from ha_mirror.api.camera_media import router as camera_media_router
 from ha_mirror.api.entities import router as entities_router
 from ha_mirror.api.health import router as health_router
 from ha_mirror.api.iframe_token import router as iframe_router
+from ha_mirror.api.scenes import router as scenes_router
 from ha_mirror.api.service import router as service_router
 from ha_mirror.api.ws_state import router as ws_router
 from ha_mirror.auth import require_api_key
@@ -256,7 +257,10 @@ def create_app() -> FastAPI:
         CORSMiddleware,
         allow_origins=settings.allowed_origins,
         allow_credentials=True,
-        allow_methods=["GET", "POST"],
+        # PUT/DELETE los usa el CRUD de escenas. El frontend pega vía el BFF de
+        # Next (server-side, sin preflight), pero sin declararlos acá cualquier
+        # llamada desde el browser al mirror moriría en el preflight.
+        allow_methods=["GET", "POST", "PUT", "DELETE"],
         allow_headers=["X-API-Key", "Content-Type"],
     )
 
@@ -273,6 +277,7 @@ def create_app() -> FastAPI:
     app.include_router(service_router)
     app.include_router(iframe_router)
     app.include_router(camera_media_router)
+    app.include_router(scenes_router)
 
     # Router WebSocket
     app.include_router(ws_router)
