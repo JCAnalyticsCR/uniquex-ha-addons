@@ -121,6 +121,14 @@ class Settings(BaseSettings):
             'Ejemplo: {"camera.entrada":"entrada_sub"}'
         ),
     )
+    camera_labels: str = Field(
+        default="{}",
+        description=(
+            "JSON opcional con el nombre visible de cada camara. Si falta, se "
+            "usa el friendly_name de HA o se deriva del entity_id. "
+            'Ejemplo: {"camera.nvr_c21_gimnasio":"C21 GIMNASIO"}'
+        ),
+    )
     tailscale_serve_ha_hostname: str = Field(
         default="ha-gateway.example.ts.net",
         description="Hostname del HA en el tailnet con TLS"
@@ -191,6 +199,24 @@ class Settings(BaseSettings):
                 raise ValueError(f"Entidad de camara invalida en camera_stream_map: {entity_id!r}")
             if not isinstance(stream_name, str) or not stream_pattern.fullmatch(stream_name):
                 raise ValueError(f"Nombre de stream go2rtc invalido para {entity_id}")
+        return json.dumps(parsed, separators=(",", ":"), sort_keys=True)
+
+    @field_validator("camera_labels")
+    @classmethod
+    def validate_camera_labels(cls, v: str) -> str:
+        """Valida el mapa opcional entity_id -> nombre visible de la camara."""
+        try:
+            parsed = json.loads(v or "{}")
+        except json.JSONDecodeError as exc:
+            raise ValueError("camera_labels debe ser JSON valido") from exc
+        if not isinstance(parsed, dict):
+            raise ValueError("camera_labels debe ser un objeto JSON")
+        entity_pattern = re.compile(r"^camera\.[a-z0-9_]+$")
+        for entity_id, label in parsed.items():
+            if not isinstance(entity_id, str) or not entity_pattern.fullmatch(entity_id):
+                raise ValueError(f"Entidad de camara invalida en camera_labels: {entity_id!r}")
+            if not isinstance(label, str) or not 1 <= len(label) <= 64:
+                raise ValueError(f"Nombre de camara invalido para {entity_id}")
         return json.dumps(parsed, separators=(",", ":"), sort_keys=True)
 
     @field_validator("mirror_api_key")
@@ -291,6 +317,12 @@ class Settings(BaseSettings):
     def camera_streams(self) -> dict[str, str]:
         """Mapa validado de entidades HA a nombres internos de go2rtc."""
         parsed = json.loads(self.camera_stream_map)
+        return {str(key): str(value) for key, value in parsed.items()}
+
+    @property
+    def camera_label_map(self) -> dict[str, str]:
+        """Nombres visibles opcionales por entidad de camara."""
+        parsed = json.loads(self.camera_labels)
         return {str(key): str(value) for key, value in parsed.items()}
 
     @property

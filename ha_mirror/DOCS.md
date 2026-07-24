@@ -20,6 +20,11 @@ Usa el **token del Supervisor** (el add-on tiene `homeassistant_api: true`), con
 | `go2rtc_username` | Opcional | Usuario HTTP Basic configurado en go2rtc. |
 | `go2rtc_password` | Opcional | Password HTTP Basic configurado en go2rtc. |
 | `camera_stream_map` | Opcional | JSON que relaciona cada `camera.entity_id` con su stream go2rtc. |
+| `camera_labels` | Opcional | JSON con el nombre visible de cada cámara, ej. `{"camera.nvr_c21_gimnasio":"C21 GIMNASIO"}`. Si falta, se usa el nombre de HA o se deriva del `entity_id`. |
+
+`GET /api/cameras` devuelve la lista de cámaras (mapa go2rtc + entidades `camera.*` de HA).
+La app la consume tal cual: **agregar una cámara = agregarla a go2rtc y a `camera_stream_map`**,
+sin volver a desplegar el frontend.
 
 Sin las opciones go2rtc, snapshots funciona normalmente y WebRTC queda deshabilitado.
 

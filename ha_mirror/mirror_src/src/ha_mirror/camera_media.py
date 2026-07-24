@@ -83,6 +83,12 @@ class CameraMediaClient:
     def has_stream(self, entity_id: str) -> bool:
         return self.webrtc_enabled and entity_id in self._camera_streams
 
+    def list_stream_entities(self) -> list[str]:
+        """entity_ids con stream go2rtc mapeado (allowlist), en orden estable."""
+        if not self.webrtc_enabled:
+            return []
+        return sorted(self._camera_streams)
+
     def _require_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             raise CameraMediaError("media_client_not_started", 503)

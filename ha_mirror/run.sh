@@ -25,6 +25,10 @@ CAMERA_STREAM_MAP="$(opt camera_stream_map)"
 if [ -z "${CAMERA_STREAM_MAP}" ] || [ "${CAMERA_STREAM_MAP}" = "null" ]; then
   CAMERA_STREAM_MAP='{}'
 fi
+CAMERA_LABELS="$(opt camera_labels)"
+if [ -z "${CAMERA_LABELS}" ] || [ "${CAMERA_LABELS}" = "null" ]; then
+  CAMERA_LABELS='{}'
+fi
 
 # --- MIRROR_API_KEY (se comparte con el frontend) ---
 # Fix C5/A2/M6 — la key es OBLIGATORIA (config.yaml la exige) y NUNCA se
@@ -74,6 +78,7 @@ if [ -n "${GO2RTC_PASSWORD}" ] && [ "${GO2RTC_PASSWORD}" != "null" ]; then
   export GO2RTC_PASSWORD="${GO2RTC_PASSWORD}"
 fi
 export CAMERA_STREAM_MAP="${CAMERA_STREAM_MAP}"
+export CAMERA_LABELS="${CAMERA_LABELS}"
 
 echo "[mirror] Arrancando → HA local (ws://supervisor/core/websocket) en :8000"
 exec python3 -m uvicorn ha_mirror.main:app \

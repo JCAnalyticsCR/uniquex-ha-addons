@@ -7,6 +7,7 @@ from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
 from ha_mirror.auth import require_api_key
 from ha_mirror.camera_media import CameraMediaError
@@ -30,6 +31,76 @@ def _validate_camera(request: Request, entity_id: str) -> None:
 
 def _media_error(exc: CameraMediaError) -> HTTPException:
     return HTTPException(status_code=exc.status_code, detail=exc.code)
+
+
+class CameraInfo(BaseModel):
+    """Camara disponible para la app: entidad de HA o stream go2rtc mapeado."""
+
+    entity_id: str
+    name: str
+    source: str  # "go2rtc" | "homeassistant"
+    snapshot: bool
+    webrtc: bool
+    state: str | None = None
+
+
+class CameraListResponse(BaseModel):
+    cameras: list[CameraInfo]
+    count: int
+
+
+def _derive_name(entity_id: str) -> str:
+    """camera.nvr_c07_costado_garaje -> 'C07 COSTADO GARAJE'."""
+    slug = entity_id.split(".", 1)[1]
+    if slug.startswith("nvr_"):
+        slug = slug[4:]
+    return slug.replace("_", " ").strip().upper() or entity_id
+
+
+@router.get("", response_model=CameraListResponse, summary="Camaras disponibles")
+async def list_cameras(
+    request: Request,
+    _: None = Depends(require_api_key),
+) -> CameraListResponse:
+    """
+    Devuelve la lista de camaras que la app puede mostrar.
+
+    `camera_stream_map` es la lista curada (un canal del NVR por entrada): si
+    tiene contenido, manda ella. Si esta vacia se caen las camaras `camera.*`
+    de Home Assistant, para no dejar la vista sin nada.
+
+    Agregar una camara nueva = agregarla a go2rtc + al mapa del add-on.
+    La app la muestra sola, sin redeploy del frontend.
+    """
+    media = request.app.state.camera_media
+    store = request.app.state.store
+    labels: dict[str, str] = request.app.state.settings.camera_label_map
+
+    summaries = store.get_all_entity_summaries()
+    ha_cameras = {
+        entity_id: summary
+        for entity_id, summary in summaries.items()
+        if summary.domain == "camera"
+    }
+
+    mapped = media.list_stream_entities()
+    entity_ids = sorted(mapped) if mapped else sorted(ha_cameras)
+    cameras: list[CameraInfo] = []
+    for entity_id in entity_ids:
+        summary = ha_cameras.get(entity_id)
+        friendly = getattr(summary, "friendly_name", None) if summary else None
+        cameras.append(
+            CameraInfo(
+                entity_id=entity_id,
+                name=labels.get(entity_id) or friendly or _derive_name(entity_id),
+                source="go2rtc" if media.has_stream(entity_id) else "homeassistant",
+                snapshot=True,
+                webrtc=media.has_stream(entity_id),
+                state=summary.state if summary else None,
+            )
+        )
+
+    return CameraListResponse(cameras=cameras, count=len(cameras))
 
 
 @router.get("/{entity_id}/snapshot", summary="Snapshot seguro de una camara HA")
