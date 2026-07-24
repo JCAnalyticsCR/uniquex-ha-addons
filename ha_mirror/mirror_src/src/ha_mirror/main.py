@@ -136,7 +136,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     logger.info(
         "mirror.starting",
-        version="0.1.0",
+        version="0.3.0",
         ha_url=settings.ha_url,
         db_path=str(settings.mirror_db_path),
         tenant_id=settings.tenant_id,
@@ -244,7 +244,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="HA Mirror",
         description="FastAPI mirror para Home Assistant — single-tenant",
-        version="0.1.0",
+        version="0.3.0",
         lifespan=lifespan,
         docs_url=_docs,
         redoc_url=_redoc,

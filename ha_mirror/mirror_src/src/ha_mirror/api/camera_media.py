@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import re
+from collections.abc import AsyncIterator
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from fastapi.responses import StreamingResponse
 
 from ha_mirror.auth import require_api_key
 from ha_mirror.camera_media import CameraMediaError
@@ -65,6 +67,40 @@ async def camera_capabilities(
         "webrtc": media.has_stream(entity_id),
         "webrtc_transport": "whep" if media.has_stream(entity_id) else None,
     }
+
+
+@router.get("/{entity_id}/stream.mp4", summary="Video fMP4 continuo de una camara")
+async def camera_mp4_stream(
+    entity_id: str,
+    request: Request,
+    _: None = Depends(require_api_key),
+) -> StreamingResponse:
+    _validate_camera(request, entity_id)
+    context = request.app.state.camera_media.open_mp4_stream(entity_id)
+    try:
+        upstream = await context.__aenter__()
+    except CameraMediaError as exc:
+        raise _media_error(exc) from exc
+
+    async def body() -> AsyncIterator[bytes]:
+        try:
+            async for chunk in upstream.content.iter_chunked(64 * 1024):
+                if chunk:
+                    yield chunk
+        finally:
+            await context.__aexit__(None, None, None)
+
+    return StreamingResponse(
+        body(),
+        media_type="video/mp4",
+        headers={
+            "Cache-Control": "private, no-store, max-age=0",
+            "Pragma": "no-cache",
+            "Content-Disposition": "inline",
+            "X-Accel-Buffering": "no",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @router.post("/{entity_id}/webrtc", summary="Intercambio SDP con go2rtc")

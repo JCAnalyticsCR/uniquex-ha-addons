@@ -1,6 +1,6 @@
 [project]
 name = "ha-mirror"
-version = "0.1.0"
+version = "0.3.0"
 description = "FastAPI mirror para Home Assistant — single-tenant, WebSocket fan-out, Fernet at-rest"
 requires-python = ">=3.11"
 dependencies = [

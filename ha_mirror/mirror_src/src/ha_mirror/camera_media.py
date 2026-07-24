@@ -8,7 +8,9 @@ el navegador; ambos se resuelven desde configuracion validada para evitar SSRF.
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from typing import AsyncIterator
 from urllib.parse import quote
 
 import aiohttp
@@ -60,6 +62,7 @@ class CameraMediaClient:
         self._session: aiohttp.ClientSession | None = None
         self._snapshot_slots = asyncio.Semaphore(4)
         self._webrtc_slots = asyncio.Semaphore(4)
+        self._stream_slots = asyncio.Semaphore(6)
 
     async def start(self) -> None:
         """Crea una sesion HTTP reutilizable; llamar durante lifespan."""
@@ -175,3 +178,48 @@ class CameraMediaClient:
             raise CameraMediaError("go2rtc_offer_timeout", 504) from exc
         except aiohttp.ClientError as exc:
             raise CameraMediaError("go2rtc_connection_failed", 502) from exc
+
+    @asynccontextmanager
+    async def open_mp4_stream(
+        self,
+        entity_id: str,
+    ) -> AsyncIterator[aiohttp.ClientResponse]:
+        """Abre un fMP4 continuo desde un stream go2rtc mapeado."""
+        session = self._require_session()
+        if not self._go2rtc_base_url:
+            raise CameraMediaError("go2rtc_not_configured", 503)
+        stream_name = self._camera_streams.get(entity_id)
+        if stream_name is None:
+            raise CameraMediaError("camera_stream_not_configured", 404)
+
+        encoded = quote(stream_name, safe="")
+        url = f"{self._go2rtc_base_url}/api/stream.mp4?src={encoded}"
+        timeout = aiohttp.ClientTimeout(total=None, connect=5, sock_read=15)
+
+        async with self._stream_slots:
+            try:
+                async with session.get(
+                    url,
+                    headers={"Accept": "video/mp4"},
+                    auth=self._go2rtc_auth,
+                    allow_redirects=False,
+                    timeout=timeout,
+                ) as response:
+                    if response.status == 404:
+                        raise CameraMediaError("go2rtc_stream_not_found", 404)
+                    if response.status in {401, 403}:
+                        raise CameraMediaError("go2rtc_auth_failed", 502)
+                    if response.status >= 400:
+                        raise CameraMediaError("go2rtc_stream_failed", 502)
+                    content_type = (
+                        response.headers.get("Content-Type", "").split(";", 1)[0].lower()
+                    )
+                    if content_type != "video/mp4":
+                        raise CameraMediaError("invalid_stream_content_type", 502)
+                    yield response
+            except CameraMediaError:
+                raise
+            except TimeoutError as exc:
+                raise CameraMediaError("go2rtc_stream_timeout", 504) from exc
+            except aiohttp.ClientError as exc:
+                raise CameraMediaError("go2rtc_connection_failed", 502) from exc
