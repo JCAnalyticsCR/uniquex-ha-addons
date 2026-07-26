@@ -218,12 +218,19 @@ SCENE_STEPS_MAX = 64
 SCENE_CAMERAS_MAX = 12
 SCENE_STEP_DATA_MAX_KEYS = 12
 
+# Un paso puede apuntar a UNA entidad suelta o a un GRUPO: varias entidades del
+# mismo domain a las que se les da la MISMA accion (5 luces -> apagar todas). HA
+# aplica la accion a todo el target de una sola llamada; el tope es de cordura
+# para no inflar el payload ni la tarjeta de grupo del builder.
+SCENE_STEP_ENTITIES_MAX = 40
+
 # Máximo de escenas por tenant. Es un tope de cordura: la lista completa viaja
 # en cada GET /api/scenes y se renderiza entera en la app.
 SCENES_PER_TENANT_MAX = 60
 
 _SCENE_STEP_SCALARS = (str, int, float, bool)
 _SCENE_CAMERA_PATTERN = re.compile(r"^camera\.[a-z0-9_]+$")
+_SCENE_ENTITY_PATTERN = re.compile(r"^[a-z_]+\.[a-z0-9_]+$")
 
 
 def _es_valor_de_paso_valido(valor: Any) -> bool:
@@ -235,25 +242,61 @@ def _es_valor_de_paso_valido(valor: Any) -> bool:
     return False
 
 
+def _validar_entity_id(entity_id: str, domain: str) -> None:
+    """
+    Un entity_id de paso válido: matchea el patrón y su prefijo es el domain.
+
+    Se aplica igual a la entidad suelta y a cada miembro de un grupo. El chequeo
+    de prefijo cierra el hueco de declarar {"domain":"light","entity_id":"hassio.x"}
+    para colar algo administrativo por la deny-list (que mira el domain declarado)
+    mientras HA ejecuta sobre otra cosa.
+    """
+    if not _SCENE_ENTITY_PATTERN.fullmatch(entity_id):
+        raise ValueError(f"entity_id invalido: {entity_id!r}")
+    if entity_id.split(".", 1)[0] != domain:
+        raise ValueError(f"entity_id '{entity_id}' no pertenece al domain '{domain}'")
+
+
 class SceneStep(BaseModel):
-    """Una acción de la escena: un service call de HA sobre una entidad."""
+    """
+    Una acción de la escena: un service call de HA sobre una o varias entidades.
+
+    entity_id apunta a UNA entidad suelta ("switch.x") o a un GRUPO —una lista de
+    entidades del MISMO domain a las que se les da la misma acción ("apagar estas
+    5 luces")—. Es HA-native: `target.entity_id` acepta tanto el string como la
+    lista, así que el grupo se resuelve en UNA sola llamada de servicio. Las
+    escenas viejas (entity_id string) siguen siendo válidas sin tocar nada.
+    """
 
     domain: str = Field(pattern=r"^[a-z_]{1,32}$")
     service: str = Field(pattern=r"^[a-z_]{1,32}$")
-    entity_id: str = Field(pattern=r"^[a-z_]+\.[a-z0-9_]+$")
+    entity_id: str | list[str]
     data: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validar_paso(self) -> SceneStep:
         """
-        El entity_id tiene que pertenecer al domain del paso.
+        Valida el/los entity_id del paso y la forma de `data`.
 
-        Sin esto se podría guardar {"domain":"light","entity_id":"hassio.x"} y
-        pasar la deny-list (que mira el domain declarado) mientras HA ejecuta
-        sobre otra cosa. El chequeo cierra ese hueco en el momento de guardar.
+        Entidad suelta: matchea el patrón y pertenece al domain del paso. Grupo:
+        lista no vacía de a lo sumo SCENE_STEP_ENTITIES_MAX, cada uno con patrón y
+        domain válidos y sin repetidos (HA aplicaría la acción dos veces a la misma
+        entidad si no). El chequeo por-entidad cierra el hueco de colar un domain
+        administrativo por la deny-list mientras HA ejecuta sobre otra cosa.
         """
-        if self.entity_id.split(".", 1)[0] != self.domain:
-            raise ValueError(f"entity_id '{self.entity_id}' no pertenece al domain '{self.domain}'")
+        if isinstance(self.entity_id, str):
+            _validar_entity_id(self.entity_id, self.domain)
+        else:
+            if not self.entity_id:
+                raise ValueError("entity_id como grupo no puede ser una lista vacía")
+            if len(self.entity_id) > SCENE_STEP_ENTITIES_MAX:
+                raise ValueError(
+                    f"un grupo admite como maximo {SCENE_STEP_ENTITIES_MAX} entidades"
+                )
+            for entity_id in self.entity_id:
+                _validar_entity_id(entity_id, self.domain)
+            if len(set(self.entity_id)) != len(self.entity_id):
+                raise ValueError("un grupo no admite entidades repetidas")
         if len(self.data) > SCENE_STEP_DATA_MAX_KEYS:
             raise ValueError(f"data admite como maximo {SCENE_STEP_DATA_MAX_KEYS} claves")
         for clave, valor in self.data.items():

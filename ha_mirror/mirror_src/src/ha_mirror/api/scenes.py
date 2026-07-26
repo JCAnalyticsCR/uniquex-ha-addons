@@ -76,7 +76,9 @@ class _PasoPreparado:
 
     domain: str
     service: str
-    entity_id: str
+    # Una entidad suelta o un grupo (lista). Solo se usa para el log de un fallo
+    # de despacho; la correlación se rastrea por _entidad_de_tracking.
+    entity_id: str | list[str]
     payload: dict[str, Any]
     correlation_id: str
     future: asyncio.Future[bool]
@@ -90,6 +92,20 @@ class _PasoPreparado:
 def _tenant_id(request: Request) -> int:
     """Tenant único (N=1). Se lee de settings para no hardcodear el 1 acá."""
     return int(getattr(request.app.state.settings, "tenant_id", 1))
+
+
+def _entidad_de_tracking(entity_id: str | list[str]) -> str:
+    """
+    La entidad por la que se rastrea la correlación de un paso.
+
+    Un paso suelto se rastrea por su entidad, igual que siempre. Un paso-grupo es
+    UNA sola llamada de servicio pero HA emite un state_changed por CADA entidad
+    del target; se rastrea por la PRIMERA de la lista: su state_changed confirma
+    el paso y los de las demás se ignoran (no tienen correlación registrada). Así
+    el 202 y la confirmación siguen andando y un grupo no cuelga la escena. La
+    lista está garantizada no vacía por el validador del modelo.
+    """
+    return entity_id if isinstance(entity_id, str) else entity_id[0]
 
 
 def _rechazar_servicios_prohibidos(
@@ -316,17 +332,22 @@ async def activate_scene(
     preparados: list[_PasoPreparado] = []
     for paso in escena.steps:
         correlation_id = correlations.generate_id()
+        # Un paso-grupo (entity_id lista) es UNA sola llamada de servicio: HA
+        # aplica la acción a todas las entidades del target de una. La correlación
+        # se registra por UNA entidad (_entidad_de_tracking) para no colgar la
+        # escena; el target y el payload llevan la lista completa tal cual.
+        entidad_tracking = _entidad_de_tracking(paso.entity_id)
         corr = await correlations.register(
             correlation_id=correlation_id,
             domain=paso.domain,
             service=paso.service,
-            entity_id=paso.entity_id,
+            entity_id=entidad_tracking,
         )
         await db.log_service_call(
             correlation_id=correlation_id,
             domain=paso.domain,
             service=paso.service,
-            entity_id=paso.entity_id,
+            entity_id=entidad_tracking,
             target={"entity_id": paso.entity_id},
         )
         SERVICE_CALLS_TOTAL.labels(domain=paso.domain, service=paso.service).inc()
