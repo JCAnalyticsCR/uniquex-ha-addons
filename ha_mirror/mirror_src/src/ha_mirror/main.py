@@ -31,6 +31,7 @@ from starlette.responses import Response
 
 from ha_mirror.api.areas import router as areas_router
 from ha_mirror.api.camera_media import router as camera_media_router
+from ha_mirror.api.camera_ws import router as camera_ws_router
 from ha_mirror.api.entities import router as entities_router
 from ha_mirror.api.health import router as health_router
 from ha_mirror.api.iframe_token import router as iframe_router
@@ -279,8 +280,11 @@ def create_app() -> FastAPI:
     app.include_router(camera_media_router)
     app.include_router(scenes_router)
 
-    # Router WebSocket
+    # Routers WebSocket
     app.include_router(ws_router)
+    # Puente MSE-over-WebSocket de camaras (/ws/cameras/{entity_id}) — evita el
+    # buffering de Cloudflare sobre el fMP4 por HTTP que congelaba el video.
+    app.include_router(camera_ws_router)
 
     # Métricas Prometheus en /metrics — Fix C2: PROTEGIDO con API key.
     # Antes estaba montado SIN auth ("solo vía tailnet"), pero ahora el Mirror

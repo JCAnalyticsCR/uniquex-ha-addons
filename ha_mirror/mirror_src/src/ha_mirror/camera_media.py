@@ -99,6 +99,27 @@ class CameraMediaClient:
             return []
         return sorted(self._camera_streams)
 
+    def go2rtc_ws_target(
+        self, entity_id: str
+    ) -> tuple[str, aiohttp.BasicAuth | None] | None:
+        """
+        Destino del puente MSE-over-WebSocket de go2rtc para una camara.
+
+        Devuelve (url_ws, auth) para conectar a {go2rtc}/api/ws?src=<stream>, o
+        None si go2rtc no esta configurado o el entity_id no tiene stream mapeado.
+        El nombre del stream sale SIEMPRE del allowlist del servidor, nunca del
+        navegador (anti-SSRF, igual que el resto de camera_media).
+        """
+        if not self._go2rtc_base_url:
+            return None
+        stream_name = self._camera_streams.get(entity_id)
+        if stream_name is None:
+            return None
+        # http->ws / https->wss (mismo reemplazo /^http/ -> ws del BFF de Next).
+        ws_base = "ws" + self._go2rtc_base_url[4:]
+        encoded = quote(stream_name, safe="")
+        return f"{ws_base}/api/ws?src={encoded}", self._go2rtc_auth
+
     def _require_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             raise CameraMediaError("media_client_not_started", 503)
