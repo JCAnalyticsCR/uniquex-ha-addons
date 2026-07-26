@@ -39,6 +39,13 @@ class CameraMediaClient:
     _ALLOWED_IMAGE_TYPES = frozenset({"image/jpeg", "image/png", "image/webp"})
     _MAX_SNAPSHOT_BYTES = 12 * 1024 * 1024
     _MAX_SDP_BYTES = 256 * 1024
+    # go2rtc devuelve un JPEG gris de relleno (~3.9KB) de forma INTERMITENTE
+    # cuando el stream aún no tiene un cuadro decodable en ese instante. Un frame
+    # real de una cámara (aun de noche) pesa bastante más. Si el snapshot viene
+    # por debajo de este umbral lo tratamos como "gris" y reintentamos.
+    _PLACEHOLDER_MAX_BYTES = 6_000
+    _SNAPSHOT_RETRIES = 4
+    _SNAPSHOT_RETRY_DELAY = 0.45
 
     def __init__(
         self,
@@ -139,7 +146,15 @@ class CameraMediaClient:
             raise CameraMediaError("ha_snapshot_connection_failed", 502) from exc
 
     async def _get_go2rtc_snapshot(self, entity_id: str) -> SnapshotPayload:
-        """Extrae un JPEG del stream go2rtc allowlisted para camaras virtuales."""
+        """
+        Extrae un JPEG del stream go2rtc allowlisted para camaras virtuales.
+
+        go2rtc devuelve un frame gris de relleno de forma intermitente cuando el
+        stream no tiene un cuadro listo en ese instante. Reintentamos hasta agarrar
+        uno real; en las pruebas casi siempre el 1er o 2do intento ya trae imagen.
+        Si todos vienen pequeños (stream muy frío) devolvemos el ultimo — mejor un
+        gris que un error.
+        """
         session = self._require_session()
         if not self._go2rtc_base_url:
             raise CameraMediaError("go2rtc_not_configured", 503)
@@ -149,8 +164,26 @@ class CameraMediaClient:
 
         encoded = quote(stream_name, safe="")
         url = f"{self._go2rtc_base_url}/api/frame.jpeg?src={encoded}"
+
+        last: SnapshotPayload | None = None
+        async with self._snapshot_slots:
+            for intento in range(self._SNAPSHOT_RETRIES):
+                payload = await self._fetch_go2rtc_frame(session, url)
+                if len(payload.body) >= self._PLACEHOLDER_MAX_BYTES:
+                    return payload  # cuadro real
+                last = payload  # gris de relleno → reintentar
+                if intento < self._SNAPSHOT_RETRIES - 1:
+                    await asyncio.sleep(self._SNAPSHOT_RETRY_DELAY)
+        if last is None:
+            raise CameraMediaError("empty_snapshot", 502)
+        return last
+
+    async def _fetch_go2rtc_frame(
+        self, session: aiohttp.ClientSession, url: str
+    ) -> SnapshotPayload:
+        """Un solo GET a go2rtc /api/frame.jpeg con validacion (sin reintentos)."""
         try:
-            async with self._snapshot_slots, session.get(
+            async with session.get(
                 url,
                 headers={"Accept": "image/jpeg"},
                 auth=self._go2rtc_auth,
