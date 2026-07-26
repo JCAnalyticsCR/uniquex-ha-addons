@@ -103,6 +103,16 @@ async def list_cameras(
     return CameraListResponse(cameras=cameras, count=len(cameras))
 
 
+def _clamp_int(raw: str | None, lo: int, hi: int) -> int | None:
+    """Parsea un query param entero y lo acota a [lo, hi]; None si falta/invalido."""
+    if raw is None:
+        return None
+    try:
+        return max(lo, min(hi, int(raw)))
+    except (TypeError, ValueError):
+        return None
+
+
 @router.get("/{entity_id}/snapshot", summary="Snapshot seguro de una camara HA")
 async def camera_snapshot(
     entity_id: str,
@@ -110,8 +120,14 @@ async def camera_snapshot(
     _: None = Depends(require_api_key),
 ) -> Response:
     _validate_camera(request, entity_id)
+    # `w` (ancho) y `q` (calidad) opcionales: el grid del celular pide miniaturas
+    # livianas; el fullscreen usa video en vivo. Acotados para evitar abusos.
+    width = _clamp_int(request.query_params.get("w"), 120, 1280)
+    quality = _clamp_int(request.query_params.get("q"), 20, 100)
     try:
-        payload = await request.app.state.camera_media.get_snapshot(entity_id)
+        payload = await request.app.state.camera_media.get_snapshot(
+            entity_id, width=width, quality=quality
+        )
     except CameraMediaError as exc:
         raise _media_error(exc) from exc
 

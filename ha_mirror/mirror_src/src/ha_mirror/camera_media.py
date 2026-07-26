@@ -43,7 +43,10 @@ class CameraMediaClient:
     # cuando el stream aún no tiene un cuadro decodable en ese instante. Un frame
     # real de una cámara (aun de noche) pesa bastante más. Si el snapshot viene
     # por debajo de este umbral lo tratamos como "gris" y reintentamos.
-    _PLACEHOLDER_MAX_BYTES = 6_000
+    # Umbral por debajo del cual tratamos el JPEG como gris de relleno y
+    # reintentamos. Acotado para que sirva tanto a full-res (gris ~3.9KB, real
+    # >10KB) como a las miniaturas del grid (gris ~1-2KB, real >5KB).
+    _PLACEHOLDER_MAX_BYTES = 4_500
     _SNAPSHOT_RETRIES = 4
     _SNAPSHOT_RETRY_DELAY = 0.45
 
@@ -101,10 +104,22 @@ class CameraMediaClient:
             raise CameraMediaError("media_client_not_started", 503)
         return self._session
 
-    async def get_snapshot(self, entity_id: str) -> SnapshotPayload:
-        """Obtiene una imagen fija desde go2rtc o el proxy de camara de HA."""
+    async def get_snapshot(
+        self,
+        entity_id: str,
+        *,
+        width: int | None = None,
+        quality: int | None = None,
+    ) -> SnapshotPayload:
+        """
+        Obtiene una imagen fija desde go2rtc o el proxy de camara de HA.
+
+        `width`/`quality` (solo para go2rtc) piden una imagen mas chica y
+        comprimida — se usa en el grid de camaras del celular, para que carguen
+        rapido y parejo. El fullscreen y el proxy de HA usan calidad completa.
+        """
         if self.has_stream(entity_id):
-            return await self._get_go2rtc_snapshot(entity_id)
+            return await self._get_go2rtc_snapshot(entity_id, width=width, quality=quality)
 
         session = self._require_session()
         url = f"{self._ha_base_url}/api/camera_proxy/{entity_id}"
@@ -145,7 +160,13 @@ class CameraMediaClient:
         except aiohttp.ClientError as exc:
             raise CameraMediaError("ha_snapshot_connection_failed", 502) from exc
 
-    async def _get_go2rtc_snapshot(self, entity_id: str) -> SnapshotPayload:
+    async def _get_go2rtc_snapshot(
+        self,
+        entity_id: str,
+        *,
+        width: int | None = None,
+        quality: int | None = None,
+    ) -> SnapshotPayload:
         """
         Extrae un JPEG del stream go2rtc allowlisted para camaras virtuales.
 
@@ -154,6 +175,10 @@ class CameraMediaClient:
         uno real; en las pruebas casi siempre el 1er o 2do intento ya trae imagen.
         Si todos vienen pequeños (stream muy frío) devolvemos el ultimo — mejor un
         gris que un error.
+
+        `width`/`quality` se pasan a go2rtc (params `w`/`quality` de frame.jpeg)
+        para pedir una imagen mas liviana en el grid del celular. Ya vienen
+        validados/acotados por la capa de la API.
         """
         session = self._require_session()
         if not self._go2rtc_base_url:
@@ -164,6 +189,10 @@ class CameraMediaClient:
 
         encoded = quote(stream_name, safe="")
         url = f"{self._go2rtc_base_url}/api/frame.jpeg?src={encoded}"
+        if width is not None:
+            url += f"&w={width}"
+        if quality is not None:
+            url += f"&quality={quality}"
 
         last: SnapshotPayload | None = None
         async with self._snapshot_slots:
