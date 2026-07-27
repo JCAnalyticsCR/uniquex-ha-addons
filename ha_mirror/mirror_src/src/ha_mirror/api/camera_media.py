@@ -124,9 +124,17 @@ async def camera_snapshot(
     # livianas; el fullscreen usa video en vivo. Acotados para evitar abusos.
     width = _clamp_int(request.query_params.get("w"), 120, 1280)
     quality = _clamp_int(request.query_params.get("q"), 20, 100)
+    # `live=1`: lo manda el visor a pantalla completa cuando usa el bucle de
+    # snapshots como video (iPhone: Safari no trae MediaSource). Ese bucle
+    # necesita cuadros que AVANCEN, asi que el cache le aplica un TTL de 0,8 s y
+    # no le sirve nada vencido — con el TTL normal de 30 s el reloj de la camara
+    # se veia congelado.
+    live = request.query_params.get("live") == "1"
     media = request.app.state.camera_media
     try:
-        payload = await media.get_snapshot(entity_id, width=width, quality=quality)
+        payload = await media.get_snapshot(
+            entity_id, width=width, quality=quality, live=live
+        )
     except CameraMediaError as exc:
         raise _media_error(exc) from exc
 

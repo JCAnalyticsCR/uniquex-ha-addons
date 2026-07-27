@@ -98,6 +98,13 @@ class CameraMediaClient:
     _SNAPSHOT_STALE_MAX = 1_800.0
     # Tope de entradas para que pedir muchas combinaciones de w/q no infle la RAM.
     _SNAPSHOT_CACHE_MAX_ENTRIES = 120
+    # TTL para el VISOR EN VIVO (`live=1`). En iPhone el visor a pantalla
+    # completa no usa video —Safari no trae MediaSource— sino un bucle de
+    # snapshots a ~1 fps. Con el TTL normal de 30 s ese bucle recibia EL MISMO
+    # cuadro 30 veces seguidas y el reloj de la camara se veia congelado: el
+    # cache arreglaba la cuadricula y rompia el visor. Con 0,8 s el bucle avanza
+    # y el single-flight sigue coalescando si hay varios espectadores.
+    _SNAPSHOT_LIVE_TTL = 0.8
 
     def __init__(
         self,
@@ -198,30 +205,38 @@ class CameraMediaClient:
         *,
         width: int | None = None,
         quality: int | None = None,
+        live: bool = False,
     ) -> SnapshotPayload:
         """
         Devuelve una imagen fija de la camara, sirviendo del cache cuando puede.
 
-        Contrato (ver el bloque de constantes _SNAPSHOT_CACHE_* para el por que):
+        Contrato de la CUADRICULA (`live=False`, ver constantes _SNAPSHOT_CACHE_*):
           · Hay cuadro y es reciente (< TTL)  -> se devuelve al instante.
           · Hay cuadro y esta vencido          -> se devuelve al instante IGUAL y
             se dispara un refresco en segundo plano.
           · Hay cuadro pero pasa de STALE_MAX  -> se pide uno nuevo esperando.
           · No hay cuadro (camara fria)        -> se pide uno nuevo esperando.
-
         O sea: solo el primer pedido de cada camara paga el costo de go2rtc.
+
+        Contrato del VISOR EN VIVO (`live=True`): TTL de 0,8 s y NADA de servir
+        vencido — el bucle de snapshots de iPhone necesita cuadros que avancen,
+        no el ultimo bueno. Devolverle cache viejo se ve como imagen congelada.
         """
         key: _CacheKey = (entity_id, width, quality)
+        ttl = self._SNAPSHOT_LIVE_TTL if live else self._SNAPSHOT_CACHE_TTL
         cached = self._snapshot_cache.get(key)
 
         if cached is not None:
             age = time.monotonic() - cached.stored_at
-            if age < self._SNAPSHOT_STALE_MAX:
-                if age >= self._SNAPSHOT_CACHE_TTL:
-                    self._schedule_refresh(key)
+            if age < ttl:
+                return cached.payload  # suficientemente fresco para ambos modos
+            # Vencido: la cuadricula se conforma con lo viejo y refresca detras;
+            # el visor NO — espera el cuadro nuevo aunque cueste.
+            if not live and age < self._SNAPSHOT_STALE_MAX:
+                self._schedule_refresh(key)
                 return cached.payload
 
-        return await self._refresh_snapshot(key)
+        return await self._refresh_snapshot(key, ttl=ttl)
 
     def snapshot_age(
         self,
@@ -254,19 +269,26 @@ class CameraMediaClient:
         finally:
             self._refreshing.discard(key)
 
-    async def _refresh_snapshot(self, key: _CacheKey) -> SnapshotPayload:
+    async def _refresh_snapshot(
+        self, key: _CacheKey, *, ttl: float | None = None
+    ) -> SnapshotPayload:
         """
         Pide un cuadro nuevo y actualiza el cache. Single-flight por clave.
+
+        `ttl` es la frescura que exige QUIEN LLAMA (el visor pide 0,8 s, la
+        cuadricula 30 s). Importa al salir del lock: si mientras esperabamos
+        otro pedido ya trajo un cuadro, lo reusamos solo si cumple ESE umbral.
 
         Un cuadro GRIS nunca pisa uno bueno: si go2rtc devuelve el relleno y ya
         teniamos algo real guardado, se conserva lo real.
         """
+        umbral = self._SNAPSHOT_CACHE_TTL if ttl is None else ttl
         lock = self._snapshot_locks.setdefault(key, asyncio.Lock())
         async with lock:
             # Otro pedido pudo haberlo refrescado mientras esperabamos el lock.
             cached = self._snapshot_cache.get(key)
             if cached is not None:
-                if time.monotonic() - cached.stored_at < self._SNAPSHOT_CACHE_TTL:
+                if time.monotonic() - cached.stored_at < umbral:
                     return cached.payload
 
             entity_id, width, quality = key
