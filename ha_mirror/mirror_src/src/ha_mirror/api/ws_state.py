@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import json
 import uuid
+from datetime import date, datetime, time
 from typing import Any
 
 import structlog
@@ -26,6 +27,32 @@ from ha_mirror.models import WsSnapshot
 from ha_mirror.prometheus_metrics import WS_CLIENTS_CONNECTED, WS_MESSAGES_SENT
 
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
+
+
+def _json_seguro(obj: Any) -> Any:
+    """
+    Fallback de json.dumps para tipos que no son JSON nativos.
+
+    POR QUE EXISTE (bug real, 2026-07-27): el snapshot inicial se serializaba
+    con Pydantic (`model_dump(mode="json")`, que convierte fechas a texto) pero
+    los eventos incrementales iban por `json.dumps` CRUDO. Home Assistant manda
+    `datetime` dentro de los atributos de decenas de entidades, asi que al
+    primer `state_changed` que trajera uno el socket moria con
+    "Object of type datetime is not JSON serializable".
+
+    El efecto en cadena era mucho peor que perder un evento: el navegador
+    reconectaba cada 1,5 s y en CADA reconexion se caian los 6 puentes de video
+    del grid, asi que el video nunca alcanzaba a estabilizarse. Se veia como
+    "las camaras se cortan por frames" — sintoma que no apuntaba para nada a
+    este archivo.
+
+    Un evento de estado JAMAS debe poder tirar la conexion. Ante un tipo
+    inesperado degradamos el valor a texto en vez de dejar morir el socket.
+    """
+    if isinstance(obj, (datetime, date, time)):
+        return obj.isoformat()
+    return str(obj)
+
 
 router = APIRouter()
 
@@ -119,7 +146,7 @@ async def _send_snapshot(websocket: WebSocket, store: Any, client_id: str) -> No
     )
 
     payload = snapshot.model_dump(mode="json")
-    await websocket.send_text(json.dumps(payload))
+    await websocket.send_text(json.dumps(payload, default=_json_seguro))
 
     logger.info(
         "ws.snapshot_sent",
@@ -144,7 +171,7 @@ async def _stream_events(
             continue
 
         try:
-            await websocket.send_text(json.dumps(msg))
+            await websocket.send_text(json.dumps(msg, default=_json_seguro))
             WS_MESSAGES_SENT.labels(type=msg.get("type", "unknown")).inc()
         except (WebSocketDisconnect, RuntimeError):
             # Cliente desconectado — el except* en ws_state lo capturará
@@ -162,7 +189,7 @@ async def _recv_pings(websocket: WebSocket, client_id: str) -> None:
             raw = await websocket.receive_text()
             data = json.loads(raw)
             if data.get("type") == "ping":
-                await websocket.send_text(json.dumps({"type": "pong"}))
+                await websocket.send_text(json.dumps({"type": "pong"}, default=_json_seguro))
         except WebSocketDisconnect:
             raise
         except json.JSONDecodeError:
