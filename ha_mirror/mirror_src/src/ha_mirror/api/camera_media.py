@@ -124,22 +124,26 @@ async def camera_snapshot(
     # livianas; el fullscreen usa video en vivo. Acotados para evitar abusos.
     width = _clamp_int(request.query_params.get("w"), 120, 1280)
     quality = _clamp_int(request.query_params.get("q"), 20, 100)
+    media = request.app.state.camera_media
     try:
-        payload = await request.app.state.camera_media.get_snapshot(
-            entity_id, width=width, quality=quality
-        )
+        payload = await media.get_snapshot(entity_id, width=width, quality=quality)
     except CameraMediaError as exc:
         raise _media_error(exc) from exc
 
-    return Response(
-        content=payload.body,
-        media_type=payload.content_type,
-        headers={
-            "Cache-Control": "private, no-store, max-age=0",
-            "Pragma": "no-cache",
-            "X-Content-Type-Options": "nosniff",
-        },
-    )
+    headers = {
+        "Cache-Control": "private, no-store, max-age=0",
+        "Pragma": "no-cache",
+        "X-Content-Type-Options": "nosniff",
+    }
+    # Edad del cuadro en segundos. El Mirror sirve del cache y refresca en
+    # segundo plano (ver camera_media.CameraMediaClient), asi que la imagen puede
+    # no ser del instante: lo decimos en vez de simularlo. Es una camara de
+    # seguridad — que la app pueda avisar "hace 40 s" si algun dia lo quiere.
+    age = media.snapshot_age(entity_id, width=width, quality=quality)
+    if age is not None:
+        headers["X-Snapshot-Age"] = str(int(age))
+
+    return Response(content=payload.body, media_type=payload.content_type, headers=headers)
 
 
 @router.get("/{entity_id}/capabilities", summary="Capacidades de medios de una camara")

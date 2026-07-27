@@ -8,6 +8,7 @@ el navegador; ambos se resuelven desde configuracion validada para evitar SSRF.
 from __future__ import annotations
 
 import asyncio
+import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import AsyncIterator
@@ -33,6 +34,19 @@ class SnapshotPayload:
     content_type: str
 
 
+@dataclass(frozen=True, slots=True)
+class _CachedSnapshot:
+    """Ultimo cuadro bueno de una camara, con el instante en que se guardo."""
+
+    payload: SnapshotPayload
+    stored_at: float
+
+
+# Clave de cache: la misma camara pedida con distinto ancho/calidad produce
+# bytes distintos, asi que cada variante se cachea por separado.
+_CacheKey = tuple[str, "int | None", "int | None"]
+
+
 class CameraMediaClient:
     """Acceso saliente y limitado a HA Core y a go2rtc."""
 
@@ -49,6 +63,31 @@ class CameraMediaClient:
     _PLACEHOLDER_MAX_BYTES = 4_500
     _SNAPSHOT_RETRIES = 4
     _SNAPSHOT_RETRY_DELAY = 0.45
+
+    # ── Cache de snapshots (stale-while-revalidate) ───────────────────────────
+    #
+    # POR QUE: esta MEDIDO que un solo `frame.jpeg` tarda 2,5-26 s. A diferencia
+    # de `stream.mp4`, que solo retransmite el H.264 y va fluido, `frame.jpeg`
+    # obliga a go2rtc a abrir una sesion RTSP contra el NVR, esperar un keyframe,
+    # DECODIFICAR el cuadro y recomprimirlo a JPEG. Con 20 camaras en la
+    # cuadricula eso son 20 ciclos de conectar/soltar por refresco contra un NVR
+    # Dahua con sesiones simultaneas limitadas — y esa rotacion es la que le hacia
+    # stutter al video en vivo que el usuario estaba mirando.
+    #
+    # Comprobacion frio-vs-caliente sobre la misma camara (3 pedidos seguidos):
+    #   frio    2,56 / 7,89 / 11,88 s  (empeora en cada pedido)
+    #   caliente 1,85 / 3,87 /  1,95 s  (con un stream.mp4 abierto en paralelo)
+    #
+    # COMO: se devuelve SIEMPRE el ultimo cuadro bueno al instante y, si ya paso
+    # el TTL, se refresca EN SEGUNDO PLANO. Asi el pedido del usuario no espera
+    # nunca a go2rtc (salvo la primera vez de cada camara) y go2rtc recibe a lo
+    # sumo un pedido por camara por TTL, fuera del camino del request.
+    _SNAPSHOT_CACHE_TTL = 30.0
+    # Mas viejo que esto ya no se sirve: se vuelve a pedir de forma sincronica.
+    # Es una camara de seguridad — mejor esperar que mostrar algo muy pasado.
+    _SNAPSHOT_STALE_MAX = 180.0
+    # Tope de entradas para que pedir muchas combinaciones de w/q no infle la RAM.
+    _SNAPSHOT_CACHE_MAX_ENTRIES = 120
 
     def __init__(
         self,
@@ -74,6 +113,14 @@ class CameraMediaClient:
         self._webrtc_slots = asyncio.Semaphore(4)
         # La cuadrícula de Fortunata muestra 20 substreams simultáneos.
         self._stream_slots = asyncio.Semaphore(24)
+        # Cache de snapshots + un lock por variante (single-flight: si llegan
+        # varios pedidos de la misma camara juntos, go2rtc recibe UNO solo).
+        self._snapshot_cache: dict[_CacheKey, _CachedSnapshot] = {}
+        self._snapshot_locks: dict[_CacheKey, asyncio.Lock] = {}
+        # Refrescos en segundo plano en curso, y sus tasks (guardamos la
+        # referencia para que el GC no se los lleve a medio camino).
+        self._refreshing: set[_CacheKey] = set()
+        self._refresh_tasks: set[asyncio.Task[None]] = set()
 
     async def start(self) -> None:
         """Crea una sesion HTTP reutilizable; llamar durante lifespan."""
@@ -82,6 +129,16 @@ class CameraMediaClient:
             self._session = aiohttp.ClientSession(timeout=timeout)
 
     async def close(self) -> None:
+        # Cortar los refrescos en segundo plano ANTES de cerrar la sesion HTTP,
+        # si no quedan tasks pidiendo sobre un ClientSession ya cerrado.
+        for task in list(self._refresh_tasks):
+            task.cancel()
+        if self._refresh_tasks:
+            await asyncio.gather(*self._refresh_tasks, return_exceptions=True)
+        self._refresh_tasks.clear()
+        self._refreshing.clear()
+        self._snapshot_cache.clear()
+        self._snapshot_locks.clear()
         if self._session is not None and not self._session.closed:
             await self._session.close()
         self._ha_token = ""
@@ -133,11 +190,111 @@ class CameraMediaClient:
         quality: int | None = None,
     ) -> SnapshotPayload:
         """
-        Obtiene una imagen fija desde go2rtc o el proxy de camara de HA.
+        Devuelve una imagen fija de la camara, sirviendo del cache cuando puede.
+
+        Contrato (ver el bloque de constantes _SNAPSHOT_CACHE_* para el por que):
+          · Hay cuadro y es reciente (< TTL)  -> se devuelve al instante.
+          · Hay cuadro y esta vencido          -> se devuelve al instante IGUAL y
+            se dispara un refresco en segundo plano.
+          · Hay cuadro pero pasa de STALE_MAX  -> se pide uno nuevo esperando.
+          · No hay cuadro (camara fria)        -> se pide uno nuevo esperando.
+
+        O sea: solo el primer pedido de cada camara paga el costo de go2rtc.
+        """
+        key: _CacheKey = (entity_id, width, quality)
+        cached = self._snapshot_cache.get(key)
+
+        if cached is not None:
+            age = time.monotonic() - cached.stored_at
+            if age < self._SNAPSHOT_STALE_MAX:
+                if age >= self._SNAPSHOT_CACHE_TTL:
+                    self._schedule_refresh(key)
+                return cached.payload
+
+        return await self._refresh_snapshot(key)
+
+    def snapshot_age(
+        self,
+        entity_id: str,
+        *,
+        width: int | None = None,
+        quality: int | None = None,
+    ) -> float | None:
+        """Segundos desde que se capturo el cuadro cacheado (None si no hay)."""
+        cached = self._snapshot_cache.get((entity_id, width, quality))
+        if cached is None:
+            return None
+        return time.monotonic() - cached.stored_at
+
+    def _schedule_refresh(self, key: _CacheKey) -> None:
+        """Dispara un refresco en segundo plano si no hay ya uno para esta clave."""
+        if key in self._refreshing:
+            return
+        self._refreshing.add(key)
+        task = asyncio.create_task(self._background_refresh(key))
+        self._refresh_tasks.add(task)
+        task.add_done_callback(self._refresh_tasks.discard)
+
+    async def _background_refresh(self, key: _CacheKey) -> None:
+        """Refresco fuera del camino del request: si falla, queda el cuadro viejo."""
+        try:
+            await self._refresh_snapshot(key)
+        except CameraMediaError:
+            pass  # go2rtc no pudo ahora; el cuadro cacheado sigue sirviendo
+        finally:
+            self._refreshing.discard(key)
+
+    async def _refresh_snapshot(self, key: _CacheKey) -> SnapshotPayload:
+        """
+        Pide un cuadro nuevo y actualiza el cache. Single-flight por clave.
+
+        Un cuadro GRIS nunca pisa uno bueno: si go2rtc devuelve el relleno y ya
+        teniamos algo real guardado, se conserva lo real.
+        """
+        lock = self._snapshot_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            # Otro pedido pudo haberlo refrescado mientras esperabamos el lock.
+            cached = self._snapshot_cache.get(key)
+            if cached is not None:
+                if time.monotonic() - cached.stored_at < self._SNAPSHOT_CACHE_TTL:
+                    return cached.payload
+
+            entity_id, width, quality = key
+            payload = await self._fetch_snapshot(entity_id, width=width, quality=quality)
+
+            es_gris = len(payload.body) < self._PLACEHOLDER_MAX_BYTES
+            if es_gris and cached is not None:
+                return cached.payload  # preferimos lo real viejo al gris nuevo
+
+            self._store_snapshot(key, payload)
+            return payload
+
+    def _store_snapshot(self, key: _CacheKey, payload: SnapshotPayload) -> None:
+        """Guarda el cuadro, desalojando el mas viejo si el cache se paso de tope."""
+        self._snapshot_cache[key] = _CachedSnapshot(
+            payload=payload, stored_at=time.monotonic()
+        )
+        if len(self._snapshot_cache) > self._SNAPSHOT_CACHE_MAX_ENTRIES:
+            oldest = min(
+                self._snapshot_cache,
+                key=lambda k: self._snapshot_cache[k].stored_at,
+            )
+            self._snapshot_cache.pop(oldest, None)
+            self._snapshot_locks.pop(oldest, None)
+
+    async def _fetch_snapshot(
+        self,
+        entity_id: str,
+        *,
+        width: int | None = None,
+        quality: int | None = None,
+    ) -> SnapshotPayload:
+        """
+        Trae una imagen fija desde go2rtc o el proxy de camara de HA (sin cache).
 
         `width`/`quality` (solo para go2rtc) piden una imagen mas chica y
-        comprimida — se usa en el grid de camaras del celular, para que carguen
-        rapido y parejo. El fullscreen y el proxy de HA usan calidad completa.
+        comprimida — se usa en el grid de camaras, para que cargue rapido y
+        parejo. El fullscreen y el proxy de HA usan calidad completa.
         """
         if self.has_stream(entity_id):
             return await self._get_go2rtc_snapshot(entity_id, width=width, quality=quality)
