@@ -83,9 +83,19 @@ class CameraMediaClient:
     # nunca a go2rtc (salvo la primera vez de cada camara) y go2rtc recibe a lo
     # sumo un pedido por camara por TTL, fuera del camino del request.
     _SNAPSHOT_CACHE_TTL = 30.0
-    # Mas viejo que esto ya no se sirve: se vuelve a pedir de forma sincronica.
-    # Es una camara de seguridad — mejor esperar que mostrar algo muy pasado.
-    _SNAPSHOT_STALE_MAX = 180.0
+    # Hasta cuando servimos un cuadro viejo mientras se refresca por detras.
+    #
+    # 30 min y no 3: con 180 s, abrir la app un par de horas despues encontraba
+    # TODAS las camaras frias otra vez y se volvia a pagar el arranque de 3-11 s
+    # por cada una — que es exactamente lo que este cache venia a evitar. El
+    # cuadro viejo se muestra AL INSTANTE y el refresco entra segundos despues,
+    # asi que lo viejo dura un parpadeo.
+    #
+    # No es una licencia para mentir: la respuesta lleva `X-Snapshot-Age` con la
+    # edad real en segundos, y la vista en vivo (video) es la fuente de verdad
+    # para la camara que el usuario esta mirando. El snapshot es el telon de
+    # fondo, no la evidencia.
+    _SNAPSHOT_STALE_MAX = 1_800.0
     # Tope de entradas para que pedir muchas combinaciones de w/q no infle la RAM.
     _SNAPSHOT_CACHE_MAX_ENTRIES = 120
 
