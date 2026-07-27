@@ -59,6 +59,13 @@ class _CachedSnapshot:
 _CacheKey = tuple[str, "int | None", "int | None"]
 
 
+def _is_complete_jpeg(body: bytes) -> bool:
+    """True si `body` es un JPEG COMPLETO: arranca en SOI (FFD8) y cierra en EOI
+    (FFD9). Un frame truncado (lectura parcial del stream, corte a mitad) NO cierra
+    en FFD9 y se ve 'cortado' en el navegador (mitad imagen, mitad gris)."""
+    return len(body) >= 4 and body[:2] == b"\xff\xd8" and body[-2:] == b"\xff\xd9"
+
+
 # ── HLS (Safari) — constantes y helpers de parseo/reescritura ───────────────
 #
 # Safari NO soporta MSE-over-WebSocket: el ManagedMediaSource que expone se
@@ -560,9 +567,14 @@ class CameraMediaClient:
             entity_id, width, quality = key
             payload = await self._fetch_snapshot(entity_id, width=width, quality=quality)
 
-            es_gris = len(payload.body) < self._PLACEHOLDER_MAX_BYTES
-            if es_gris and cached is not None:
-                return cached.payload  # preferimos lo real viejo al gris nuevo
+            # Un cuadro MALO (gris de relleno o JPEG truncado que no cierra en FFD9)
+            # nunca pisa uno bueno ya cacheado: preferimos lo real viejo.
+            es_malo = (
+                len(payload.body) < self._PLACEHOLDER_MAX_BYTES
+                or not _is_complete_jpeg(payload.body)
+            )
+            if es_malo and cached is not None:
+                return cached.payload
 
             self._store_snapshot(key, payload)
             return payload
@@ -623,11 +635,21 @@ class CameraMediaClient:
                 if declared_size is not None and declared_size > self._MAX_SNAPSHOT_BYTES:
                     raise CameraMediaError("snapshot_too_large", 502)
 
-                body = await response.content.read(self._MAX_SNAPSHOT_BYTES + 1)
+                # Leer el body COMPLETO (todos los chunks hasta EOF). Antes usaba
+                # content.read(n), que hace UNA lectura parcial y devuelve el primer
+                # chunk sin esperar el resto → truncaba el JPEG (se veía cortado en
+                # el grid, mitad imagen mitad gris). iter_chunked acumula hasta EOF,
+                # con tope de tamaño para no reventar por un body gigante.
+                parts: list[bytes] = []
+                total = 0
+                async for chunk in response.content.iter_chunked(65_536):
+                    total += len(chunk)
+                    if total > self._MAX_SNAPSHOT_BYTES:
+                        raise CameraMediaError("snapshot_too_large", 502)
+                    parts.append(chunk)
+                body = b"".join(parts)
                 if not body:
                     raise CameraMediaError("empty_snapshot", 502)
-                if len(body) > self._MAX_SNAPSHOT_BYTES:
-                    raise CameraMediaError("snapshot_too_large", 502)
                 return SnapshotPayload(body=body, content_type=content_type)
         except CameraMediaError:
             raise
@@ -674,9 +696,13 @@ class CameraMediaClient:
         async with self._snapshot_slots:
             for intento in range(self._SNAPSHOT_RETRIES):
                 payload = await self._fetch_go2rtc_frame(session, url)
-                if len(payload.body) >= self._PLACEHOLDER_MAX_BYTES:
-                    return payload  # cuadro real
-                last = payload  # gris de relleno → reintentar
+                if (
+                    len(payload.body) >= self._PLACEHOLDER_MAX_BYTES
+                    and _is_complete_jpeg(payload.body)
+                ):
+                    return payload  # cuadro real y COMPLETO
+                # gris de relleno, o JPEG truncado (no cierra en FFD9) → reintentar
+                last = payload
                 if intento < self._SNAPSHOT_RETRIES - 1:
                     await asyncio.sleep(self._SNAPSHOT_RETRY_DELAY)
         if last is None:
@@ -706,11 +732,21 @@ class CameraMediaClient:
                 )
                 if content_type != "image/jpeg":
                     raise CameraMediaError("invalid_snapshot_content_type", 502)
-                body = await response.content.read(self._MAX_SNAPSHOT_BYTES + 1)
+                # Leer el body COMPLETO (todos los chunks hasta EOF). Antes usaba
+                # content.read(n), que hace UNA lectura parcial y devuelve el primer
+                # chunk sin esperar el resto → truncaba el JPEG (se veía cortado en
+                # el grid, mitad imagen mitad gris). iter_chunked acumula hasta EOF,
+                # con tope de tamaño para no reventar por un body gigante.
+                parts: list[bytes] = []
+                total = 0
+                async for chunk in response.content.iter_chunked(65_536):
+                    total += len(chunk)
+                    if total > self._MAX_SNAPSHOT_BYTES:
+                        raise CameraMediaError("snapshot_too_large", 502)
+                    parts.append(chunk)
+                body = b"".join(parts)
                 if not body:
                     raise CameraMediaError("empty_snapshot", 502)
-                if len(body) > self._MAX_SNAPSHOT_BYTES:
-                    raise CameraMediaError("snapshot_too_large", 502)
                 return SnapshotPayload(body=body, content_type=content_type)
         except CameraMediaError:
             raise
@@ -1032,9 +1068,17 @@ class CameraMediaClient:
                     if content_type not in _HLS_SEGMENT_CONTENT_TYPES:
                         raise CameraMediaError("go2rtc_hls_segment_content_type_invalido", 502)
 
-                    body = await response.content.read(_MAX_SEGMENT_BYTES + 1)
-                    if len(body) > _MAX_SEGMENT_BYTES:
-                        raise CameraMediaError("go2rtc_hls_segmento_demasiado_grande", 502)
+                    # Body COMPLETO hasta EOF (no una lectura parcial): un segmento
+                    # .ts truncado rompe la reproducción HLS en Safari (el vivo de
+                    # iOS se corta o se congela). Acumulamos con tope de tamaño.
+                    seg_parts: list[bytes] = []
+                    seg_total = 0
+                    async for chunk in response.content.iter_chunked(65_536):
+                        seg_total += len(chunk)
+                        if seg_total > _MAX_SEGMENT_BYTES:
+                            raise CameraMediaError("go2rtc_hls_segmento_demasiado_grande", 502)
+                        seg_parts.append(chunk)
+                    body = b"".join(seg_parts)
 
                     # Normalizamos octet-stream a video/mp4 para que Safari no
                     # rechace el segmento por tipo de contenido desconocido.
