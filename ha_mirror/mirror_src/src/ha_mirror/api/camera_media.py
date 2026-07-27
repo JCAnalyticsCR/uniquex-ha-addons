@@ -10,7 +10,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from ha_mirror.auth import require_api_key
-from ha_mirror.camera_media import CameraMediaError
+from ha_mirror.camera_media import CameraMediaError, _SEG_REF_MAX_LEN, _SEG_REF_RE
 
 router = APIRouter(prefix="/api/cameras", tags=["cameras"])
 
@@ -238,6 +238,98 @@ async def camera_webrtc(
         content=answer,
         media_type="application/sdp",
         status_code=201,
+        headers={
+            "Cache-Control": "private, no-store, max-age=0",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@router.get("/{entity_id}/index.m3u8", summary="Playlist HLS para Safari/iOS")
+async def camera_hls_playlist(
+    entity_id: str,
+    request: Request,
+    _: None = Depends(require_api_key),
+) -> Response:
+    """
+    Playlist HLS con URIs de segmento reescritas a nuestro propio dominio.
+
+    Safari no soporta MSE-over-WebSocket (ManagedMediaSource se congela).
+    En cambio, reproduce HLS nativamente con un <video> estandar. go2rtc
+    emite la playlist en /api/stream.m3u8; la proxeamos reescribiendo todas
+    las URIs de segmento para que el navegador nunca vea go2rtc directamente.
+
+    Content-Type: application/vnd.apple.mpegurl (requerido por Safari).
+    Cache-Control: no-store porque la playlist cambia con cada segmento nuevo.
+    """
+    _validate_camera(request, entity_id)
+    media = request.app.state.camera_media
+
+    # HLS solo tiene sentido para camaras mapeadas en go2rtc; las camaras
+    # nativas de HA no tienen stream que go2rtc pueda emitir como HLS.
+    if not media.has_stream(entity_id):
+        raise HTTPException(status_code=404, detail="camera_stream_not_configured")
+
+    # Prefijo absoluto de nuestro endpoint de segmentos (sin host — Cloudflare
+    # no cambia el path, asi que este path funciona en prod igual que en local).
+    our_seg_prefix = f"/api/cameras/{entity_id}/hls-segment"
+
+    try:
+        playlist = await media.fetch_hls_playlist(entity_id, our_seg_prefix=our_seg_prefix)
+    except CameraMediaError as exc:
+        raise _media_error(exc) from exc
+
+    return Response(
+        content=playlist.encode("utf-8"),
+        media_type="application/vnd.apple.mpegurl",
+        headers={
+            "Cache-Control": "private, no-store, max-age=0",
+            "Pragma": "no-cache",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@router.get("/{entity_id}/hls-segment", summary="Proxy de segmento HLS (Safari)")
+async def camera_hls_segment(
+    entity_id: str,
+    request: Request,
+    _: None = Depends(require_api_key),
+) -> Response:
+    """
+    Proxea un segmento HLS desde go2rtc hacia el navegador.
+
+    El parametro `_seg` contiene la referencia opaca generada al reescribir
+    la playlist: path+query de go2rtc sin scheme, sin host y sin el stream
+    name (que viaja server-side desde el allowlist). El stream name nunca
+    viene del request del navegador — ese es el mecanismo anti-SSRF.
+
+    Content-Type: el que devuelva go2rtc (video/mp4 o video/mp2t).
+    """
+    _validate_camera(request, entity_id)
+    media = request.app.state.camera_media
+
+    if not media.has_stream(entity_id):
+        raise HTTPException(status_code=404, detail="camera_stream_not_configured")
+
+    seg_ref = request.query_params.get("_seg", "")
+    if not seg_ref:
+        raise HTTPException(status_code=400, detail="Missing _seg parameter")
+
+    # Validacion en la capa API antes de llegar al cliente: mismas reglas que
+    # _resolve_seg_ref en camera_media.py. El cliente re-valida internamente
+    # como defensa en profundidad.
+    if len(seg_ref) > _SEG_REF_MAX_LEN or not _SEG_REF_RE.fullmatch(seg_ref):
+        raise HTTPException(status_code=400, detail="Invalid _seg parameter")
+
+    try:
+        payload = await media.fetch_hls_segment(entity_id, seg_ref)
+    except CameraMediaError as exc:
+        raise _media_error(exc) from exc
+
+    return Response(
+        content=payload.body,
+        media_type=payload.content_type,
         headers={
             "Cache-Control": "private, no-store, max-age=0",
             "X-Content-Type-Options": "nosniff",

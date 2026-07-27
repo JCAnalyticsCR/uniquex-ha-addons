@@ -8,11 +8,12 @@ el navegador; ambos se resuelven desde configuracion validada para evitar SSRF.
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import AsyncIterator
-from urllib.parse import quote
+from urllib.parse import parse_qs, parse_qsl, quote, urlencode, urljoin, urlparse
 
 import aiohttp
 
@@ -35,6 +36,14 @@ class SnapshotPayload:
 
 
 @dataclass(frozen=True, slots=True)
+class HlsSegmentPayload:
+    """Bytes de un segmento HLS proxeado desde go2rtc."""
+
+    body: bytes
+    content_type: str  # "video/mp4" o "video/mp2t"
+
+
+@dataclass(frozen=True, slots=True)
 class _CachedSnapshot:
     """Ultimo cuadro bueno de una camara, con el instante en que se guardo."""
 
@@ -45,6 +54,154 @@ class _CachedSnapshot:
 # Clave de cache: la misma camara pedida con distinto ancho/calidad produce
 # bytes distintos, asi que cada variante se cachea por separado.
 _CacheKey = tuple[str, "int | None", "int | None"]
+
+
+# ── HLS (Safari) — constantes y helpers de parseo/reescritura ───────────────
+#
+# Safari NO soporta MSE-over-WebSocket: el ManagedMediaSource que expone se
+# congela en cuanto el stream fMP4 lleva unos segundos. En cambio, Safari
+# reproduce HLS nativamente con un <video> comun. go2rtc puede emitir HLS;
+# reescribimos las URIs de segmento para que el navegador nunca vea el host
+# ni el stream name internos de go2rtc (anti-SSRF del lado cliente).
+#
+# Suposicion sobre go2rtc 1.9.14 (no verificable desde afuera de la cajita):
+#   Playlist: GET /api/stream.m3u8?src=<nombre>
+#   Segmentos: URIs con path bajo /api/ (absolutas o relativas a la playlist).
+#             Ejemplo real esperado: /api/stream.m4s?src=NVR_CH01&id=42
+#             o relativo:            stream.m4s?id=42
+# Si la ruta real es distinta, el error "go2rtc_hls_uri_fuera_de_api" o
+# "go2rtc_hls_no_soportado" lo revela al momento de probarlo en la cajita.
+
+# Referencia validada a un segmento en go2rtc: path+query sin scheme, host
+# ni el param src (que viaja server-side desde el allowlist).
+# Formato: /api/<seg1>[/<seg2>][?<query>]
+# Cada segmento del path debe arrancar con alfanumerico -> bloquea ".." y "@".
+# El query solo acepta chars URL-safe (% permitido para encoding legitimo).
+_SEG_REF_RE = re.compile(
+    r"^/api/[a-zA-Z0-9][a-zA-Z0-9\-_.]*(?:/[a-zA-Z0-9][a-zA-Z0-9\-_.]*)*"
+    r"(?:\?[a-zA-Z0-9\-_.%=&+]{0,220})?$"
+)
+_SEG_REF_MAX_LEN = 256
+
+_MAX_PLAYLIST_BYTES = 256 * 1024   # 256 KB — una playlist m3u8 nunca deberia pasar de esto
+_MAX_SEGMENT_BYTES = 8 * 1024 * 1024  # 8 MB — generoso para un segmento H.264 de 2-4 s
+
+# Tipos MIME que go2rtc puede devolver para segmentos HLS.
+# application/octet-stream: fallback cuando go2rtc no pone tipo explicito.
+_HLS_SEGMENT_CONTENT_TYPES = frozenset(
+    {"video/mp4", "video/mp2t", "video/iso.segment", "application/octet-stream"}
+)
+
+
+def _resolve_seg_ref(raw_uri: str, go2rtc_base_url: str) -> str:
+    """
+    Convierte una URI de segmento go2rtc en una referencia validada.
+
+    Pasos:
+    1. Resuelve la URI (relativa o absoluta) contra la URL de la playlist de
+       go2rtc para obtener una URL absoluta.
+    2. Verifica que el host resultante sea el mismo go2rtc (anti-SSRF: bloquea
+       URIs que apunten a hosts externos).
+    3. Verifica que el path comience con /api/ (las APIs de go2rtc viven ahi).
+    4. Elimina el param `src` del query (se re-agrega server-side al servir el
+       segmento, usando el stream_name del allowlist, nunca del request).
+    5. Valida longitud y charset del resultado.
+
+    Lanza CameraMediaError con codigo explicito si algo falla — nunca silencia.
+    """
+    # urljoin resuelve correctamente: relativas, absolutas con path, y absolutas
+    # con host distinto (estas ultimas quedan con netloc != go2rtc_base_url).
+    playlist_base = f"{go2rtc_base_url}/api/stream.m3u8"
+    abs_url = urljoin(playlist_base, raw_uri)
+    parsed = urlparse(abs_url)
+
+    # Anti-SSRF: si la URI apuntara a otro host (p.ej. via URI="http://evil.com/")
+    # urljoin deja ese host en parsed.netloc. Lo bloqueamos aqui.
+    expected_netloc = urlparse(go2rtc_base_url).netloc
+    if parsed.netloc and parsed.netloc != expected_netloc:
+        raise CameraMediaError("go2rtc_hls_uri_host_externo", 502)
+
+    path = parsed.path
+    if not path.startswith("/api/"):
+        # Las URIs de go2rtc 1.9.x deben estar bajo /api/. Si llegan de otro
+        # lugar, la suposicion sobre la API no se cumple — mejor error explicito
+        # que proxear a ciegas a una ruta desconocida.
+        raise CameraMediaError("go2rtc_hls_uri_fuera_de_api", 502)
+
+    # Eliminar src del query: el stream_name viaja server-side desde el allowlist.
+    # Ordenamos las claves restantes para producir una referencia determinista.
+    params = parse_qs(parsed.query, keep_blank_values=True)
+    params.pop("src", None)
+    new_query = urlencode(sorted((k, v[0]) for k, v in params.items()))
+
+    seg_ref = path + ("?" + new_query if new_query else "")
+
+    if len(seg_ref) > _SEG_REF_MAX_LEN:
+        raise CameraMediaError("go2rtc_hls_uri_demasiado_larga", 502)
+    if not _SEG_REF_RE.fullmatch(seg_ref):
+        # Chars inesperados en el path o query (p.ej. espacios, backslash, @@).
+        raise CameraMediaError("go2rtc_hls_uri_invalida", 502)
+
+    return seg_ref
+
+
+def _rewrite_hls_playlist(
+    raw: str,
+    *,
+    go2rtc_base_url: str,
+    our_seg_prefix: str,
+) -> str:
+    """
+    Reescribe las URIs de segmento de una playlist HLS de go2rtc.
+
+    Itera linea a linea el m3u8 y reemplaza:
+    - #EXT-X-MAP:URI="..." (segmento de inicializacion fMP4)
+    - Lineas de segmento (no-comentario, no-vacias)
+
+    Cada URI va por _resolve_seg_ref: se valida y se strip-ea el param src.
+    Luego se convierte en nuestro endpoint:
+      <our_seg_prefix>?_seg=<seg_ref_urlencode>
+
+    Los tags restantes (#EXTINF, #EXT-X-TARGETDURATION, etc.) se dejan tal
+    cual — no contienen URIs que necesiten reescritura.
+
+    Lanza CameraMediaError si alguna URI falla la validacion.
+    """
+    if "#EXT-X-STREAM-INF" in raw:
+        # go2rtc devolvio un master playlist (multi-variante). No lo soportamos
+        # por ahora; un master playlist necesita reescribir URIs de variante,
+        # no de segmentos — logica distinta.
+        raise CameraMediaError("go2rtc_hls_master_playlist_no_soportado", 502)
+
+    lines_out: list[str] = []
+
+    for line in raw.splitlines(keepends=True):
+        stripped = line.rstrip("\r\n")
+        eol = line[len(stripped):]  # preserva el terminador original (\n o \r\n)
+
+        # Tag de segmento de inicializacion: #EXT-X-MAP:URI="<uri>"
+        if stripped.startswith("#EXT-X-MAP:"):
+            def _sub_map_uri(m: re.Match) -> str:
+                raw_uri = m.group(1)
+                seg_ref = _resolve_seg_ref(raw_uri, go2rtc_base_url)
+                our_uri = f"{our_seg_prefix}?_seg={quote(seg_ref, safe='')}"
+                return f'URI="{our_uri}"'
+
+            rewritten = re.sub(r'URI="([^"]*)"', _sub_map_uri, stripped)
+            lines_out.append(rewritten + eol)
+            continue
+
+        # Segmento de medios: linea no-vacia que NO empieza con #
+        if stripped and not stripped.startswith("#"):
+            seg_ref = _resolve_seg_ref(stripped, go2rtc_base_url)
+            our_uri = f"{our_seg_prefix}?_seg={quote(seg_ref, safe='')}"
+            lines_out.append(our_uri + eol)
+            continue
+
+        # Tags (#EXTINF, #EXT-X-TARGETDURATION, etc.), comentarios y vacias
+        lines_out.append(line)
+
+    return "".join(lines_out)
 
 
 class CameraMediaClient:
@@ -546,5 +703,164 @@ class CameraMediaClient:
                 raise
             except TimeoutError as exc:
                 raise CameraMediaError("go2rtc_stream_timeout", 504) from exc
+            except aiohttp.ClientError as exc:
+                raise CameraMediaError("go2rtc_connection_failed", 502) from exc
+
+    async def fetch_hls_playlist(
+        self,
+        entity_id: str,
+        *,
+        our_seg_prefix: str,
+    ) -> str:
+        """
+        Descarga la playlist HLS de go2rtc y reescribe las URIs de segmento.
+
+        Devuelve el texto m3u8 con las URIs de segmento reemplazadas por
+        nuestro endpoint proxy (our_seg_prefix), para que el navegador nunca
+        vea el host ni el stream name de go2rtc.
+
+        Usa GET /api/stream.m3u8?src=<nombre> de go2rtc 1.9.x. Si go2rtc
+        responde 404, lanza CameraMediaError("go2rtc_hls_no_soportado", 501)
+        — codigo distinguible del 502 generico para saber al instante si esa
+        build de go2rtc no compila HLS (no todas lo hacen).
+
+        Usa self._stream_slots para no saturar go2rtc con fetches concurrentes
+        de playlist (mismo semaforo que stream.mp4 y segmentos).
+        """
+        session = self._require_session()
+        if not self._go2rtc_base_url:
+            raise CameraMediaError("go2rtc_not_configured", 503)
+        stream_name = self._camera_streams.get(entity_id)
+        if stream_name is None:
+            raise CameraMediaError("camera_stream_not_configured", 404)
+
+        encoded = quote(stream_name, safe="")
+        url = f"{self._go2rtc_base_url}/api/stream.m3u8?src={encoded}"
+
+        async with self._stream_slots:
+            try:
+                async with session.get(
+                    url,
+                    auth=self._go2rtc_auth,
+                    allow_redirects=False,
+                    headers={"Accept": "application/vnd.apple.mpegurl"},
+                ) as response:
+                    if response.status == 404:
+                        # go2rtc puede compilarse sin HLS o el stream no existe.
+                        # 501 (no soportado) en vez de 502 para distinguirlo de
+                        # un error de red: al probarlo en la cajita sabemos de
+                        # inmediato si es un problema de version o de stream.
+                        raise CameraMediaError("go2rtc_hls_no_soportado", 501)
+                    if response.status in {401, 403}:
+                        raise CameraMediaError("go2rtc_auth_failed", 502)
+                    if response.status >= 400:
+                        raise CameraMediaError("go2rtc_hls_failed", 502)
+
+                    raw = await response.content.read(_MAX_PLAYLIST_BYTES + 1)
+                    if not raw:
+                        raise CameraMediaError("go2rtc_hls_empty", 502)
+                    if len(raw) > _MAX_PLAYLIST_BYTES:
+                        raise CameraMediaError("go2rtc_hls_demasiado_grande", 502)
+            except CameraMediaError:
+                raise
+            except TimeoutError as exc:
+                raise CameraMediaError("go2rtc_hls_timeout", 504) from exc
+            except aiohttp.ClientError as exc:
+                raise CameraMediaError("go2rtc_connection_failed", 502) from exc
+
+        try:
+            playlist_text = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise CameraMediaError("go2rtc_hls_encoding_invalido", 502) from exc
+
+        # _rewrite_hls_playlist puede lanzar CameraMediaError si las URIs de
+        # go2rtc no cumplen la forma esperada (ver _resolve_seg_ref).
+        return _rewrite_hls_playlist(
+            playlist_text,
+            go2rtc_base_url=self._go2rtc_base_url,
+            our_seg_prefix=our_seg_prefix,
+        )
+
+    async def fetch_hls_segment(self, entity_id: str, seg_ref: str) -> HlsSegmentPayload:
+        """
+        Proxea un segmento HLS desde go2rtc hacia el navegador.
+
+        `seg_ref` es la referencia generada por _rewrite_hls_playlist:
+        path+query de go2rtc sin scheme, host ni el param src. Llega aqui ya
+        validado por el endpoint de la API; se re-valida por defensividad.
+
+        Reconstruye la URL de go2rtc agregando el src del allowlist del servidor
+        (nunca del request del navegador) — ese es el mecanismo anti-SSRF del
+        lado de los segmentos: el navegador solo ve el entity_id en la ruta, no
+        el stream name interno ni el host de go2rtc.
+        """
+        session = self._require_session()
+        if not self._go2rtc_base_url:
+            raise CameraMediaError("go2rtc_not_configured", 503)
+        stream_name = self._camera_streams.get(entity_id)
+        if stream_name is None:
+            raise CameraMediaError("camera_stream_not_configured", 404)
+
+        # Re-validacion defensiva: aunque ya viene validado del endpoint,
+        # el cliente no deberia confiar en que su llamador siempre valido.
+        if not seg_ref or len(seg_ref) > _SEG_REF_MAX_LEN or not _SEG_REF_RE.fullmatch(seg_ref):
+            raise CameraMediaError("go2rtc_hls_seg_ref_invalida", 400)
+
+        # Reconstruir la URL de go2rtc: base + path del segmento + query SIN
+        # ningun `src` que venga del navegador + el `src` del allowlist.
+        #
+        # POR QUE SE REMUEVE `src` EN VEZ DE SOLO CONCATENAR EL NUESTRO: el
+        # `seg_ref` llega del navegador. La playlist que emitimos nunca lleva
+        # `src`, pero un cliente puede fabricar `_seg=/api/stream.m4s?src=OTRO`
+        # a mano — pasa la regex, porque `src=OTRO` son caracteres legitimos.
+        # Al concatenar el nuestro quedaria `?src=OTRO&src=REAL`, y go2rtc (Go)
+        # resuelve `Query().Get("src")` con el PRIMER valor: el del navegador.
+        # Eso dejaria elegir cualquier stream y anularia el allowlist, que es
+        # justamente toda la defensa. Se remueve siempre y se pone el nuestro.
+        partes = urlparse(seg_ref)
+        query = [
+            (k, v)
+            for k, v in parse_qsl(partes.query, keep_blank_values=True)
+            if k != "src"
+        ]
+        query.append(("src", stream_name))
+        go2rtc_url = f"{self._go2rtc_base_url}{partes.path}?{urlencode(query)}"
+
+        async with self._stream_slots:
+            try:
+                async with session.get(
+                    go2rtc_url,
+                    auth=self._go2rtc_auth,
+                    allow_redirects=False,
+                    headers={"Accept": "video/mp4, video/mp2t, */*"},
+                ) as response:
+                    if response.status == 404:
+                        raise CameraMediaError("go2rtc_hls_segmento_no_encontrado", 404)
+                    if response.status in {401, 403}:
+                        raise CameraMediaError("go2rtc_auth_failed", 502)
+                    if response.status >= 400:
+                        raise CameraMediaError("go2rtc_hls_segment_failed", 502)
+
+                    content_type = (
+                        response.headers.get("Content-Type", "application/octet-stream")
+                        .split(";")[0]
+                        .strip()
+                        .lower()
+                    )
+                    if content_type not in _HLS_SEGMENT_CONTENT_TYPES:
+                        raise CameraMediaError("go2rtc_hls_segment_content_type_invalido", 502)
+
+                    body = await response.content.read(_MAX_SEGMENT_BYTES + 1)
+                    if len(body) > _MAX_SEGMENT_BYTES:
+                        raise CameraMediaError("go2rtc_hls_segmento_demasiado_grande", 502)
+
+                    # Normalizamos octet-stream a video/mp4 para que Safari no
+                    # rechace el segmento por tipo de contenido desconocido.
+                    final_ct = content_type if content_type != "application/octet-stream" else "video/mp4"
+                    return HlsSegmentPayload(body=body, content_type=final_ct)
+            except CameraMediaError:
+                raise
+            except TimeoutError as exc:
+                raise CameraMediaError("go2rtc_hls_segment_timeout", 504) from exc
             except aiohttp.ClientError as exc:
                 raise CameraMediaError("go2rtc_connection_failed", 502) from exc
