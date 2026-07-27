@@ -277,7 +277,13 @@ class CameraMediaClient:
     # el TTL, se refresca EN SEGUNDO PLANO. Asi el pedido del usuario no espera
     # nunca a go2rtc (salvo la primera vez de cada camara) y go2rtc recibe a lo
     # sumo un pedido por camara por TTL, fuera del camino del request.
-    _SNAPSHOT_CACHE_TTL = 30.0
+    # TTL del GRID: por debajo de esto el cuadro cacheado se sirve sin refrescar.
+    # Alineado con los 8 s del warm-loop y del refresco del cliente del grid
+    # (snapshotRefreshMs=8000): con el warm-loop sano el grid siempre halla un
+    # cuadro < 10 s; y si se pasa (p.ej. la variante movil que el warm-loop no
+    # cubre) el propio pedido dispara un refresco en segundo plano
+    # (stale-while-revalidate) en vez de esperar los 30 s de antes.
+    _SNAPSHOT_CACHE_TTL = 10.0
     # Hasta cuando servimos un cuadro viejo mientras se refresca por detras.
     #
     # 30 min y no 3: con 180 s, abrir la app un par de horas despues encontraba
@@ -306,12 +312,14 @@ class CameraMediaClient:
     # pidió. Cuando nadie mira el grid por un rato, go2rtc suelta el stream RTSP
     # por inactividad y la próxima apertura paga el COLD-START (5-19 s el 1er
     # cuadro). Este loop pide un cuadro de cada cámara cada _PREWARM_INTERVAL →
-    # el caché nunca vence y —más importante— el stream de go2rtc queda vivo, así
-    # el grid abre rápido SIEMPRE. Carga acotada: pide MENOS seguido que el propio
-    # grid cuando se está mirando (refresca cada 15 s), así que nunca supera el
-    # pico que ya ocurre viendo cámaras.
+    # el server mantiene una foto fresca de cada cámara cada 8 s para el grid, el
+    # caché nunca vence y —más importante— el stream de go2rtc queda vivo, así el
+    # grid abre rápido SIEMPRE. Es UNA decodificación por cámara cada 8 s del lado
+    # server, sin importar cuántos clientes ni cuántas fichas miren el grid: PC y
+    # móvil se sirven de este mismo caché tibio (el vivo pesado queda solo para la
+    # cámara que se abre a pantalla completa).
     _PREWARM_ENABLED = True
-    _PREWARM_INTERVAL = 25.0  # < _SNAPSHOT_CACHE_TTL (30 s) → grid siempre encuentra caché fresca
+    _PREWARM_INTERVAL = 8.0  # < _SNAPSHOT_CACHE_TTL (10 s) → grid siempre encuentra caché fresca
     _PREWARM_CONCURRENCY = 4  # gentil con la cajita en el warm inicial en frío
     _PREWARM_WIDTH = 512  # variante del grid de ESCRITORIO; tener vivo el stream acelera todas
     _PREWARM_QUALITY = 55
