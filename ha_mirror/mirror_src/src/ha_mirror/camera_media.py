@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import re
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from typing import AsyncIterator
 from urllib.parse import parse_qs, parse_qsl, quote, urlencode, urljoin, urlparse
@@ -301,6 +301,22 @@ class CameraMediaClient:
     # y el single-flight sigue coalescando si hay varios espectadores.
     _SNAPSHOT_LIVE_TTL = 0.8
 
+    # ── Warm-up proactivo ─────────────────────────────────────────────────────
+    # El caché de arriba es REACTIVO: solo mantiene tibia una cámara que YA se
+    # pidió. Cuando nadie mira el grid por un rato, go2rtc suelta el stream RTSP
+    # por inactividad y la próxima apertura paga el COLD-START (5-19 s el 1er
+    # cuadro). Este loop pide un cuadro de cada cámara cada _PREWARM_INTERVAL →
+    # el caché nunca vence y —más importante— el stream de go2rtc queda vivo, así
+    # el grid abre rápido SIEMPRE. Carga acotada: pide MENOS seguido que el propio
+    # grid cuando se está mirando (refresca cada 15 s), así que nunca supera el
+    # pico que ya ocurre viendo cámaras.
+    _PREWARM_ENABLED = True
+    _PREWARM_INTERVAL = 25.0  # < _SNAPSHOT_CACHE_TTL (30 s) → grid siempre encuentra caché fresca
+    _PREWARM_CONCURRENCY = 4  # gentil con la cajita en el warm inicial en frío
+    _PREWARM_WIDTH = 512  # variante del grid de ESCRITORIO; tener vivo el stream acelera todas
+    _PREWARM_QUALITY = 55
+    _PREWARM_INITIAL_DELAY = 8.0  # dejar bootear el add-on antes del 1er ciclo
+
     def __init__(
         self,
         *,
@@ -333,14 +349,27 @@ class CameraMediaClient:
         # referencia para que el GC no se los lleve a medio camino).
         self._refreshing: set[_CacheKey] = set()
         self._refresh_tasks: set[asyncio.Task[None]] = set()
+        # Task del loop de warm-up proactivo (ver constantes _PREWARM_*).
+        self._prewarm_task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
         """Crea una sesion HTTP reutilizable; llamar durante lifespan."""
         if self._session is None or self._session.closed:
             timeout = aiohttp.ClientTimeout(total=15, connect=5, sock_read=12)
             self._session = aiohttp.ClientSession(timeout=timeout)
+        # Warm-up proactivo: mantiene vivos los streams go2rtc para que el grid
+        # abra rápido siempre (no solo la 2ª vez). Se cancela en close().
+        if self._PREWARM_ENABLED and self._prewarm_task is None:
+            self._prewarm_task = asyncio.create_task(self._prewarm_loop())
 
     async def close(self) -> None:
+        # Cortar el warm-up ANTES que nada, para que no dispare pedidos nuevos
+        # mientras cerramos.
+        if self._prewarm_task is not None:
+            self._prewarm_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._prewarm_task
+            self._prewarm_task = None
         # Cortar los refrescos en segundo plano ANTES de cerrar la sesion HTTP,
         # si no quedan tasks pidiendo sobre un ClientSession ya cerrado.
         for task in list(self._refresh_tasks):
@@ -463,6 +492,40 @@ class CameraMediaClient:
             pass  # go2rtc no pudo ahora; el cuadro cacheado sigue sirviendo
         finally:
             self._refreshing.discard(key)
+
+    async def _prewarm_loop(self) -> None:
+        """
+        Mantiene las cámaras TIBIAS de forma proactiva (ver constantes _PREWARM_*).
+
+        Cada _PREWARM_INTERVAL pide un cuadro de cada stream mapeado con
+        concurrencia acotada. `_refresh_snapshot(..., ttl=_PREWARM_INTERVAL)`
+        salta el pedido si otro (real o del ciclo anterior) ya trajo un cuadro
+        dentro de la ventana → durante el uso activo defiere al tráfico real, y
+        durante la inactividad es el único que mantiene vivo el stream de go2rtc.
+        Nunca tumba el add-on: un ciclo que falla se loguea y se reintenta.
+        """
+        await asyncio.sleep(self._PREWARM_INITIAL_DELAY)
+        sem = asyncio.Semaphore(self._PREWARM_CONCURRENCY)
+
+        async def _warm_one(entity_id: str) -> None:
+            async with sem:
+                key: _CacheKey = (entity_id, self._PREWARM_WIDTH, self._PREWARM_QUALITY)
+                # go2rtc no pudo ahora; se reintenta en el próximo ciclo.
+                with suppress(CameraMediaError):
+                    await self._refresh_snapshot(key, ttl=self._PREWARM_INTERVAL)
+
+        while True:
+            try:
+                entities = self.list_stream_entities()
+                if entities:
+                    await asyncio.gather(
+                        *(_warm_one(e) for e in entities), return_exceptions=True
+                    )
+            except asyncio.CancelledError:
+                raise  # cierre normal (close())
+            except Exception:  # noqa: BLE001 — un loop de fondo jamás debe tumbar el add-on
+                logger.exception("camera.prewarm_cycle_error")
+            await asyncio.sleep(self._PREWARM_INTERVAL)
 
     async def _refresh_snapshot(
         self, key: _CacheKey, *, ttl: float | None = None
