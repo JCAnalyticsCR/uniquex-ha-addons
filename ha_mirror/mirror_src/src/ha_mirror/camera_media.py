@@ -16,6 +16,9 @@ from typing import AsyncIterator
 from urllib.parse import parse_qs, parse_qsl, quote, urlencode, urljoin, urlparse
 
 import aiohttp
+import structlog
+
+logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
 
 
 class CameraMediaError(Exception):
@@ -775,11 +778,29 @@ class CameraMediaClient:
 
         # _rewrite_hls_playlist puede lanzar CameraMediaError si las URIs de
         # go2rtc no cumplen la forma esperada (ver _resolve_seg_ref).
-        return _rewrite_hls_playlist(
-            playlist_text,
-            go2rtc_base_url=self._go2rtc_base_url,
-            our_seg_prefix=our_seg_prefix,
-        )
+        #
+        # DIAGNOSTICO: la forma real de las URIs de go2rtc 1.9.14 no se puede
+        # inspeccionar desde afuera de la cajita — go2rtc solo es alcanzable
+        # desde adentro y Cloudflare reemplaza el cuerpo de las respuestas 5xx,
+        # asi que el `detail` del error nunca llega al que prueba. Por eso, si la
+        # reescritura falla, dejamos en el log del add-on una MUESTRA de la
+        # playlist cruda: con eso se corrige el parseo de una, en vez de adivinar
+        # entre tres errores posibles. Se trunca porque solo hacen falta las
+        # primeras lineas para ver el formato de las URIs.
+        try:
+            return _rewrite_hls_playlist(
+                playlist_text,
+                go2rtc_base_url=self._go2rtc_base_url,
+                our_seg_prefix=our_seg_prefix,
+            )
+        except CameraMediaError as exc:
+            logger.error(
+                "hls.rewrite_failed",
+                code=exc.code,
+                entity_id=entity_id,
+                muestra=playlist_text[:600],
+            )
+            raise
 
     async def fetch_hls_segment(self, entity_id: str, seg_ref: str) -> HlsSegmentPayload:
         """
