@@ -35,6 +35,7 @@ from ha_mirror.api.camera_ws import router as camera_ws_router
 from ha_mirror.api.entities import router as entities_router
 from ha_mirror.api.health import router as health_router
 from ha_mirror.api.iframe_token import router as iframe_router
+from ha_mirror.api.preferences import router as preferences_router
 from ha_mirror.api.scenes import router as scenes_router
 from ha_mirror.api.service import router as service_router
 from ha_mirror.api.ws_state import router as ws_router
@@ -279,6 +280,7 @@ def create_app() -> FastAPI:
     app.include_router(iframe_router)
     app.include_router(camera_media_router)
     app.include_router(scenes_router)
+    app.include_router(preferences_router)
 
     # Routers WebSocket
     app.include_router(ws_router)

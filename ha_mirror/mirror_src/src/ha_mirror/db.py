@@ -111,6 +111,16 @@ CREATE TABLE IF NOT EXISTS scenes (
 );
 CREATE INDEX IF NOT EXISTS idx_scenes_tenant_created
     ON scenes(tenant_id, created_at);
+
+-- Preferencias KV del cliente (layout del Inicio, etc.). Single-tenant.
+-- Diseñada COMPLETA de entrada: ver nota en scenes sobre migraciones.
+CREATE TABLE IF NOT EXISTS preferences (
+    tenant_id   INTEGER NOT NULL DEFAULT 1 REFERENCES tenants(id),
+    key         TEXT NOT NULL,
+    value_json  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, key)
+);
 """
 
 
@@ -427,3 +437,47 @@ class Database:
             actualizadas = cur.rowcount
         await conn.commit()
         return ahora if actualizadas else None
+
+    # -------------------------------------------------------------------------
+    # Preferencias KV (layout del Inicio, configuración del cliente)
+    #
+    # Misma decisión que escenas: _require_conn() en lugar de silencio. Devolver
+    # None cuando la DB no está montada confundiría al router creyendo que no hay
+    # preferencias guardadas y resetearía el layout del cliente — mejor un 500
+    # ruidoso que resetear en silencio el orden que eligió el usuario.
+    # -------------------------------------------------------------------------
+
+    async def get_preference(self, key: str, tenant_id: int = 1) -> Any | None:
+        """Lee una preferencia KV. Devuelve el objeto Python o None si no existe.
+
+        Si el JSON guardado está corrupto devuelve None en lugar de reventar:
+        el endpoint lo tratará como "sin dato" y devolverá el fallback vacío.
+        """
+        conn = self._require_conn()
+        async with conn.execute(
+            "SELECT value_json FROM preferences WHERE tenant_id = ? AND key = ?",
+            (tenant_id, key),
+        ) as cur:
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            try:
+                return json.loads(row["value_json"])
+            except json.JSONDecodeError:
+                logger.warning("db.preference_json_corrupt", key=key, tenant_id=tenant_id)
+                return None
+
+    async def set_preference(self, key: str, value: Any, tenant_id: int = 1) -> None:
+        """Upsert de una preferencia KV. Crea la fila o actualiza sin tocar otras claves."""
+        conn = self._require_conn()
+        await conn.execute(
+            """
+            INSERT INTO preferences (tenant_id, key, value_json, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(tenant_id, key) DO UPDATE
+                SET value_json = excluded.value_json,
+                    updated_at = excluded.updated_at
+            """,
+            (tenant_id, key, json.dumps(value, separators=(",", ":")), utc_now_iso()),
+        )
+        await conn.commit()
