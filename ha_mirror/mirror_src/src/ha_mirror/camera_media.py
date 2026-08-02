@@ -54,6 +54,35 @@ class _CachedSnapshot:
     stored_at: float
 
 
+@dataclass(frozen=True, slots=True)
+class _HlsSession:
+    """
+    Sesion HLS activa de go2rtc: URL de la media playlist con su id opaco.
+
+    go2rtc 1.9.14 asigna un id de sesion la primera vez que se solicita el
+    master (/api/stream.m3u8?src=...) y lo mantiene activo mientras sigan
+    llegando pedidos a esa misma media playlist. Guardamos la URL completa
+    — que ya incluye ?id=XXX — para que los polls sucesivos de Safari vayan
+    directamente a la media sin re-negociar el master.
+
+    SIN ESTA CACHE: cada poll de Safari llamaba a fetch_hls_playlist, que
+    pedia el master y obtenía un id NUEVO. Safari recibía #EXT-X-MEDIA-SEQUENCE:0
+    en cada respuesta, interpretando el stream como un "vivo que nunca avanza".
+    Ademas, cada llamada dejaba una sesion HLS colgada en go2rtc por no poder
+    reutilizar la anterior.
+
+    CON ESTA CACHE: el segundo poll va directo a /api/hls/playlist.m3u8?id=XXX
+    (el mismo id) y go2rtc devuelve MEDIA-SEQUENCE:1, MEDIA-SEQUENCE:2, etc.
+    Safari ve el video avanzar normalmente.
+    """
+
+    # URL completa de la media playlist, p.ej.:
+    # http://go2rtc/api/hls/playlist.m3u8?id=rrEq3WNf
+    media_url: str
+    # time.monotonic() cuando se nego esta sesion (para el TTL).
+    created_at: float
+
+
 # Clave de cache: la misma camara pedida con distinto ancho/calidad produce
 # bytes distintos, asi que cada variante se cachea por separado.
 _CacheKey = tuple[str, "int | None", "int | None"]
@@ -314,6 +343,19 @@ class CameraMediaClient:
     # y el single-flight sigue coalescando si hay varios espectadores.
     _SNAPSHOT_LIVE_TTL = 0.8
 
+    # ── Sesion HLS (Safari) ───────────────────────────────────────────────────
+    #
+    # go2rtc asigna un id de sesion opaco la primera vez que se pide el master
+    # y lo mantiene vivo mientras sigan llegando polls a esa media playlist.
+    # Guardamos la URL de la media (que ya incluye ?id=XXX) para reutilizarla
+    # en polls sucesivos sin re-negociar el master — ver _HlsSession y
+    # _get_hls_media_playlist para el flujo completo.
+    #
+    # TTL elegido con margen respecto al timeout de go2rtc (~30 s de inactividad):
+    # si el usuario lleva mas de 25 s sin pedir el playlist, la sesion puede
+    # estar cancelada en go2rtc; renegociar es mas seguro que recibir un 404.
+    _HLS_SESSION_TTL = 25.0
+
     # ── Warm-up proactivo ─────────────────────────────────────────────────────
     # El caché de arriba es REACTIVO: solo mantiene tibia una cámara que YA se
     # pidió. Cuando nadie mira el grid por un rato, go2rtc suelta el stream RTSP
@@ -327,7 +369,16 @@ class CameraMediaClient:
     # cámara que se abre a pantalla completa).
     _PREWARM_ENABLED = True
     _PREWARM_INTERVAL = 8.0  # < _SNAPSHOT_CACHE_TTL (10 s) → grid siempre encuentra caché fresca
-    _PREWARM_CONCURRENCY = 4  # gentil con la cajita en el warm inicial en frío
+    # Concurrencia del warm loop: 20 cámaras / 10 = 2 lotes; con 4 s/cámara
+    # (worst-case medido) → 2 × 4 = 8 s por ciclo = exactamente _PREWARM_INTERVAL.
+    # Con el fix de sleep timer-based el ciclo TOTAL (gather + sleep) dura
+    # siempre _PREWARM_INTERVAL, no _PREWARM_INTERVAL + gather.
+    #
+    # Interacción con _snapshot_slots (24): el warm loop ocupa hasta 10 de esos
+    # 24 slots mientras hace los fetches; los 14 restantes quedan para pedidos
+    # reales (live=True del visor iPhone). El visor en vivo usa _stream_slots
+    # (mp4/hls), que es un semáforo distinto: no compite con el warm loop.
+    _PREWARM_CONCURRENCY = 10
     _PREWARM_WIDTH = 512  # variante del grid de ESCRITORIO; tener vivo el stream acelera todas
     _PREWARM_QUALITY = 55
     _PREWARM_INITIAL_DELAY = 8.0  # dejar bootear el add-on antes del 1er ciclo
@@ -366,6 +417,14 @@ class CameraMediaClient:
         self._refresh_tasks: set[asyncio.Task[None]] = set()
         # Task del loop de warm-up proactivo (ver constantes _PREWARM_*).
         self._prewarm_task: asyncio.Task[None] | None = None
+        # Cache de sesiones HLS por camara: guarda la URL de la media playlist
+        # (que ya contiene el id de sesion de go2rtc) para reutilizarla entre
+        # polls de Safari sin re-negociar el master. Ver _HlsSession y
+        # _get_hls_media_playlist para el flujo completo de cache/expirado.
+        self._hls_sessions: dict[str, _HlsSession] = {}
+        # Lock por camara: evita que dos polls simultaneos del mismo stream
+        # negotien dos sesiones a la vez — el segundo reutiliza la del primero.
+        self._hls_session_locks: dict[str, asyncio.Lock] = {}
 
     async def start(self) -> None:
         """Crea una sesion HTTP reutilizable; llamar durante lifespan."""
@@ -395,6 +454,10 @@ class CameraMediaClient:
         self._refreshing.clear()
         self._snapshot_cache.clear()
         self._snapshot_locks.clear()
+        # Limpiar sesiones HLS para que no queden ids huerfanos si el add-on
+        # se reinicia y go2rtc ya descarto esas sesiones.
+        self._hls_sessions.clear()
+        self._hls_session_locks.clear()
         if self._session is not None and not self._session.closed:
             await self._session.close()
         self._ha_token = ""
@@ -530,6 +593,10 @@ class CameraMediaClient:
                     await self._refresh_snapshot(key, ttl=self._PREWARM_INTERVAL)
 
         while True:
+            # Registrar el inicio del ciclo ANTES del gather para poder calcular
+            # cuánto tiempo sobra después. Esto hace que el ciclo completo dure
+            # _PREWARM_INTERVAL (no _PREWARM_INTERVAL + duracion_del_gather).
+            t_ini = time.monotonic()
             try:
                 entities = self.list_stream_entities()
                 if entities:
@@ -540,7 +607,12 @@ class CameraMediaClient:
                 raise  # cierre normal (close())
             except Exception:  # noqa: BLE001 — un loop de fondo jamás debe tumbar el add-on
                 logger.exception("camera.prewarm_cycle_error")
-            await asyncio.sleep(self._PREWARM_INTERVAL)
+            # Dormir lo que reste para completar el intervalo exacto. Si el gather
+            # ya tardó más que _PREWARM_INTERVAL (NVR muy lento o NVR cold-start),
+            # max(0, ...) evita un sleep negativo y el ciclo siguiente empieza
+            # de inmediato sin acumular retraso.
+            elapsed = time.monotonic() - t_ini
+            await asyncio.sleep(max(0.0, self._PREWARM_INTERVAL - elapsed))
 
     async def _refresh_snapshot(
         self, key: _CacheKey, *, ttl: float | None = None
@@ -896,6 +968,141 @@ class CameraMediaClient:
         except UnicodeDecodeError as exc:
             raise CameraMediaError("go2rtc_hls_encoding_invalido", 502) from exc
 
+    async def _fetch_via_master(
+        self,
+        entity_id: str,
+        stream_name: str,
+        session: aiohttp.ClientSession,
+    ) -> tuple[str, str]:
+        """
+        Negocia una sesion HLS nueva a traves del master playlist de go2rtc.
+
+        Retorna (media_url, media_raw):
+        - media_url: URL completa de la media playlist (incluye ?id=XXX).
+        - media_raw: texto crudo listo para reescribir.
+
+        Se invoca en dos situaciones:
+        1. No hay sesion cacheada (primer poll o TTL vencido).
+        2. La sesion cacheada devolvio 404 (go2rtc la cancelo por inactividad).
+
+        IMPORTANTE: los segmentos de la media playlist son relativos a SU
+        propia URL (/api/hls/playlist.m3u8?id=X), no al master. Por eso
+        devolvemos media_url en vez de master_url: _rewrite_hls_playlist la
+        usa como resolve_base para resolver correctamente las URIs relativas.
+        """
+        encoded = quote(stream_name, safe="")
+        master_url = f"{self._go2rtc_base_url}/api/stream.m3u8?src={encoded}"
+
+        master_raw = await self._fetch_raw_hls(
+            master_url,
+            session,
+            not_found_code="go2rtc_hls_no_soportado",
+            not_found_status=501,
+        )
+
+        if "#EXT-X-STREAM-INF" in master_raw:
+            variant_uri_raw = _extract_first_variant_uri(master_raw)
+            if variant_uri_raw is None:
+                raise CameraMediaError("go2rtc_hls_master_sin_variante", 502)
+
+            # La variante es relativa al master_url, no a go2rtc_base_url.
+            variant_ref = _resolve_seg_ref(
+                variant_uri_raw,
+                go2rtc_base_url=self._go2rtc_base_url,
+                resolve_base=master_url,
+            )
+            # go2rtc 1.9.14 identifica la sesion por `id`, no por `src`:
+            # la URI de variante ya trae el id (hls/playlist.m3u8?id=XXX).
+            # No se agrega src — el id es suficiente y un src ajeno puede
+            # desorientar a go2rtc.
+            media_url = f"{self._go2rtc_base_url}{variant_ref}"
+            media_raw = await self._fetch_raw_hls(
+                media_url,
+                session,
+                not_found_code="go2rtc_hls_variante_no_encontrada",
+                not_found_status=502,
+            )
+        else:
+            # go2rtc devolvio media playlist directa (poco probable en 1.9.14,
+            # pero lo cubrimos por si cambia en versiones futuras).
+            media_url = master_url
+            media_raw = master_raw
+
+        return media_url, media_raw
+
+    async def _get_hls_media_playlist(
+        self,
+        entity_id: str,
+        stream_name: str,
+        session: aiohttp.ClientSession,
+    ) -> tuple[str, str]:
+        """
+        Devuelve (media_url, media_raw) reutilizando la sesion HLS si es posible.
+
+        Flujo completo:
+        1. Si hay sesion cacheada y no vencio el TTL (_HLS_SESSION_TTL):
+           pide la media playlist directamente (1 HTTP, sin tocar el master).
+           - Si go2rtc responde 200 → retorna el resultado.
+           - Si go2rtc responde 404 (sesion cancelada por inactividad) →
+             descarta el cache y cae al paso 2. Se renegocia UNA SOLA VEZ;
+             si esa segunda negociacion tambien falla, el error se propaga.
+        2. Sin sesion valida: llama a _fetch_via_master (2 HTTP: master +
+           media), guarda la nueva sesion en cache y retorna.
+
+        El lock por camara serializa pedidos simultaneos del mismo stream:
+        el segundo poll espera al primero y luego hit de cache en vez de
+        crear una sesion duplicada. La adquisicion sigue siempre el orden
+        _stream_slots → entity_lock (el caller ya tiene _stream_slots).
+        """
+        lock = self._hls_session_locks.setdefault(entity_id, asyncio.Lock())
+        async with lock:
+            cached = self._hls_sessions.get(entity_id)
+            if cached is not None:
+                session_age = time.monotonic() - cached.created_at
+                if session_age < self._HLS_SESSION_TTL:
+                    try:
+                        # Poll directo a la media playlist: go2rtc reconoce el
+                        # id y devuelve MEDIA-SEQUENCE:N (N avanza en cada poll).
+                        media_raw = await self._fetch_raw_hls(
+                            cached.media_url,
+                            session,
+                            not_found_code="go2rtc_hls_sesion_expirada",
+                            not_found_status=502,
+                        )
+                        return cached.media_url, media_raw
+                    except CameraMediaError as exc:
+                        if exc.code == "go2rtc_hls_sesion_expirada":
+                            # go2rtc cancelo la sesion (inactividad u otro motivo).
+                            # Descartar la cache y renegociar via master.
+                            logger.info(
+                                "hls.session_expired_renegotiating",
+                                entity_id=entity_id,
+                                session_age_s=round(session_age, 1),
+                            )
+                            del self._hls_sessions[entity_id]
+                        else:
+                            raise
+                else:
+                    # TTL vencido: demasiado tiempo sin usar esta sesion;
+                    # puede que go2rtc la haya cancelado por inactividad.
+                    logger.debug(
+                        "hls.session_ttl_expired",
+                        entity_id=entity_id,
+                        session_age_s=round(session_age, 1),
+                        ttl=self._HLS_SESSION_TTL,
+                    )
+                    del self._hls_sessions[entity_id]
+
+            # Sin sesion valida: negociar via master y almacenar la nueva.
+            media_url, media_raw = await self._fetch_via_master(
+                entity_id, stream_name, session
+            )
+            self._hls_sessions[entity_id] = _HlsSession(
+                media_url=media_url,
+                created_at=time.monotonic(),
+            )
+            return media_url, media_raw
+
     async def fetch_hls_playlist(
         self,
         entity_id: str,
@@ -903,26 +1110,29 @@ class CameraMediaClient:
         our_seg_prefix: str,
     ) -> str:
         """
-        Descarga la playlist HLS de go2rtc y reescribe las URIs de segmento.
+        Descarga la playlist HLS de go2rtc, reutiliza la sesion y reescribe URIs.
 
         go2rtc 1.9.14 devuelve un MASTER playlist con #EXT-X-STREAM-INF en
         /api/stream.m3u8?src=<nombre>. El browser (Safari) necesita una MEDIA
-        playlist directa. Este metodo la sigue server-side:
+        playlist directa, con #EXT-X-MEDIA-SEQUENCE que avance en cada poll.
 
-        1. Fetch master de /api/stream.m3u8?src=<allowlist>.
-        2. Si tiene #EXT-X-STREAM-INF: extraer primera variante, validarla
-           (mismo host go2rtc, bajo /api/, sin traversal), fetch de la media.
-        3. Reescribir los segmentos de la media usando la URL EXACTA de la
-           media como resolve_base (los segmentos son relativos a /api/hls/,
-           NO a /api/ — usar la base del master produce rutas erroneas).
-        4. Devolver la media playlist reescrita.
+        CACHE DE SESION: la primera llamada negocia el master (2 HTTP: master
+        + media). Las siguientes van directo a la media playlist con el mismo
+        id de sesion (1 HTTP). Esto hace que MEDIA-SEQUENCE avance y Safari
+        vea video fluido en vez de un stream que "nunca avanza". Si la sesion
+        expira en go2rtc (404), se renegocia el master una sola vez.
+        Ver _get_hls_media_playlist para el flujo completo.
+
+        ANTI-SSRF: los segmentos de la media se reescriben con el resolve_base
+        exacto de esa media (no del master). Los segmentos son relativos a
+        /api/hls/playlist.m3u8, no a /api/stream.m3u8 — usar la base equivocada
+        produce rutas erroneas (costó un despliegue descubrirlo).
 
         Si go2rtc responde 404 al master: "go2rtc_hls_no_soportado" (501) —
         distinguible de un error de red para diagnostico rapido.
 
-        Si la reescritura falla, loguea la muestra cruda en el add-on (los
-        errores 5xx de go2rtc no llegan al exterior porque Cloudflare los
-        reemplaza — el log es la unica ventana de diagnostico).
+        Si la reescritura falla, loguea la muestra cruda (Cloudflare reemplaza
+        el cuerpo de 5xx y el log es la unica ventana de diagnostico).
         """
         session = self._require_session()
         if not self._go2rtc_base_url:
@@ -931,46 +1141,10 @@ class CameraMediaClient:
         if stream_name is None:
             raise CameraMediaError("camera_stream_not_configured", 404)
 
-        encoded = quote(stream_name, safe="")
-        master_url = f"{self._go2rtc_base_url}/api/stream.m3u8?src={encoded}"
-
         async with self._stream_slots:
-            # ── Fetch del master playlist ────────────────────────────────────
-            master_raw = await self._fetch_raw_hls(
-                master_url,
-                session,
-                not_found_code="go2rtc_hls_no_soportado",
-                not_found_status=501,
+            media_url, media_raw = await self._get_hls_media_playlist(
+                entity_id, stream_name, session
             )
-
-            # ── Si es master, seguir a la media playlist ─────────────────────
-            if "#EXT-X-STREAM-INF" in master_raw:
-                variant_uri_raw = _extract_first_variant_uri(master_raw)
-                if variant_uri_raw is None:
-                    raise CameraMediaError("go2rtc_hls_master_sin_variante", 502)
-
-                # La variante es relativa al master_url, no a go2rtc_base_url.
-                variant_ref = _resolve_seg_ref(
-                    variant_uri_raw,
-                    go2rtc_base_url=self._go2rtc_base_url,
-                    resolve_base=master_url,
-                )
-                # go2rtc 1.9.14 identifica la sesion por `id`, no por `src`:
-                # la URI de variante ya trae el id (hls/playlist.m3u8?id=XXX).
-                # No se agrega src — el id es suficiente y un src ajeno puede
-                # desorientar a go2rtc.
-                media_url = f"{self._go2rtc_base_url}{variant_ref}"
-                media_raw = await self._fetch_raw_hls(
-                    media_url,
-                    session,
-                    not_found_code="go2rtc_hls_variante_no_encontrada",
-                    not_found_status=502,
-                )
-            else:
-                # go2rtc devolvio media playlist directa (poco probable en 1.9.14,
-                # pero lo cubrimos por si cambia en versiones futuras).
-                media_url = master_url
-                media_raw = master_raw
 
         # resolve_base = URL de la MEDIA playlist: los segmentos de go2rtc son
         # relativos a /api/hls/playlist.m3u8?id=X, no a /api/stream.m3u8.

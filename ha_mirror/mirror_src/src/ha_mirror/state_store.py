@@ -48,6 +48,14 @@ class StateStore:
         self._areas: dict[str, HaAreaRegistryEntry] = {}
         self._services: dict[str, Any] = {}
 
+        # Entidades inyectadas por conectores EXTERNOS a HA (p.ej. Crestron vía
+        # crestron_connector). Se registran acá para que hydrate() (que reemplaza
+        # todo el estado de HA) las PRESERVE en vez de borrarlas en cada
+        # rehidratación del upstream. _external_areas guarda las áreas propias de
+        # esos conectores para reinyectarlas por la misma razón.
+        self._external_entity_ids: set[str] = set()
+        self._external_areas: dict[str, HaAreaRegistryEntry] = {}
+
         # Metadatos del upstream
         self._connected: bool = False
         self._upstream_state: str = "DISCONNECTED"
@@ -73,10 +81,31 @@ class StateStore:
     ) -> None:
         """Reemplaza todo el estado en memoria post-hidratación del upstream."""
         async with self._lock:
-            self._states = {s.entity_id: s for s in states}
-            self._entities = {e.entity_id: e for e in entities}
+            # Snapshot de lo anterior para reinyectar las entidades externas: sin
+            # esto, cada rehidratación de HA (reconexión del upstream) borraría los
+            # dispositivos Crestron del store hasta el próximo poll del connector,
+            # haciéndolos "parpadear" (desaparecer de la app durante ~poll_interval s).
+            old_states = self._states
+            old_entities = self._entities
+
+            new_states = {s.entity_id: s for s in states}
+            new_entities = {e.entity_id: e for e in entities}
+
+            for eid in self._external_entity_ids:
+                # Solo rellenamos huecos: si HA trajera una entidad con el mismo id
+                # (no debería, por el prefijo `crestron_`), gana HA.
+                if eid not in new_states and eid in old_states:
+                    new_states[eid] = old_states[eid]
+                if eid not in new_entities and eid in old_entities:
+                    new_entities[eid] = old_entities[eid]
+
+            self._states = new_states
+            self._entities = new_entities
             self._devices = {d.id: d for d in devices}
             self._areas = {a.area_id: a for a in areas}
+            # Reinyectar las áreas de conectores externos (idempotente).
+            for area_id, area in self._external_areas.items():
+                self._areas.setdefault(area_id, area)
             self._services = services
             self._connected = True
             self._upstream_state = "READY"
@@ -118,6 +147,65 @@ class StateStore:
             correlation_id=correlation_id,
         )
         await self._fanout(msg.model_dump())
+
+    async def upsert_external(
+        self,
+        states: list[HaState],
+        entities: list[HaEntityRegistryEntry],
+        area: HaAreaRegistryEntry | None = None,
+    ) -> None:
+        """
+        Merge ADITIVO de entidades externas a HA (p.ej. Crestron).
+
+        A diferencia de hydrate(), NO reemplaza el estado de HA: agrega/actualiza
+        las entidades dadas en self._states/_entities/_areas, las registra como
+        externas (para que hydrate las preserve) y hace fan-out de un
+        WsStateChanged por cada entidad cuyo ESTADO o ATRIBUTOS cambiaron
+        (comparación que ignora timestamps para no spamear en cada poll).
+        """
+        changed: list[tuple[str, EntitySummary | None]] = []
+        added_new = False
+
+        async with self._lock:
+            # Registry de entidades: siempre sobrescribe (nombre/área pueden variar).
+            for entry in entities:
+                self._entities[entry.entity_id] = entry
+                self._external_entity_ids.add(entry.entity_id)
+
+            # Área del conector (idempotente): no pisa una de HA con el mismo id.
+            if area is not None:
+                self._areas.setdefault(area.area_id, area)
+                self._external_areas[area.area_id] = area
+
+            # Estados: detectar cambios reales para decidir el fan-out.
+            for state in states:
+                self._external_entity_ids.add(state.entity_id)
+                old = self._states.get(state.entity_id)
+                self._states[state.entity_id] = state
+
+                if old is None:
+                    added_new = True
+                    changed.append(
+                        (state.entity_id, self._build_entity_summary_locked(state.entity_id, state))
+                    )
+                    continue
+
+                old_attrs = dict(old.attributes.model_extra or {})
+                new_attrs = dict(state.attributes.model_extra or {})
+                if old.state != state.state or old_attrs != new_attrs:
+                    changed.append(
+                        (state.entity_id, self._build_entity_summary_locked(state.entity_id, state))
+                    )
+
+            if added_new:
+                # El set de entidades creció: bump para que un cliente que se
+                # reconecte reciba un snapshot con versión nueva.
+                self._cache_version += 1
+
+        # Fan-out fuera del lock (mismo patrón que apply_state_changed).
+        for entity_id, summary in changed:
+            msg = WsStateChanged(entity_id=entity_id, new_state=summary, correlation_id=None)
+            await self._fanout(msg.model_dump())
 
     async def mark_disconnected(self) -> None:
         """Marca el upstream como desconectado y notifica a los clientes WS."""
@@ -184,13 +272,34 @@ class StateStore:
             if (summary := self._build_entity_summary_locked(eid, state)) is not None
         }
 
+    def _area_efectiva(self, entry: HaEntityRegistryEntry) -> str | None:
+        """
+        Área REAL de una entidad: la suya, o la de su device.
+
+        En Home Assistant el área normalmente se asigna al DEVICE; la entidad
+        solo lleva `area_id` propio cuando alguien la movió a mano (override).
+        El frontend de HA resuelve `entity.area_id ?? device.area_id`, y sin ese
+        mismo fallback el Mirror reportaba 0 de 418 entidades con área — cuando
+        en la casa de Fortunatta hay 35 que sí la tienen vía device (Sala TV y
+        las persianas Somfy). Eso dejaba `/api/areas` devolviendo las 5 áreas
+        con `entity_ids: []` y la app cayendo siempre al fallback por nombre.
+        """
+        if entry.area_id:
+            return entry.area_id
+        if entry.device_id:
+            device = self._devices.get(entry.device_id)
+            if device is not None:
+                return device.area_id
+        return None
+
     def get_areas_enriched(self) -> list[AreaSummary]:
         """Áreas con lista de entity_ids que pertenecen a cada área."""
         area_entities: dict[str, list[str]] = {aid: [] for aid in self._areas}
 
         for entity_id, entry in self._entities.items():
-            if entry.area_id and entry.area_id in area_entities:
-                area_entities[entry.area_id].append(entity_id)
+            area_id = self._area_efectiva(entry)
+            if area_id and area_id in area_entities:
+                area_entities[area_id].append(entity_id)
 
         result = []
         for area in self._areas.values():
@@ -290,7 +399,11 @@ class StateStore:
             last_changed=state.last_changed,
             last_updated=state.last_updated,
             friendly_name=state.friendly_name or (entry.name if entry else None),
-            area_id=entry.area_id if entry else None,
+            # Mismo fallback device→área que `get_areas_enriched`: si no,
+            # /api/entities reporta area_id null en las 418 aunque el device
+            # tenga área, y cualquier consumidor que agrupe por área ve la casa
+            # vacía. Ver `_area_efectiva`.
+            area_id=self._area_efectiva(entry) if entry else None,
             device_id=entry.device_id if entry else None,
             domain=state.domain,
         )

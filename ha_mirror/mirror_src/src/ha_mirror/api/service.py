@@ -62,6 +62,64 @@ def _is_service_forbidden(domain: str, service: str) -> bool:
     return d in _FORBIDDEN_DOMAINS or (d, s) in _FORBIDDEN_SERVICES
 
 
+def _crestron_entity_arg(body: ServiceCallRequest) -> str | list[str] | None:
+    """Entidad(es) objetivo del call: entity_id directo o target.entity_id."""
+    if body.entity_id is not None:
+        return body.entity_id
+    if body.target:
+        return body.target.get("entity_id")
+    return None
+
+
+def _crestron_route(crestron: object, entity_arg: str | list[str] | None) -> bool:
+    """True si el/los entity_id objetivo pertenecen al connector Crestron."""
+    if crestron is None or entity_arg is None:
+        return False
+    if isinstance(entity_arg, str):
+        return crestron.owns_entity(entity_arg)  # type: ignore[attr-defined]
+    if isinstance(entity_arg, list):
+        return any(
+            isinstance(e, str) and crestron.owns_entity(e)  # type: ignore[attr-defined]
+            for e in entity_arg
+        )
+    return False
+
+
+async def _execute_crestron_call(
+    *,
+    crestron: object,
+    store: object,
+    db: Database,
+    correlation_id: str,
+    domain: str,
+    service: str,
+    entity_arg: str | list[str] | None,
+    confirm_entity_id: str | None,
+    data: dict,
+) -> None:
+    """
+    Tarea background: ejecuta el control Crestron y confirma por WS.
+
+    Mantiene el mismo contrato que la vía HA: el frontend ya recibió 202 +
+    correlation_id y espera un service_complete (success True/False) por /ws/state.
+    """
+    try:
+        await crestron.handle_service_call(domain, service, entity_arg, data)  # type: ignore[attr-defined]
+        await store.fanout_service_complete(correlation_id, confirm_entity_id, True)  # type: ignore[attr-defined]
+        await db.complete_service_call(correlation_id, "confirmed")
+        logger.info("service.crestron_confirmed", correlation_id=correlation_id)
+    except Exception as exc:  # noqa: BLE001 — cualquier fallo se reporta como service_complete=False
+        await store.fanout_service_complete(correlation_id, confirm_entity_id, False)  # type: ignore[attr-defined]
+        await db.complete_service_call(correlation_id, "error")
+        logger.error(
+            "service.crestron_error",
+            correlation_id=correlation_id,
+            domain=domain,
+            service=service,
+            exc=str(exc),
+        )
+
+
 @router.post(
     "/api/service/{domain}/{service}",
     response_model=ServiceCallResponse,
@@ -102,6 +160,47 @@ async def call_service(
     correlations: CorrelationTracker = request.app.state.correlations
     db: Database = request.app.state.db
     settings = request.app.state.settings
+
+    # --- Enrutado Crestron -------------------------------------------------
+    # Si la entidad objetivo pertenece al connector Crestron, la manejamos acá
+    # (no va al upstream HA). Se hace ANTES del chequeo store.connected para que
+    # el control Crestron funcione aunque el upstream HA esté caído — son buses
+    # independientes. Mismo contrato de respuesta que la vía HA: 202 +
+    # correlation_id ahora, service_complete/timeout después por /ws/state.
+    crestron = getattr(request.app.state, "crestron", None)
+    entity_arg = _crestron_entity_arg(body)
+    if _crestron_route(crestron, entity_arg):
+        correlation_id = correlations.generate_id()
+        await db.log_service_call(
+            correlation_id=correlation_id,
+            domain=domain,
+            service=service,
+            entity_id=body.entity_id,
+            target=body.target,
+        )
+        SERVICE_CALLS_TOTAL.labels(domain=domain, service=service).inc()
+        asyncio.create_task(
+            _execute_crestron_call(
+                crestron=crestron,
+                store=store,
+                db=db,
+                correlation_id=correlation_id,
+                domain=domain,
+                service=service,
+                entity_arg=entity_arg,
+                confirm_entity_id=body.entity_id,
+                data=body.service_data,
+            ),
+            name=f"crestron_call_{correlation_id[:8]}",
+        )
+        logger.info(
+            "service.crestron_accepted",
+            correlation_id=correlation_id,
+            domain=domain,
+            service=service,
+            entity_id=body.entity_id,
+        )
+        return ServiceCallResponse(correlation_id=correlation_id)
 
     if not store.connected:
         raise HTTPException(

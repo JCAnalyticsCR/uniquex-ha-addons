@@ -41,20 +41,24 @@ async def ws_camera(
     websocket: WebSocket,
     entity_id: str,
     api_key: str | None = Query(default=None),
+    ticket: str | None = Query(default=None),
 ) -> None:
     """
     Puente WebSocket entre el navegador y el /api/ws de go2rtc.
 
-    El cliente pasa ?api_key=<MIRROR_API_KEY> en la URL (el browser no permite
-    headers custom en el upgrade WS — mismo compromiso Fase 1 que /ws/state).
+    El cliente pasa ?ticket=<ticket firmado> en la URL (el browser no permite
+    headers custom en el upgrade WS). El ticket lleva la entidad firmada
+    adentro: uno de camera.sala NO abre camera.dormitorio.
     """
     # Importacion tardia para evitar ciclo con auth (auth importa config).
     from ha_mirror.auth import authenticate_ws
 
     # Validar antes de aceptar. authenticate_ws cierra el WS con el codigo
-    # apropiado (4001 key invalida / 4029 rate limit) si la autenticacion falla.
+    # apropiado (4001 credencial invalida / 4029 rate limit) si falla.
     try:
-        await authenticate_ws(websocket, api_key)
+        await authenticate_ws(
+            websocket, api_key, ticket, scope="camera", entity_id=entity_id
+        )
     except Exception:
         # authenticate_ws ya cerro el WebSocket con el codigo correspondiente.
         return

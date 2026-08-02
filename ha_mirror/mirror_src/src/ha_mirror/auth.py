@@ -229,16 +229,30 @@ async def require_api_key(
 
 async def authenticate_ws(
     websocket: WebSocket,
-    api_key: str | None = Query(default=None, alias="api_key"),
+    api_key: str | None = None,
+    ticket: str | None = None,
+    scope: str = "state",
+    entity_id: str | None = None,
 ) -> None:
     """
     Autentica una conexion WebSocket entrante.
 
-    El upgrade HTTP del browser no soporta headers custom arbitrarios,
-    por eso la key viaja en query param ?api_key= en el WS upgrade request.
-    Si la key es invalida, cierra el WS con codigo 4001 antes de aceptar.
-    Aplica rate-limiting por IP.
+    El upgrade HTTP del browser no soporta headers custom arbitrarios, asi que
+    la credencial tiene que viajar en el query string. Hay dos caminos:
+
+      1. ?ticket=  — el camino bueno (0.21.0). Firmado, caduca en segundos y
+         vale para un unico scope/entidad. El navegador nunca ve la API key.
+      2. ?api_key= — el camino viejo, EN RETIRADA. Le entrega la key maestra al
+         navegador; se mantiene solo para no romper un frontend todavia no
+         actualizado. Cada uso deja un WARN que hay que vigilar antes de
+         apagarlo con `reject_legacy_ws_key`.
+
+    Cierra con 4001 si la autenticacion falla y 4029 si se excedio el rate
+    limit, siempre ANTES de aceptar la conexion.
     """
+    # Importacion local: ws_ticket importa config, igual que este modulo.
+    from ha_mirror.ws_ticket import verify_ticket
+
     settings = get_settings()
     # Fix A3 — detrás de Cloudflare todos los WS parecen venir del mismo IP edge;
     # usamos CF-Connecting-IP para no bloquear a todos los clientes de un saque.
@@ -253,17 +267,42 @@ async def authenticate_ws(
         await websocket.close(code=4029, reason="Rate limit excedido")
         raise
 
-    if api_key is None or not _is_valid_key(api_key, settings):
+    async def _rechazar(reason: str, close_reason: str) -> None:
         _record_failure(ip)
-        logger.warning(
-            "auth.ws_rejected",
-            ip=ip,
-            reason="missing_or_invalid_api_key",
-        )
-        await websocket.close(code=4001, reason="API key invalida o ausente")
+        logger.warning("auth.ws_rejected", ip=ip, reason=reason, scope=scope)
+        await websocket.close(code=4001, reason=close_reason)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API key",
         )
 
-    _clear_rate_limit(ip)
+    # --- Camino 1: ticket firmado -----------------------------------------
+    # Tiene precedencia. Si vino un ticket y es invalido NO se cae al camino
+    # viejo: seria una via para degradar la autenticacion a voluntad.
+    if ticket is not None:
+        if not verify_ticket(settings, ticket, scope, entity_id):
+            await _rechazar("invalid_ticket", "Ticket invalido o vencido")
+        _clear_rate_limit(ip)
+        return
+
+    # --- Camino 2: API key en el query (en retirada) -----------------------
+    if api_key is not None:
+        if settings.reject_legacy_ws_key:
+            await _rechazar("legacy_key_rejected", "Se requiere ticket")
+
+        # Este WARN es la senal operativa: mientras aparezca, todavia hay un
+        # cliente entregandole la key maestra al navegador.
+        logger.warning(
+            "auth.ws_legacy_key_used",
+            ip=ip,
+            scope=scope,
+            path=websocket.url.path,
+            # NUNCA la key en el log.
+        )
+        if not _is_valid_key(api_key, settings):
+            await _rechazar("invalid_api_key", "API key invalida")
+        _clear_rate_limit(ip)
+        return
+
+    # --- Ni ticket ni key --------------------------------------------------
+    await _rechazar("missing_credential", "Falta ticket o API key")

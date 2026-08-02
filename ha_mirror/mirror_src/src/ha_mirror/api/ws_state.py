@@ -61,20 +61,23 @@ router = APIRouter()
 async def ws_state(
     websocket: WebSocket,
     api_key: str | None = Query(default=None),
+    ticket: str | None = Query(default=None),
 ) -> None:
     """
     WebSocket de estado en tiempo real.
 
-    El cliente debe pasar ?api_key=<MIRROR_API_KEY> en la URL de conexión.
+    El cliente pasa ?ticket=<ticket firmado> en la URL de conexión (0.21.0).
+    ?api_key= sigue aceptándose mientras haya frontends sin actualizar, pero
+    deja un WARN en el log y se apaga con `reject_legacy_ws_key`.
     """
     # Importación tardía para evitar ciclo con auth (auth importa config)
     from ha_mirror.auth import authenticate_ws
 
     # Validar antes de aceptar la conexión WS.
     # authenticate_ws aplica rate-limiting por IP y cierra el WS con el código
-    # apropiado (4001 key inválida / 4029 rate limit) si la autenticación falla.
+    # apropiado (4001 credencial inválida / 4029 rate limit) si falla.
     try:
-        await authenticate_ws(websocket, api_key)
+        await authenticate_ws(websocket, api_key, ticket, scope="state")
     except Exception:
         # authenticate_ws ya cerró el WebSocket con el código correspondiente.
         return

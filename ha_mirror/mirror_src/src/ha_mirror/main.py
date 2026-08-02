@@ -39,6 +39,7 @@ from ha_mirror.api.preferences import router as preferences_router
 from ha_mirror.api.scenes import router as scenes_router
 from ha_mirror.api.service import router as service_router
 from ha_mirror.api.ws_state import router as ws_router
+from ha_mirror.api.ws_ticket import router as ws_ticket_router
 from ha_mirror.auth import require_api_key
 from ha_mirror.camera_media import CameraMediaClient
 from ha_mirror.config import get_settings
@@ -194,6 +195,42 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # (Python no garantiza wipe de memoria, pero reducimos ventana de exposición)
     del ha_token
 
+    # 4b. Connector Crestron (opcional). Import PEREZOSO: cuando Crestron no está
+    #     configurado (caso por defecto), el mirror arranca sin depender de
+    #     crestron_client/crestron_connector. Solo cuando está configurado se
+    #     importan y se levanta el cliente + el polling supervisado.
+    crestron_client = None
+    crestron_connector = None
+    if settings.crestron_configured:
+        from ha_mirror.crestron_client import CrestronClient
+        from ha_mirror.crestron_connector import CrestronConnector
+
+        crestron_token = settings.get_crestron_token()
+        crestron_client = CrestronClient(
+            base_url=settings.crestron_base_url,  # allowlist de settings, nunca del request
+            token=crestron_token,
+            verify_ssl=settings.crestron_verify_ssl,
+        )
+        # Borrar el token de la variable local ASAP (igual que con ha_token).
+        del crestron_token
+        await crestron_client.start()
+        crestron_connector = CrestronConnector(
+            client=crestron_client,
+            store=store,
+            correlations=correlations,
+            poll_interval=settings.crestron_poll_interval,
+            area_id=settings.crestron_area_id,
+        )
+        await crestron_connector.start()
+        logger.info(
+            "crestron.enabled",
+            base_url=settings.crestron_base_url,
+            poll_interval=settings.crestron_poll_interval,
+            area_id=settings.crestron_area_id,
+        )
+    else:
+        logger.info("crestron.disabled")
+
     # 5. Montar en app.state para que los routers accedan via request.app.state
     app.state.store = store
     app.state.upstream = upstream
@@ -201,6 +238,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.db = db
     app.state.settings = settings
     app.state.camera_media = camera_media
+    # None si Crestron no está configurado; api/service.py lo consulta con getattr.
+    app.state.crestron = crestron_connector
 
     # 6. Lanzar el upstream como task supervisado
     upstream_task = asyncio.create_task(upstream.run_forever(), name="ha_upstream")
@@ -231,6 +270,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         upstream_task.cancel()
         with suppress(asyncio.CancelledError, Exception):
             await upstream_task
+        # Parar el polling Crestron y cerrar el cliente antes de la DB.
+        if crestron_connector is not None:
+            with suppress(Exception):
+                await crestron_connector.close()
+        if crestron_client is not None:
+            with suppress(Exception):
+                await crestron_client.close()
         await camera_media.close()
         await db.close()
         logger.info("mirror.stopped")
@@ -281,6 +327,9 @@ def create_app() -> FastAPI:
     app.include_router(camera_media_router)
     app.include_router(scenes_router)
     app.include_router(preferences_router)
+    # Emisor de tickets de WebSocket (0.21.0). Lo llama el frontend desde el
+    # servidor con X-API-Key; el navegador nunca recibe la key.
+    app.include_router(ws_ticket_router)
 
     # Routers WebSocket
     app.include_router(ws_router)

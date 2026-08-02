@@ -161,9 +161,87 @@ class Settings(BaseSettings):
     iframe_token_ttl_seconds: int = Field(default=900, description="TTL de tokens iframe (15 min)")
 
     # -------------------------------------------------------------------------
+    # Tickets de WebSocket (0.21.0) — ver ha_mirror/ws_ticket.py
+    # -------------------------------------------------------------------------
+    ws_ticket_ttl_seconds: int = Field(
+        default=30,
+        ge=5,
+        le=300,
+        description=(
+            "TTL del ticket de WebSocket. Corto a propósito: el ticket solo tiene "
+            "que sobrevivir el tiempo entre que el frontend lo pide y el navegador "
+            "abre el socket."
+        ),
+    )
+    reject_legacy_ws_key: bool = Field(
+        default=False,
+        description=(
+            "Rechaza WebSockets que lleguen con ?api_key= (el camino viejo, "
+            "anterior a los tickets). ARRANCA EN False A PROPÓSITO: el add-on vive "
+            "en la caja y el frontend en Railway, y se despliegan por separado — si "
+            "el add-on deja de aceptar la key antes de que Railway tenga el código "
+            "nuevo, las cámaras se caen. Activar solo cuando el log del add-on ya "
+            "no muestre 'auth.ws_legacy_key_used'. Casa 2 puede arrancar en True: "
+            "no tiene frontend viejo que respetar."
+        ),
+    )
+
+    # -------------------------------------------------------------------------
     # Multi-tenant en frío: tenant_id constante
     # -------------------------------------------------------------------------
     tenant_id: int = Field(default=1, description="ID del tenant único (N=1)")
+
+    # -------------------------------------------------------------------------
+    # Crestron Home (conector directo)
+    # -------------------------------------------------------------------------
+    crestron_enabled: bool = Field(
+        default=False,
+        description=(
+            "Activa el conector Crestron Home. Default off — el Mirror arranca "
+            "normalmente sin CP4-R. Poné True solo cuando tengas acceso al procesador."
+        ),
+    )
+    crestron_base_url: str | None = Field(
+        default=None,
+        description=(
+            "URL base del CP4-R, p.ej. https://192.168.1.30. "
+            "Requiere crestron_enabled=true. "
+            "Nunca exponer el CP4-R directamente a internet: "
+            "el Mirror debe alcanzarlo por LAN o tailnet."
+        ),
+    )
+    crestron_token: SecretStr | None = Field(
+        default=None,
+        description=(
+            "Token de la Web API de Crestron Home. "
+            "Obtenerlo en Crestron Setup app → Installer Settings → "
+            "System Control Options → Web API Settings → Update Token. "
+            "NUNCA commitear el valor real — siempre vía variable de entorno o "
+            "opción 'password?' del add-on."
+        ),
+    )
+    crestron_verify_ssl: bool = Field(
+        default=False,
+        description=(
+            "Verificar el certificado SSL del CP4-R. "
+            "CP4-R V2 usa cert autofirmado → default False (no validar). "
+            "Poné True solo si hay cert válido firmado por una CA reconocida."
+        ),
+    )
+    crestron_poll_interval: float = Field(
+        default=12.0,
+        description=(
+            "Intervalo en segundos entre polls al CP4-R. "
+            "Default 12 s (rango recomendado 10-15 s)."
+        ),
+    )
+    crestron_area_id: str = Field(
+        default="crestron",
+        description=(
+            "ID de área virtual en el Mirror para los dispositivos Crestron. "
+            "Default 'crestron'. Cambiar si el sistema tiene múltiples procesadores."
+        ),
+    )
 
     @field_validator("ha_url")
     @classmethod
@@ -182,6 +260,26 @@ class Settings(BaseSettings):
         if not value.startswith(("http://", "https://")):
             raise ValueError("go2rtc_base_url debe comenzar con http:// o https://")
         return value
+
+    @field_validator("crestron_base_url")
+    @classmethod
+    def validate_crestron_base_url(cls, v: str | None) -> str | None:
+        if v is None or not v.strip():
+            return None
+        value = v.strip().rstrip("/")
+        if not value.startswith(("http://", "https://")):
+            raise ValueError("crestron_base_url debe comenzar con http:// o https://")
+        return value
+
+    @field_validator("crestron_token")
+    @classmethod
+    def validate_crestron_token(cls, v: SecretStr | None) -> SecretStr | None:
+        """Convierte SecretStr vacío a None (p.ej. CRESTRON_TOKEN='' en .env)."""
+        if v is None:
+            return None
+        if not v.get_secret_value().strip():
+            return None
+        return v
 
     @field_validator("camera_stream_map")
     @classmethod
@@ -341,6 +439,26 @@ class Settings(BaseSettings):
             "http://localhost:3000",
             "http://localhost:5173",
         ]
+
+    @property
+    def crestron_configured(self) -> bool:
+        """True solo cuando el conector Crestron está habilitado y tiene URL + token."""
+        return (
+            self.crestron_enabled
+            and self.crestron_base_url is not None
+            and self.crestron_token is not None
+        )
+
+    def get_crestron_token(self) -> str | None:
+        """
+        Retorna el token Crestron en texto plano, o None si no está definido.
+
+        El token Crestron llega por opción 'password?' del add-on (nunca cifrado
+        con Fernet — no es un LLAT de HA). No loggear el resultado.
+        """
+        if self.crestron_token is None:
+            return None
+        return self.crestron_token.get_secret_value()
 
 
 @lru_cache(maxsize=1)
