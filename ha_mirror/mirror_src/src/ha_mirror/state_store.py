@@ -24,10 +24,20 @@ from ha_mirror.models import (
     WsConnectionStatus,
     WsServiceComplete,
     WsServiceTimeout,
+    WsSnapshot,
     WsStateChanged,
 )
 
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
+
+# Tope de entidades que la reconciliación post-rehidratación manda una por una.
+# Por debajo, el diff es SIEMPRE más barato en bytes que un snapshot: el snapshot
+# lleva las 418 entidades MÁS el registro completo de servicios de HA (que no
+# cambia entre reconexiones y pesa tanto como los estados). Por encima estamos
+# reconstruyendo media casa entidad por entidad, y ahí manda otro costo: son N
+# frames sobre el túnel de Cloudflare y N slots de la cola de 1000 del cliente,
+# contra UN frame del snapshot. 200 ≈ la mitad de las entidades de esta casa.
+_RESYNC_MAX_DIFF = 200
 
 
 class StateStore:
@@ -112,15 +122,38 @@ class StateStore:
             self._cache_version += 1
             version = self._cache_version
 
+            # Qué cambió DE VERDAD entre la caché vieja y la nueva. Se calcula acá
+            # adentro porque `old_states` solo existe dentro del lock, y solo si hay
+            # alguien escuchando: el upstream se rehidrata ~60 veces por hora y de
+            # madrugada no hay ninguna app abierta — en ese caso esto cuesta cero.
+            cambiados = (
+                self._diff_estados_locked(old_states, new_states) if self._subscribers else []
+            )
+            resync: list[tuple[str, EntitySummary | None]] | None = None
+            if 0 < len(cambiados) <= _RESYNC_MAX_DIFF:
+                # Las summaries se arman acá porque necesitan los registries que
+                # acabamos de reemplazar (nombre y área de cada entidad).
+                resync = [
+                    (
+                        entity_id,
+                        self._build_entity_summary_locked(entity_id, self._states.get(entity_id)),
+                    )
+                    for entity_id in cambiados
+                ]
+
         logger.info(
             "store.hydrated",
             states=len(states),
             entities=len(entities),
             areas=len(areas),
             cache_version=version,
+            resync_entidades=len(cambiados),
         )
 
-        # Fan-out del snapshot fuera del lock
+        # Fan-out fuera del lock. El estado fresco va ANTES del "connected": las
+        # colas por cliente son FIFO, así que cuando la app se pinta en verde los
+        # datos que respaldan ese verde ya viajan adelante en su propia cola.
+        await self._fanout_resync(cambiados, resync)
         await self._fanout_connection_status("connected")
 
     async def apply_state_changed(
@@ -365,6 +398,77 @@ class StateStore:
         msg = WsConnectionStatus(upstream=status)
         await self._fanout(msg.model_dump())
 
+    async def _fanout_resync(
+        self,
+        cambiados: list[str],
+        resync: list[tuple[str, EntitySummary | None]] | None,
+    ) -> None:
+        """
+        Reconcilia a los clientes ya conectados después de una rehidratación.
+
+        EL BUG (medido 2026-08-04): el Mirror pierde el enlace con HA ~1 vez por
+        minuto. Al recuperarse rehidrataba su caché con el estado fresco de la casa
+        pero solo emitía `connection_status`, y la app —que procesa el `snapshot`
+        ÚNICAMENTE al abrir el socket— seguía pintando el estado viejo como si
+        fuera actual. Los contadores del día: `snapshot` 195 contra
+        `connection_status` 6687; se estimaban 40-75 eventos por hora que nunca se
+        reconciliaban. En la práctica: una luz que alguien apagó por el interruptor
+        de pared durante el corte se quedaba encendida en la app hasta que el
+        usuario cerraba y reabría la app.
+
+        QUÉ MANDAMOS: solo lo que cambió, con `state_changed`, que es un tipo que
+        el frontend ya entiende (y ya coalesce en un solo render por frame). En un
+        corte de 20 s con la casa quieta el diff es VACÍO y esto cuesta cero bytes.
+        Reenviar el snapshot completo en cada recuperación (~60/h) es justo la
+        carga que hay que evitar: lleva las 418 entidades más el registro entero de
+        servicios de HA, y el túnel de Cloudflare ya se saturó una vez y se llevó
+        puestas las cámaras.
+
+        POR QUÉ NO HAY LÍMITE DE FRECUENCIA: el propio diff ya es el freno, y uno
+        guiado por datos en vez de por reloj — si no cambió nada no se manda nada.
+        Un freno por tiempo solo podría hacer dos cosas, y las dos son peores:
+        dejar al cliente con datos viejos a sabiendas (lo único inaceptable acá) o
+        degradar el snapshot a N mensajes sueltos, que son MÁS frames que el
+        snapshot que quería evitar.
+
+        `resync=None` significa que el diff pasó `_RESYNC_MAX_DIFF`: ahí va un
+        snapshot y punto. Ese camino es autolimitante — la caché ya convergió a la
+        realidad, así que la rehidratación siguiente vuelve a dar un diff chico.
+        Es además el caso del cliente que abrió la app con el upstream caído: antes
+        se quedaba con la casa vacía hasta reconectar, ahora se llena solo cuando
+        entra la primera hidratación.
+        """
+        if not cambiados:
+            return
+
+        if resync is None:
+            logger.warning("store.resync_por_snapshot", entidades=len(cambiados))
+            await self._fanout_snapshot()
+            return
+
+        # Mismo shape que `apply_state_changed` — para el cliente es indistinguible
+        # de un evento normal de HA, y `new_state=None` sigue significando
+        # "la entidad ya no existe".
+        for entity_id, summary in resync:
+            msg = WsStateChanged(entity_id=entity_id, new_state=summary, correlation_id=None)
+            await self._fanout(msg.model_dump())
+
+    async def _fanout_snapshot(self) -> None:
+        """
+        Empuja un snapshot completo a los suscriptores.
+
+        Idéntico al que `/ws/state` manda al conectar, así que el cliente lo trata
+        con el mismo código: reemplaza su estado entero. Es el único camino que
+        también refresca áreas y servicios (el diff solo lleva estados).
+        """
+        msg = WsSnapshot(
+            states=self.get_all_entity_summaries(),
+            areas=self.get_areas_enriched(),
+            services=self.get_services(),
+            cache_version=self._cache_version,
+        )
+        await self._fanout(msg.model_dump(mode="json"))
+
     async def fanout_service_complete(
         self, correlation_id: str, entity_id: str | None, success: bool
     ) -> None:
@@ -384,6 +488,47 @@ class StateStore:
     # -------------------------------------------------------------------------
     # Helpers privados
     # -------------------------------------------------------------------------
+
+    def _diff_estados_locked(
+        self,
+        old_states: dict[str, HaState],
+        new_states: dict[str, HaState],
+    ) -> list[str]:
+        """
+        entity_ids que cambiaron entre dos cachés (incluye altas y bajas).
+
+        NO compara `last_changed` / `last_updated` A PROPÓSITO: cuando Home
+        Assistant se reinicia les pone la hora del arranque a las 418 entidades sin
+        que nada haya cambiado de verdad, así que mirar los timestamps convertiría
+        CADA rehidratación en un diff de la casa entera — exactamente el reenvío
+        masivo que estamos evitando. Es el mismo criterio que ya usa
+        `upsert_external` para no spamear en cada poll de Crestron.
+
+        LIMITACIÓN CONOCIDA: solo mira estados. Si alguien renombra una entidad o
+        la mueve de área en HA sin que cambie su estado, eso viaja recién en el
+        próximo snapshot (reconexión del cliente, o el camino de diff masivo). Es
+        un cambio manual y raro; el estado en vivo es lo que la app pinta.
+        """
+        cambiados: list[str] = []
+
+        for entity_id, new_state in new_states.items():
+            old = old_states.get(entity_id)
+            if old is None:
+                cambiados.append(entity_id)
+                continue
+            if old.state != new_state.state:
+                cambiados.append(entity_id)
+                continue
+            if (old.attributes.model_extra or {}) != (new_state.attributes.model_extra or {}):
+                cambiados.append(entity_id)
+
+        # Bajas: la entidad desapareció de HA. El summary queda en None y el
+        # mensaje sale como `new_state: null`, que es lo que el contrato define.
+        for entity_id in old_states:
+            if entity_id not in new_states:
+                cambiados.append(entity_id)
+
+        return cambiados
 
     def _build_entity_summary_locked(
         self, entity_id: str, state: HaState | None

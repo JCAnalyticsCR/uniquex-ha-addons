@@ -33,4 +33,9 @@ async def health(
         ws_reconnects_total=store.reconnect_count,
         connected_ws_clients=store.get_subscriber_count(),
         tenant_id=settings.tenant_id,
+        # app.state.mirror_version se populó en el lifespan (main.py).
+        # No usamos request.app.version directamente porque starlette tipea
+        # Request.app como Starlette (sin .version), mientras que app.state
+        # es Any y no genera error con mypy strict.
+        version=request.app.state.mirror_version,
     )

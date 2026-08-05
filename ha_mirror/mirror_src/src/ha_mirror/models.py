@@ -182,6 +182,10 @@ class HealthResponse(BaseModel):
     ws_reconnects_total: int
     connected_ws_clients: int
     tenant_id: int
+    # Versión del paquete instalado — leída al arrancar desde importlib.metadata
+    # (main.py) y expuesta acá para que el frontend o un curl externo pueda
+    # confirmar en un segundo si una actualización entró o un rollback funcionó.
+    version: str
 
 
 # ---------------------------------------------------------------------------

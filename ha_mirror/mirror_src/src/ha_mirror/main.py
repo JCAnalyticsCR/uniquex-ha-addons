@@ -20,6 +20,8 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
+from importlib.metadata import PackageNotFoundError
+from importlib.metadata import version as _pkg_version
 
 import structlog
 from fastapi import Depends, FastAPI
@@ -51,6 +53,18 @@ from ha_mirror.logging_setup import configure_logging
 from ha_mirror.state_store import StateStore
 
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
+
+# Versión del paquete instalado — fuente única de verdad.
+# importlib.metadata lee el METADATA del wheel/egg-info que instaló pip,
+# originado en pyproject.toml (version = "x.y.z"). El Supervisor de HA
+# siempre instala el paquete antes de iniciar, así que en la cajita esto
+# siempre resuelve. El fallback "desconocida" protege entornos de desarrollo
+# donde el paquete no está instalado (editable install pendiente).
+# NUNCA levanta excepción al importar el módulo.
+try:
+    _MIRROR_VERSION: str = _pkg_version("ha-mirror")
+except PackageNotFoundError:
+    _MIRROR_VERSION = "desconocida"
 
 
 class CSPMiddleware(BaseHTTPMiddleware):
@@ -140,7 +154,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     logger.info(
         "mirror.starting",
-        version="0.3.0",
+        version=_MIRROR_VERSION,
         ha_url=settings.ha_url,
         db_path=str(settings.mirror_db_path),
         tenant_id=settings.tenant_id,
@@ -240,6 +254,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.camera_media = camera_media
     # None si Crestron no está configurado; api/service.py lo consulta con getattr.
     app.state.crestron = crestron_connector
+    # Versión legible desde cualquier router sin reimportar importlib.
+    # Permite que /api/health la exponga hacia afuera — confirmar en un segundo
+    # si una actualización entró o un rollback funcionó, sin entrar a la cajita.
+    app.state.mirror_version = _MIRROR_VERSION
 
     # 6. Lanzar el upstream como task supervisado
     upstream_task = asyncio.create_task(upstream.run_forever(), name="ha_upstream")
@@ -293,7 +311,7 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title="HA Mirror",
         description="FastAPI mirror para Home Assistant — single-tenant",
-        version="0.3.0",
+        version=_MIRROR_VERSION,
         lifespan=lifespan,
         docs_url=_docs,
         redoc_url=_redoc,

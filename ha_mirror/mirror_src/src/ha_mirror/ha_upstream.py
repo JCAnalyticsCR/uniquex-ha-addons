@@ -8,6 +8,8 @@ Implementa el protocolo WS de HA completo:
   → loop: listener + heartbeat (TaskGroup)
 
 En caso de desconexión: backoff exponencial 1s→30s con jitter ±50%, re-hidratación completa.
+El backoff se reinicia SOLO si la sesión que murió alcanzó READY y vivió al menos
+_HEALTHY_SESSION_SECONDS; una sesión que muere al nacer sigue escalando.
 HaAuthError (auth_invalid) detiene el retry — intervención humana requerida.
 """
 
@@ -53,6 +55,16 @@ _BACKOFF_BASE = 1.0
 _BACKOFF_CAP = 30.0
 _BACKOFF_JITTER = 0.5
 
+# Cuánto tiene que durar una sesión READY para considerarla SANA y reiniciar el backoff.
+# Medido en la casa del cliente: las sesiones vivían 90–107 s y morían, pero el backoff
+# nunca se reiniciaba (ver run_forever) y se clavaba en el tope de 30 s, así que cada
+# caída costaba media reconexión de más — la casa quedó inalcanzable ~27 % del tiempo.
+# 60 s = dos ciclos completos de heartbeat (tic de 30 s + 10 s de timeout del pong):
+# si la sesión llegó hasta ahí hubo al menos un ping/pong confirmado, o sea era una
+# conexión de verdad y la caída es un evento nuevo. Por debajo de eso (HA reiniciándose,
+# hidratación que revienta) seguimos escalando para no martillar a un HA caído.
+_HEALTHY_SESSION_SECONDS = 60.0
+
 
 class HAUpstream:
     """
@@ -89,6 +101,10 @@ class HAUpstream:
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         # Lock para serializar envíos al WS
         self._send_lock = asyncio.Lock()
+        # Instante (monotónico) en que la sesión actual quedó READY; None si no hay
+        # sesión viva. Es time.monotonic() a propósito: time.time() puede saltar con
+        # NTP o cambio de hora y falsearía la duración de la sesión.
+        self._ready_since: float | None = None
 
     # -------------------------------------------------------------------------
     # API pública
@@ -105,10 +121,11 @@ class HAUpstream:
         backoff = _BACKOFF_BASE
         async with aiohttp.ClientSession() as session:
             while True:
+                # Arranca en None: un intento que ni siquiera llega a READY no debe
+                # heredar la marca de la sesión anterior.
+                self._ready_since = None
                 try:
                     await self._connect_and_run(session)
-                    # Llegamos aquí si la conexión terminó limpiamente (raro)
-                    backoff = _BACKOFF_BASE
                 except HaAuthError:
                     UPSTREAM_AUTH_FAILURES.inc()
                     logger.error(
@@ -121,7 +138,7 @@ class HAUpstream:
                 except asyncio.CancelledError:
                     raise  # Shutdown limpio
                 except (HaConnectError, HaProtocolError) as exc:
-                    logger.warning("ha.disconnected", reason=str(exc), next_backoff=backoff)
+                    logger.warning("ha.disconnected", reason=str(exc))
                 except Exception as exc:
                     logger.exception("ha.unexpected_error", exc=str(exc))
                 finally:
@@ -130,13 +147,31 @@ class HAUpstream:
                     self._ws = None
                     self._cancel_all_pending()
 
+                # Reinicio del backoff: SOLO si la sesión que acaba de morir fue sana.
+                # Antes el reinicio estaba adentro del try, después de _connect_and_run(),
+                # pero toda desconexión real sale por excepción: esa línea era inalcanzable
+                # y el backoff quedaba clavado en 30 s para siempre. Reiniciar en CADA
+                # intento tampoco sirve — martillaría a un HA genuinamente caído —, así que
+                # el criterio es cuánto vivió la sesión: si estuvo READY el tiempo de una
+                # conexión sana, la caída es un evento nuevo y se empieza de cero.
+                ready_seconds = (
+                    0.0 if self._ready_since is None else time.monotonic() - self._ready_since
+                )
+                if ready_seconds >= _HEALTHY_SESSION_SECONDS:
+                    logger.info("ha.backoff_reset", ready_seconds=round(ready_seconds, 1))
+                    backoff = _BACKOFF_BASE
+
                 UPSTREAM_RECONNECTS.inc()
                 await self._store.mark_reconnecting()
 
                 # Backoff con jitter: sleep = backoff * uniform(0.5, 1.5)
                 jitter = 1.0 + _BACKOFF_JITTER * (2 * random.random() - 1)
                 sleep_time = min(backoff * jitter, _BACKOFF_CAP)
-                logger.info("ha.reconnect_wait", sleep_seconds=round(sleep_time, 2))
+                logger.info(
+                    "ha.reconnect_wait",
+                    sleep_seconds=round(sleep_time, 2),
+                    ready_seconds=round(ready_seconds, 1),
+                )
                 await asyncio.sleep(sleep_time)
                 backoff = min(backoff * 2, _BACKOFF_CAP)
 
@@ -186,6 +221,11 @@ class HAUpstream:
                 t0 = time.monotonic()
                 await self._hydrate(ws)
                 HYDRATION_DURATION.observe(time.monotonic() - t0)
+
+                # Recién acá la sesión está READY: autenticada, hidratada y suscrita.
+                # run_forever mide desde este instante para decidir si la conexión fue
+                # sana (reinicia el backoff) o murió al nacer (sigue escalando).
+                self._ready_since = time.monotonic()
 
                 # Loop principal: listener + heartbeat en TaskGroup
                 async with asyncio.TaskGroup() as tg:
@@ -340,29 +380,71 @@ class HAUpstream:
         """
         Loop principal que despacha mensajes del upstream.
 
-        Termina cuando WS cierra o llega error. TaskGroup cancela el heartbeat.
+        Termina SIEMPRE lanzando HaConnectError: mientras el socket viva no hay salida
+        limpia, y cuando muere hay que avisarle al TaskGroup en el acto (ver el bloque
+        de cierre al final del método). El TaskGroup cancela el heartbeat.
         """
+        binary_frames = 0
+
         async for raw_msg in ws:
             if raw_msg.type == aiohttp.WSMsgType.TEXT:
                 try:
-                    data: dict[str, Any] = raw_msg.json()
+                    parsed: object = raw_msg.json()
                 except Exception:
                     logger.warning("ha.malformed_json_frame")
                     continue
-                await self._dispatch(data)
+                # HA coalescente manda varios mensajes como array JSON en UN frame TEXT
+                # (no binario). _dispatch espera dict: sin este desempaque un array
+                # reventaba el listener con AttributeError y tumbaba toda la sesión.
+                # Mismo criterio que _send_command_direct usa en la hidratación.
+                items: list[object] = parsed if isinstance(parsed, list) else [parsed]
+                for item in items:
+                    if isinstance(item, dict):
+                        await self._dispatch(item)
+                    else:
+                        logger.warning("ha.unexpected_frame_shape", shape=type(item).__name__)
 
             elif raw_msg.type == aiohttp.WSMsgType.BINARY:
-                # HA puede enviar mensajes coalescidos en binary (msgpack-like array)
-                # Por ahora ignoramos y logueamos para detectar si esto ocurre
-                logger.debug("ha.binary_frame_ignored", size=len(raw_msg.data))
+                # HA sólo manda BINARY a quien se suscribe a un stream binario (audio de
+                # assist, descargas); el Mirror sólo pide state_changed, así que acá no
+                # debería llegar ninguno. Se siguen descartando igual que antes, pero el
+                # PRIMERO de cada sesión se logguea visible: estaba en debug (invisible en
+                # producción) y por eso la sospecha de que estos frames se comían un pong
+                # nunca se pudo ni probar ni descartar.
+                binary_frames += 1
+                if binary_frames == 1:
+                    logger.warning("ha.binary_frame_ignored", size=len(raw_msg.data))
+                else:
+                    logger.debug(
+                        "ha.binary_frame_ignored", size=len(raw_msg.data), n=binary_frames
+                    )
 
             elif raw_msg.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.ERROR):
+                # Ojo: por acá sólo cae ERROR. El CLOSE nunca llega a esta rama (ver el
+                # bloque de abajo); se deja el tipo en el log para no perder el caso.
                 logger.warning(
                     "ha.ws_closed",
                     type=raw_msg.type.name,
                     code=getattr(raw_msg, "data", None),
                 )
                 raise HaConnectError(f"WS closed: {raw_msg.type.name}")
+
+        # Salida del `async for` SIN excepción. aiohttp corta la iteración con
+        # StopAsyncIteration ante CLOSE/CLOSING/CLOSED (client_ws.py::__anext__), o sea
+        # que la rama de CLOSE de arriba es inalcanzable y antes _listen retornaba "todo
+        # bien": el TaskGroup se quedaba esperando al heartbeat, que recién se enteraba en
+        # su próximo tic (30 s) más el timeout del pong (10 s). Hasta 40 s reportando READY
+        # con la casa ya inalcanzable. Ahora la caída se decide y se propaga en el acto.
+        close_code = ws.close_code
+        ws_exc = ws.exception()
+        if ws_exc is not None:
+            logger.warning("ha.ws_error", code=close_code, exc=str(ws_exc))
+            raise HaConnectError(f"WS terminado por error: {ws_exc}")
+        if close_code is None or close_code == aiohttp.WSCloseCode.OK:
+            logger.info("ha.ws_closed_clean", code=close_code)
+            raise HaConnectError(f"WS cerrado limpio por el servidor (code={close_code})")
+        logger.warning("ha.ws_closed_abnormal", code=close_code)
+        raise HaConnectError(f"WS cerrado anormalmente (code={close_code})")
 
     async def _dispatch(self, msg: dict[str, Any]) -> None:
         """Despacha un mensaje recibido según su tipo."""

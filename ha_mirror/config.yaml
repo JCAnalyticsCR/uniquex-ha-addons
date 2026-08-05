@@ -1,5 +1,9 @@
 name: UniquexCR Mirror
-version: "0.21.0"
+# ÚNICO lugar que mira el Supervisor de HA para decidir si hay actualización.
+# Si esto no sube, la casa no recibe nada aunque el código cambie.
+# Mantener sincronizado con mirror_src/pyproject.toml (de ahí sale la versión
+# que reporta /api/health).
+version: "0.22.0"
 slug: ha_mirror
 description: >-
   Mirror del frontend de lujo UniquexCR. Se conecta a Home Assistant de forma

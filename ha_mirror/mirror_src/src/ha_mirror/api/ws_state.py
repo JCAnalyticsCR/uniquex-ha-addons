@@ -8,6 +8,13 @@ Protocolo:
   4. Server hace stream de diffs (state_changed, connection_status,
      service_complete, service_timeout) hasta que el cliente desconecta
 
+OJO con el paso 3: el `snapshot` NO es exclusivo del saludo inicial. Cuando el
+Mirror recupera el enlace con Home Assistant reconcilia a los clientes ya
+conectados (ver `StateStore._fanout_resync`), y si el diff contra la caché vieja
+es demasiado grande manda un `snapshot` por el mismo stream. El cliente tiene que
+poder recibir un snapshot en cualquier momento y reemplazar su estado con él —
+que es justo lo que ya hace `useWsStream`.
+
 El fan-out usa asyncio.Queue con drop si está llena — cliente lento no
 bloquea el loop del upstream.
 """
