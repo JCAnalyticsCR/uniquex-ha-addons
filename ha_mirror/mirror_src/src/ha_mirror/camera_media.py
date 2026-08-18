@@ -369,16 +369,31 @@ class CameraMediaClient:
     # cámara que se abre a pantalla completa).
     _PREWARM_ENABLED = True
     _PREWARM_INTERVAL = 8.0  # < _SNAPSHOT_CACHE_TTL (10 s) → grid siempre encuentra caché fresca
-    # Concurrencia del warm loop: 20 cámaras / 10 = 2 lotes; con 4 s/cámara
-    # (worst-case medido) → 2 × 4 = 8 s por ciclo = exactamente _PREWARM_INTERVAL.
-    # Con el fix de sleep timer-based el ciclo TOTAL (gather + sleep) dura
-    # siempre _PREWARM_INTERVAL, no _PREWARM_INTERVAL + gather.
+    # Concurrencia del warm loop. VOLVIÓ A 4 EN 0.23.0 — a propósito.
     #
-    # Interacción con _snapshot_slots (24): el warm loop ocupa hasta 10 de esos
-    # 24 slots mientras hace los fetches; los 14 restantes quedan para pedidos
-    # reales (live=True del visor iPhone). El visor en vivo usa _stream_slots
-    # (mp4/hls), que es un semáforo distinto: no compite con el warm loop.
-    _PREWARM_CONCURRENCY = 10
+    # 0.21.0 la subió de 4 a 10 para que el ciclo cerrara en 8 s (20 cámaras /
+    # 10 = 2 lotes × 4 s worst-case). El problema es dónde cae ese costo: el
+    # Mirror solo PIDE los JPEG, quien los decodifica es go2rtc. Sus semáforos
+    # (_snapshot_slots = 24) protegen al Mirror, no la CPU de go2rtc, que es el
+    # recurso que de verdad se satura. Pasar de 4 a 10 son ~2.9× decodificaciones
+    # por segundo sostenidas contra la cajita, y ese número NUNCA se midió contra
+    # hardware real.
+    #
+    # 0.23.0 sale a producción para llevar el fix del backoff de 0.22.0 (la casa
+    # se reconectaba 1 vez por minuto) y las dependencias pinneadas de 0.21.0. No
+    # tiene sentido mezclar ese arreglo con un aumento de carga sin medir: con 4,
+    # la carga de cámaras queda IDÉNTICA a la de 0.20.0, que es lo que la casa
+    # viene corriendo sin quejas.
+    #
+    # Costo aceptado: 20 cámaras / 4 = 5 lotes × 4 s ≈ 20 s por ciclo, así que la
+    # cuadrícula muestra fotos de hasta ~20 s en vez de 8 (exactamente como hoy).
+    # El visor expandido no se ve afectado: usa _stream_slots (mp4/hls), un
+    # semáforo distinto que no compite con el warm loop.
+    #
+    # PARA SUBIRLA: medir primero la CPU de go2rtc en la cajita con el visor en
+    # vivo abierto. Si hay margen, subir de a poco (4 → 6 → 8) verificando que el
+    # video del visor no se degrade. Es una sola constante.
+    _PREWARM_CONCURRENCY = 4
     _PREWARM_WIDTH = 512  # variante del grid de ESCRITORIO; tener vivo el stream acelera todas
     _PREWARM_QUALITY = 55
     _PREWARM_INITIAL_DELAY = 8.0  # dejar bootear el add-on antes del 1er ciclo
