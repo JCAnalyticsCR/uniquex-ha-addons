@@ -219,6 +219,42 @@ class HAUpstream:
             raise UpstreamNotReadyError("Upstream no conectado")
         return await self._send_command(msg, timeout=timeout)
 
+    async def aplicar_zona_horaria(self, zona: str) -> None:
+        """
+        Fija la zona horaria de Home Assistant.
+
+        POR QUÉ EXISTE
+        --------------
+        La caja se prepara en una casa y se instala en otra. Durante la
+        configuración inicial, quien la arma pone SU ubicación — y esa zona
+        horaria viaja al cliente. El síntoma es de los peores: nada se rompe, las
+        escenas por atardecer quedan corridas, y nadie relaciona una cosa con la
+        otra durante semanas.
+
+        La plataforma sí sabe la zona de la casa real, así que la manda al
+        activar y esto la aplica. Deja de depender de que alguien se acuerde.
+
+        ⚠️ `config/core/update` NO ESTÁ EN LA API PÚBLICA DE HOME ASSISTANT.
+        Existe —lo usa su propio frontend, está en
+        `homeassistant/components/config/core.py` y exige permiso de admin, que
+        el token del Supervisor tiene— pero al no ser público puede cambiar en
+        cualquier actualización.
+
+        Por eso quien llama a esto NO debe tratar un fallo como fatal: si un día
+        HA cambia el comando, la casa tiene que seguir funcionando y la zona
+        horaria pasa a ser algo que se corrige a mano, que es donde estábamos
+        antes. Nunca al revés.
+        """
+        from ha_mirror.errors import UpstreamNotReadyError
+
+        if self._ws is None or not self._store.connected:
+            raise UpstreamNotReadyError("Upstream no conectado")
+
+        await self._send_command(
+            {"type": "config/core/update", "time_zone": zona}, timeout=10.0
+        )
+        logger.info("upstream.zona_horaria_aplicada", zona=zona)
+
     # -------------------------------------------------------------------------
     # Conexión y handshake
     # -------------------------------------------------------------------------

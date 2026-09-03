@@ -192,6 +192,43 @@ class Settings(BaseSettings):
     tenant_id: int = Field(default=1, description="ID del tenant único (N=1)")
 
     # -------------------------------------------------------------------------
+    # Activación de fábrica (modo producto) — APAGADA por defecto
+    #
+    # `platform_base_url` es el INTERRUPTOR MAESTRO de todo el aprovisionamiento
+    # automático: identidad de la caja, reporte a la plataforma, túnel propio y
+    # calcomanía con el QR. Vacía = MODO ARTESANAL: nada de eso existe.
+    #
+    # El default es VACÍO A PROPÓSITO, y es la decisión más importante de este
+    # archivo. En la rama de fábrica apuntaba a la plataforma, y el arranque se
+    # decidía por "¿hay identidad?" en vez de por esta variable. Fusionado así,
+    # una casa artesanal YA INSTALADA —que está fuera del proyecto de fábrica por
+    # decisión explícita— habría empezado a reportarse sola a esa plataforma cada
+    # dos minutos con solo actualizar el add-on. Una casa nunca se une a una flota
+    # por defecto: alguien tiene que escribir la URL.
+    # -------------------------------------------------------------------------
+    platform_base_url: str = Field(
+        default="",
+        description=(
+            "URL del API de la plataforma de fábrica. VACÍA (default) = modo "
+            "artesanal: la caja no genera identidad, no se reporta, no levanta "
+            "túnel propio y no muestra calcomanía. Con valor = modo fábrica; "
+            "sirve para DOS cosas y por eso es una sola variable: el reporte "
+            "periódico (POST {url}/api/boxes/announce) y el QR de la calcomanía "
+            "({url}/emparejar). NO es un secreto — es pública, y por eso sí puede "
+            "venir horneada en la imagen del sistema."
+        ),
+    )
+    device_identity_key_path: Path | None = Field(
+        default=None,
+        description=(
+            "Archivo con la llave PRIVADA de la caja (Ed25519). Si no se define, "
+            "se deriva como device_identity.key junto a la DB — que en el add-on "
+            "es /data, el único directorio que sobrevive a las actualizaciones. "
+            "Ver ha_mirror/device_identity.py."
+        ),
+    )
+
+    # -------------------------------------------------------------------------
     # Crestron Home (conector directo)
     # -------------------------------------------------------------------------
     crestron_enabled: bool = Field(
@@ -439,6 +476,53 @@ class Settings(BaseSettings):
             "http://localhost:3000",
             "http://localhost:5173",
         ]
+
+    @property
+    def modo_fabrica(self) -> bool:
+        """
+        True si esta caja es una caja de producto (aprovisionamiento automático).
+
+        ÚNICA condición que decide si la activación existe. Todo el resto del
+        código pregunta por acá y nunca por "¿hay identidad?" o "¿hay archivo?":
+        dos formas de decidir lo mismo terminan discrepando, y el día que
+        discrepen la casa de alguien empieza a hablarle a una plataforma que no
+        le corresponde.
+        """
+        return bool(self.platform_base_url.strip())
+
+    @property
+    def tunnel_token_path(self) -> Path:
+        """
+        Dónde vive el token de cloudflared de esta casa.
+
+        Archivo propio (0600) junto a la llave privada, no dentro de la SQLite:
+        la base se copia para depurar y se respalda, y este token levanta el
+        túnel de la casa de un cliente. Mismo criterio que la llave privada.
+        """
+        return self.mirror_db_path.parent / "tunnel.token"
+
+    @property
+    def platform_mirror_key_path(self) -> Path:
+        """
+        Credencial que la plataforma emitió para que la app le hable a esta caja.
+
+        Archivo propio junto a la llave privada, no en la SQLite: es un secreto
+        y la base se copia para depurar.
+        """
+        return self.mirror_db_path.parent / "platform_mirror.key"
+
+    @property
+    def device_key_path(self) -> Path:
+        """
+        Dónde vive la llave privada de la caja.
+
+        Se deriva junto a la DB en vez de tener un default absoluto propio: si
+        alguien mueve la base (dev local, tests, otro layout), la llave lo sigue
+        y no quedan las dos mitades de la identidad en directorios distintos.
+        """
+        if self.device_identity_key_path is not None:
+            return self.device_identity_key_path
+        return self.mirror_db_path.parent / "device_identity.key"
 
     @property
     def crestron_configured(self) -> bool:

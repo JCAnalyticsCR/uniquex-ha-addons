@@ -4,7 +4,7 @@ name = "ha-mirror"
 # Estuvo congelada en 0.3.1 mientras el add-on iba en 0.20.0 — corregido en 0.21.0.
 # Desde 0.22.0 esta es la version que /api/health reporta hacia afuera
 # (main.py la lee con importlib.metadata del paquete instalado).
-version = "0.24.0"
+version = "0.25.0"
 description = "FastAPI mirror para Home Assistant — single-tenant, WebSocket fan-out, Fernet at-rest"
 requires-python = ">=3.11"
 dependencies = [
@@ -18,6 +18,10 @@ dependencies = [
     "aiosqlite>=0.20",
     "prometheus-client>=0.20",
     "itsdangerous>=2.2",
+    # QR de la calcomanía de activación. Puro Python y CERO dependencias
+    # transitivas — importa en una caja que va a la casa de un cliente: cada
+    # paquete que entra es superficie que hay que auditar.
+    "segno>=1.6",
 ]
 
 [dependency-groups]

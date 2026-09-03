@@ -152,6 +152,42 @@ CREATE TABLE IF NOT EXISTS custom_rooms (
 
 -- Registro de entidades conocidas para detección de dispositivos nuevos.
 -- acknowledged_at NULL = pendiente de revisión por el cliente.
+-- Alembic y CREATE TABLE IF NOT EXISTS NO agrega columnas a una tabla que ya
+-- existe). Por eso las columnas de emparejamiento ya están, aunque el código que
+-- las llena sea del paso siguiente: si se agregaran después, toda caja ya
+-- instalada arrastraría un schema incompleto para siempre.
+CREATE TABLE IF NOT EXISTS device_identity (
+    id                INTEGER PRIMARY KEY CHECK (id = 1),
+    device_id         TEXT NOT NULL UNIQUE,     -- uuid4().hex, aleatorio (NO derivado del hardware)
+    public_key        TEXT NOT NULL,            -- base64 de los 32 bytes crudos Ed25519
+    key_algorithm     TEXT NOT NULL DEFAULT 'ed25519',
+    hardware_id       TEXT,                     -- inventario/soporte; nullable a propósito
+    created_at        TEXT NOT NULL,            -- ISO8601 con offset, escrito desde Python
+
+    -- --- Emparejamiento ---
+    -- El código del QR se DERIVA de la llave privada (no se guarda). Esta versión
+    -- entra en la derivación: subirla da un código nuevo sin tocar el par de
+    -- llaves. Sirve para el caso "la calcomanía se fotografió antes de instalar":
+    -- se reimprime sin re-aprovisionar la caja.
+    claim_code_version INTEGER NOT NULL DEFAULT 1,
+    paired_at         TEXT,                     -- cuándo se completó el claim
+    paired_house_id   TEXT,                     -- el house_id que asignó el backend
+    backend_base_url  TEXT,                     -- a qué plataforma quedó atada esta caja
+
+    -- --- Alcance: el túnel que el backend provisiona AL emparejar ---
+    -- Resuelve que hoy hay que averiguar la IP local de la caja y editar el
+    -- add-on de Cloudflared a mano (00_INSTALAR_REMOTO.md, paso 6) — cuatro
+    -- pasos que exigen a Jeyrell presente, y una IP local clavada que se rompe
+    -- con cualquier renovación de DHCP.
+    --
+    -- La CREDENCIAL del túnel no está acá: es un secreto y va a su propio
+    -- archivo, por la misma razón que la llave privada (la base se copia para
+    -- depurar y se respalda; los secretos no deben viajar con ella).
+    tunnel_provider   TEXT,                     -- 'cloudflare' — no clavarse a un proveedor
+    tunnel_hostname   TEXT,                     -- el subdominio asignado; público, no secreto
+    tunnel_ready_at   TEXT                      -- cuándo quedó operativo
+);
+
 CREATE TABLE IF NOT EXISTS known_entities (
     tenant_id       INTEGER NOT NULL DEFAULT 1 REFERENCES tenants(id),
     entity_id       TEXT NOT NULL,
@@ -843,3 +879,112 @@ class Database:
                 total += cur.rowcount
         await conn.commit()
         return total
+
+    # -------------------------------------------------------------------------
+    # Identidad de la caja (modo fábrica)
+    #
+    # Solo se usa cuando `platform_base_url` tiene valor. En modo artesanal estas
+    # tablas quedan vacías y estos métodos no los llama nadie — la tabla se crea
+    # igual porque `CREATE TABLE IF NOT EXISTS` no agrega columnas a una tabla ya
+    # existente: un schema incompleto se arrastraría para siempre.
+    # -------------------------------------------------------------------------
+
+    async def get_device_identity(self) -> dict[str, Any] | None:
+        """La identidad de esta caja, o None si nunca arrancó (primer boot)."""
+        conn = self._require_conn()
+        async with conn.execute("SELECT * FROM device_identity WHERE id = 1") as cur:
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            return self._device_identity_row_to_dict(row)
+
+    async def create_device_identity(
+        self,
+        *,
+        device_id: str,
+        public_key: str,
+        hardware_id: str | None,
+        key_algorithm: str,
+    ) -> dict[str, Any]:
+        """
+        Inserta la identidad única de la caja. Solo corre en el primer arranque.
+
+        El INSERT es sin OR REPLACE a propósito: si ya hay una fila, que falle.
+        Pisar la identidad de una caja en funcionamiento es justo lo que no
+        queremos que pueda pasar por accidente.
+        """
+        conn = self._require_conn()
+        await conn.execute(
+            """
+            INSERT INTO device_identity
+                (id, device_id, public_key, key_algorithm, hardware_id, created_at,
+                 claim_code_version, paired_at, paired_house_id, backend_base_url,
+                 tunnel_provider, tunnel_hostname, tunnel_ready_at)
+            VALUES (1, ?, ?, ?, ?, ?, 1, NULL, NULL, NULL, NULL, NULL, NULL)
+            """,
+            (device_id, public_key, key_algorithm, hardware_id, utc_now_iso()),
+        )
+        await conn.commit()
+        creada = await self.get_device_identity()
+        if creada is None:  # pragma: no cover — solo si algo borra en el medio
+            raise RuntimeError("La identidad desapareció inmediatamente tras el INSERT")
+        return creada
+
+    async def mark_device_paired(
+        self,
+        *,
+        house_id: str,
+        backend_base_url: str,
+    ) -> dict[str, Any] | None:
+        """
+        Sella el emparejamiento. UN SOLO USO: si ya estaba emparejada, no hace nada.
+
+        El `WHERE paired_at IS NULL` es la garantía de un solo uso, y vive en la
+        base a propósito — no en un `if` de Python. Dos requests simultáneos con
+        el mismo código llegan los dos al UPDATE; solo uno encuentra la fila sin
+        emparejar. Devuelve None cuando no actualizó nada, y el router lo
+        traduce a "esta caja ya tiene dueño".
+        """
+        conn = self._require_conn()
+        async with conn.execute(
+            """
+            UPDATE device_identity
+            SET paired_at = ?, paired_house_id = ?, backend_base_url = ?
+            WHERE id = 1 AND paired_at IS NULL
+            """,
+            (utc_now_iso(), house_id, backend_base_url),
+        ) as cur:
+            actualizadas = cur.rowcount
+        await conn.commit()
+        if not actualizadas:
+            return None
+        return await self.get_device_identity()
+
+    async def set_device_tunnel(
+        self,
+        *,
+        provider: str,
+        hostname: str,
+    ) -> dict[str, Any] | None:
+        """
+        Registra el túnel que el backend provisionó para esta casa.
+
+        Separado de mark_device_paired porque son dos momentos distintos: el
+        claim se completa apenas la persona escanea, y el túnel puede tardar
+        (crear el DNS, que propague, que cloudflared levante). Meterlos en el
+        mismo UPDATE haría que un túnel lento pareciera un emparejamiento fallido.
+        """
+        conn = self._require_conn()
+        async with conn.execute(
+            """
+            UPDATE device_identity
+            SET tunnel_provider = ?, tunnel_hostname = ?, tunnel_ready_at = ?
+            WHERE id = 1
+            """,
+            (provider, hostname, utc_now_iso()),
+        ) as cur:
+            actualizadas = cur.rowcount
+        await conn.commit()
+        if not actualizadas:
+            return None
+        return await self.get_device_identity()

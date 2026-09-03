@@ -180,6 +180,37 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     await db.connect()
 
+    # ---------------------------------------------------------------------
+    # MODO FABRICA vs MODO ARTESANAL — el interruptor es `platform_base_url`.
+    #
+    # Artesanal (default, vacio): no se genera identidad, no se reporta a
+    # ninguna plataforma, no se levanta tunel propio y no hay calcomania. Una
+    # casa instalada a mano actualiza el add-on y NO cambia absolutamente nada.
+    # Esa garantia es el motivo de que la condicion sea una sola y este aca.
+    #
+    # Un fallo generando la identidad NO tumba el Mirror: esta caja puede estar
+    # sirviendo las camaras de una familia, y que una funcion de
+    # aprovisionamiento deje la casa a oscuras seria un intercambio pesimo.
+    # ---------------------------------------------------------------------
+    device_identity = None
+    if settings.modo_fabrica:
+        logger.info("mirror.modo_fabrica", platform_base_url=settings.platform_base_url)
+        try:
+            from ha_mirror.device_identity import ensure_identity
+
+            device_identity = await ensure_identity(db, settings.device_key_path)
+        except Exception as exc:
+            logger.error(
+                "device_identity.unavailable",
+                exc=str(exc),
+                msg="El Mirror arranca igual; solo la activacion queda fuera de servicio.",
+            )
+    else:
+        logger.info(
+            "mirror.modo_artesanal",
+            msg="Sin platform_base_url: sin identidad, sin reporte y sin tunel propio.",
+        )
+
     # 4. Construir HAUpstream
     upstream = HAUpstream(
         ha_ws_url=settings.ha_url,
@@ -260,6 +291,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # Permite que /api/health la exponga hacia afuera — confirmar en un segundo
     # si una actualización entró o un rollback funcionó, sin entrar a la cajita.
     app.state.mirror_version = _MIRROR_VERSION
+    # None en modo artesanal; api/device.py responde 503 en ese caso.
+    app.state.device_identity = device_identity
 
     # Servicio de onboarding (sin tareas de fondo propias).
     app.state.onboarding = OnboardingService(
@@ -289,6 +322,73 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     upstream_task.add_done_callback(_on_upstream_done)
 
+    # ---------------------------------------------------------------------
+    # Reporte a la plataforma + tunel propio. Solo en modo fabrica y solo si la
+    # identidad se resolvio. Si la caja YA esta emparejada, el loop termina solo
+    # en su primer ciclo (el backend responde paired:true).
+    # ---------------------------------------------------------------------
+    announce_task: asyncio.Task | None = None
+    tunnel_task: asyncio.Task | None = None
+    if settings.modo_fabrica and device_identity is not None:
+        try:
+            from ha_mirror.announce_client import AnnounceClient
+            from ha_mirror.device_identity import cargar_llave_privada
+            from ha_mirror.tunnel_client import TunnelClient
+
+            privada_para_anuncio = cargar_llave_privada(settings.device_key_path)
+            announce_client = AnnounceClient(
+                identity=device_identity,
+                private_key=privada_para_anuncio,
+                db=db,
+                platform_base_url=settings.platform_base_url,
+                tunnel_token_path=settings.tunnel_token_path,
+                mirror_key_path=settings.platform_mirror_key_path,
+                upstream=upstream,
+                on_paired=lambda nueva: setattr(app.state, "device_identity", nueva),
+            )
+            # El tunel corre EN PARALELO al anuncio, no despues: el token puede
+            # llegar en cualquier momento (cuando alguien escanee el QR) y
+            # tambien puede estar ya en disco de un arranque anterior.
+            tunnel_client = TunnelClient(token_path=settings.tunnel_token_path)
+            tunnel_task = asyncio.create_task(
+                tunnel_client.run_forever(), name="tunnel_client"
+            )
+
+            def _on_tunnel_done(task: asyncio.Task) -> None:
+                if task.cancelled():
+                    return
+                exc = task.exception()
+                if exc:
+                    logger.error(
+                        "tunnel.task_failed",
+                        exc=str(exc),
+                        msg="La casa sigue andando en red local, pero no desde afuera.",
+                    )
+
+            tunnel_task.add_done_callback(_on_tunnel_done)
+
+            announce_task = asyncio.create_task(
+                announce_client.run_forever(), name="announce_client"
+            )
+
+            def _on_announce_done(task: asyncio.Task) -> None:
+                if task.cancelled():
+                    logger.info("announce.task_cancelled")
+                    return
+                exc = task.exception()
+                if exc:
+                    logger.error("announce.task_failed", exc=str(exc))
+                else:
+                    logger.info("announce.task_finished_paired")
+
+            announce_task.add_done_callback(_on_announce_done)
+        except Exception as exc:
+            logger.error(
+                "announce.init_failed",
+                exc=str(exc),
+                msg="El Mirror arranca sin el cliente de anuncio. Revisar los logs.",
+            )
+
     logger.info("mirror.started")
 
     try:
@@ -305,6 +405,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if crestron_client is not None:
             with suppress(Exception):
                 await crestron_client.close()
+        for tarea in (announce_task, tunnel_task):
+            if tarea is not None:
+                tarea.cancel()
+                with suppress(asyncio.CancelledError, Exception):
+                    await tarea
         await camera_media.close()
         await db.close()
         logger.info("mirror.stopped")
@@ -359,6 +464,18 @@ def create_app() -> FastAPI:
     # Emisor de tickets de WebSocket (0.21.0). Lo llama el frontend desde el
     # servidor con X-API-Key; el navegador nunca recibe la key.
     app.include_router(ws_ticket_router)
+
+    # Identidad de la caja y calcomania de activacion: SOLO modo fabrica. En
+    # artesanal ni siquiera se importan (asi `segno` no se carga donde no se
+    # usa) y las rutas no existen — un 404 en vez de una pantalla vacia.
+    if settings.modo_fabrica:
+        from ha_mirror.api.device import router as device_router
+        from ha_mirror.api.sticker import router as sticker_router
+
+        app.include_router(device_router)
+        # La calcomania vive en `/` para poder abrirla por ingress desde la
+        # barra lateral de HA. Es lo que usa quien prepara la caja en el taller.
+        app.include_router(sticker_router)
 
     # Routers WebSocket
     app.include_router(ws_router)

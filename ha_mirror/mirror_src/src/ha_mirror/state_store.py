@@ -40,6 +40,76 @@ logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
 _RESYNC_MAX_DIFF = 200
 
 
+# Plataformas internas de HA que NO representan hardware físico añadido por el socio.
+# Se excluyen del conteo de dispositivos del taller (ver contar_dispositivos_configurados).
+#
+# POR QUÉ ESTE MECANISMO Y NO OTRO
+# ---------------------------------
+# HaDeviceRegistryEntry tiene un campo `entry_type` (valores: None = hardware real,
+# "service" = integración de servicio sin hardware) que sería el filtro ideal, pero
+# no siempre llega según la versión de HA y no está en el modelo base. Usar la
+# `platform` de la entidad (que SÍ se hidrata de entity_registry) es más estable.
+#
+# LA LISTA ERRA HACIA LA INCLUSIÓN
+# ---------------------------------
+# Si una plataforma no está acá, sus dispositivos SE CUENTAN. Un falso positivo
+# (la calcomanía queda bloqueada cuando la caja está limpia) es corregible en
+# segundos. Un falso negativo (despachar la caja con dispositivos del taller sin
+# que nadie lo note) puede volverse un viaje de soporte a casa del cliente.
+_PLATAFORMAS_INTERNAS: frozenset[str] = frozenset(
+    {
+        # Infraestructura HAOS — el supervisor, los add-ons y sus entidades de
+        # actualización existen en el registry aunque no sean hardware del taller.
+        "homeassistant",
+        "hassio",
+        "backup",
+        # Monitoreo del propio host: CPU, RAM, disco del hardware del socio.
+        # Estos sensores viajan a la casa del cliente y apuntan a una máquina
+        # que no está ahí — el caso exacto que hay que prevenir.
+        "systemmonitor",
+        "system_health",
+        # Entidades de HA sin correlato físico
+        "persistent_notification",
+        "recorder",
+        "logbook",
+        "conversation",  # Asistente de voz Assist
+        # Astronómicas / meteorológicas (sin hardware)
+        "sun",
+        "moon",
+        "weather",
+        # Helpers y entidades de lógica — el socio las crea para automatizar
+        # su taller, pero no son hardware que pertenezca a la casa del cliente.
+        "automation",
+        "script",
+        "scene",
+        "zone",
+        "person",
+        "group",
+        "input_boolean",
+        "input_number",
+        "input_select",
+        "input_text",
+        "input_datetime",
+        "input_button",
+        "timer",
+        "counter",
+        "schedule",
+        "todo",
+        "calendar",
+        "template",
+    }
+)
+
+# Tope de entidades que la reconciliación post-rehidratación manda una por una.
+# Por debajo, el diff es SIEMPRE más barato en bytes que un snapshot: el snapshot
+# lleva las 418 entidades MÁS el registro completo de servicios de HA (que no
+# cambia entre reconexiones y pesa tanto como los estados). Por encima estamos
+# reconstruyendo media casa entidad por entidad, y ahí manda otro costo: son N
+# frames sobre el túnel de Cloudflare y N slots de la cola de 1000 del cliente,
+# contra UN frame del snapshot. 200 ≈ la mitad de las entidades de esta casa.
+_RESYNC_MAX_DIFF = 200
+
+
 class StateStore:
     """
     Store en memoria del estado HA con fan-out WebSocket.
@@ -345,6 +415,45 @@ class StateStore:
                 )
             )
         return result
+
+    def contar_dispositivos_configurados(self) -> int:
+        """
+        Cantidad de dispositivos físicos no-internos que HA tiene registrados.
+
+        Útil para detectar antes de despachar una caja si el socio la preparó en su
+        propia red y dejó dispositivos de su casa (su TV, su impresora, sus luces)
+        en el registry de HA. Esos dispositivos van a aparecer en la app del cliente
+        apuntando a equipos que no existen en su casa — el error es silencioso y no
+        da ninguna señal hasta que alguien lo nota semanas después.
+
+        QUÉ CUENTA
+        ----------
+        Cada device_id único de entidades que:
+          1. Tienen device_id (las que no lo tienen son helpers, automations, sun,
+             scripts — integraciones que HA trae solas, nunca hardware real).
+          2. Su plataforma NO está en _PLATAFORMAS_INTERNAS (ver constante).
+
+        Tres entidades del mismo dispositivo (un switch, un sensor de temperatura
+        y un botón del mismo equipo Zigbee) cuentan como UN solo dispositivo.
+
+        QUÉ NO CUENTA
+        -------------
+        Ver _PLATAFORMAS_INTERNAS: hassio, backup, systemmonitor, helpers, etc.
+
+        Si el store no se hidró todavía (HA no conectó), devuelve 0 — en ese caso
+        no hay datos y no se bloquea la calcomanía por falta de información.
+        """
+        device_ids: set[str] = set()
+        for entry in self._entities.values():
+            # Sin device_id: entidad virtual, helper o integración de servicio puro.
+            # Nunca representa hardware que pudiera "viajar" a la casa del cliente.
+            if entry.device_id is None:
+                continue
+            # Plataforma interna: HA la crea sola, no la añadió el socio.
+            if entry.platform in _PLATAFORMAS_INTERNAS:
+                continue
+            device_ids.add(entry.device_id)
+        return len(device_ids)
 
     def get_services(self) -> dict[str, Any]:
         return dict(self._services)

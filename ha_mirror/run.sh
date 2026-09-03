@@ -17,6 +17,7 @@ gen_secret() { python3 -c "import secrets; print(secrets.token_hex(32))"; }
 
 API_KEY="$(opt mirror_api_key)"
 FRONTEND_ORIGIN="$(opt frontend_origin)"
+PLATFORM_BASE_URL="$(opt platform_base_url)"
 LOG_LEVEL="$(opt log_level)"; LOG_LEVEL="${LOG_LEVEL:-INFO}"
 GO2RTC_BASE_URL="$(opt go2rtc_base_url)"
 GO2RTC_USERNAME="$(opt go2rtc_username)"
@@ -67,6 +68,17 @@ export MIRROR_DB_PATH="/data/mirror.sqlite3"
 export LOG_LEVEL="${LOG_LEVEL}"
 if [ -n "${FRONTEND_ORIGIN}" ] && [ "${FRONTEND_ORIGIN}" != "null" ]; then
   export FRONTEND_ORIGIN="${FRONTEND_ORIGIN}"
+fi
+# Interruptor maestro del modo fabrica. Si la opcion viene vacia (o "null",
+# que es lo que devuelve el parser cuando no esta puesta) NO se exporta nada:
+# el Mirror arranca en modo artesanal y no genera identidad, no reporta a
+# ninguna plataforma y no levanta tunel propio. Una casa instalada a mano
+# nunca se une a una flota por accidente.
+if [ -n "${PLATFORM_BASE_URL}" ] && [ "${PLATFORM_BASE_URL}" != "null" ]; then
+  export PLATFORM_BASE_URL="${PLATFORM_BASE_URL}"
+  echo "[mirror] Modo FABRICA: reportando a ${PLATFORM_BASE_URL}"
+else
+  echo "[mirror] Modo ARTESANAL: sin plataforma, sin identidad de caja, sin tunel propio."
 fi
 if [ -n "${GO2RTC_BASE_URL}" ] && [ "${GO2RTC_BASE_URL}" != "null" ]; then
   export GO2RTC_BASE_URL="${GO2RTC_BASE_URL}"

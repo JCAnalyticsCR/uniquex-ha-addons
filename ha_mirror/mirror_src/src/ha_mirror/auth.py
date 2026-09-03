@@ -155,15 +155,39 @@ def _get_valid_keys(settings: Settings) -> list[bytes]:
     """
     # Preferir la lista multi-key si esta disponible
     multi = getattr(settings, "mirror_api_keys", None)
+    keys: list[bytes] = []
     if multi:
         raw: str = multi.get_secret_value()
         keys = [k.strip().encode() for k in raw.split(",") if k.strip()]
-        if keys:
-            return keys
 
     # Fallback a la key unica
-    single: str = settings.mirror_api_key.get_secret_value()
-    return [single.encode()]
+    if not keys:
+        single: str = settings.mirror_api_key.get_secret_value()
+        keys = [single.encode()]
+
+    # Y la credencial que emitio la PLATAFORMA al emparejar, si esta caja ya la
+    # recibio. Es la que usa la app multi-casa: sin esto, la app no podria
+    # hablarle a ninguna caja aprovisionada automaticamente.
+    #
+    # Se suma en vez de reemplazar: la key configurada a mano sigue sirviendo
+    # para diagnostico local, y quitarsela dejaria sin acceso a quien esta
+    # parado frente al equipo.
+    #
+    # 🔪 VA DESPUES DE LOS DOS CAMINOS, NO SOLO DEL FALLBACK. Tal como venia de
+    # la rama de fabrica, esto colgaba despues de un `return keys` temprano: una
+    # caja que usara MIRROR_API_KEYS (la rotacion zero-downtime de arriba) se
+    # quedaba SIN la credencial de la plataforma, o sea que la app multi-casa
+    # dejaba de poder hablarle — y justo durante una rotacion, que es cuando
+    # menos se quiere descubrir algo asi.
+    #
+    # En modo artesanal el archivo no existe y esto devuelve None sin tocar
+    # disco mas alla de un stat: la casa sigue exactamente como estaba.
+    from ha_mirror.device_identity import cargar_clave_mirror
+
+    plataforma = cargar_clave_mirror(settings.platform_mirror_key_path)
+    if plataforma:
+        keys.append(plataforma.encode())
+    return keys
 
 
 def _is_valid_key(provided: str, settings: Settings) -> bool:

@@ -3,7 +3,7 @@ name: UniquexCR Mirror
 # Si esto no sube, la casa no recibe nada aunque el código cambie.
 # Mantener sincronizado con mirror_src/pyproject.toml (de ahí sale la versión
 # que reporta /api/health).
-version: "0.24.0"
+version: "0.25.0"
 slug: ha_mirror
 description: >-
   Mirror del frontend de lujo UniquexCR. Se conecta a Home Assistant de forma
@@ -31,6 +31,12 @@ ports_description:
   "8000/tcp": "Puerto del Mirror — se expone por el túnel Cloudflare hacia el frontend"
 options:
   mirror_api_key: ""
+  # INTERRUPTOR MAESTRO del aprovisionamiento automatico (modo fabrica).
+  # VACIA = casa artesanal: sin identidad de caja, sin reporte a ninguna
+  # plataforma, sin tunel propio y sin calcomania de activacion. Una casa
+  # instalada a mano actualiza el add-on y NO cambia nada.
+  # Con valor = caja de producto: se enciende el QR, el reporte y el tunel.
+  platform_base_url: ""
   frontend_origin: ""
   log_level: INFO
   go2rtc_base_url: ""
@@ -40,6 +46,7 @@ options:
   camera_labels: "{}"
 schema:
   mirror_api_key: "password"
+  platform_base_url: "str?"
   frontend_origin: "str?"
   log_level: "list(DEBUG|INFO|WARNING|ERROR)?"
   go2rtc_base_url: "str?"
