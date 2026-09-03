@@ -158,8 +158,7 @@ def verificar(imagen: str, plataforma: str) -> list[str]:
     marcadas = [l for l in salida.splitlines() if l.startswith("RESULTADO ")]
     if len(marcadas) != 1:
         raise Roto(
-            "no encontre la linea de resultado. Salida completa:
-" + salida.strip()
+            "no encontre la linea de resultado. Salida completa:\n" + salida.strip()
         )
     _, rutas_api, rutas_calco, modo_fabrica = marcadas[0].split()
 
