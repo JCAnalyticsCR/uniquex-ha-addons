@@ -1,0 +1,102 @@
+name: Construir y publicar la imagen del add-on
+
+# POR QUE EXISTE
+# --------------
+# Hasta la 0.26.1, CADA caja construia la imagen del add-on al instalarlo: 8
+# pasos de build, 102 dependencias bajadas de PyPI y la descarga de cloudflared.
+# Entre 3 y 8 minutos por caja, y dependiendo de que PyPI, Debian y GitHub
+# estuvieran disponibles justo en ese momento — con el tecnico parado en la casa
+# del cliente.
+#
+# Con este workflow la imagen se construye UNA vez, aca, y las cajas solo la
+# bajan. La instalacion pasa de minutos a segundos, y todas las cajas corren
+# bytes identicos en vez de resultados de builds hechos en momentos distintos.
+#
+# CUANDO CORRE
+# ------------
+# Al empujar a main un cambio dentro de ha_mirror/, y a mano desde la pestaña
+# Actions. Publica con la version que diga config.yaml.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "ha_mirror/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  construir:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # El nombre de la imagen lleva la arquitectura al final porque es lo
+          # que Home Assistant espera: en config.yaml se escribe una sola linea
+          # con {arch} y el Supervisor la reemplaza por la del equipo.
+          - arch: amd64
+            plataforma: linux/amd64
+          - arch: aarch64
+            plataforma: linux/arm64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Leer la version de config.yaml
+        id: version
+        run: |
+          set -euo pipefail
+          VERSION="$(grep -E '^version:' ha_mirror/config.yaml | sed 's/.*"\(.*\)".*/\1/')"
+          if [ -z "$VERSION" ]; then
+            echo "No pude leer la version de ha_mirror/config.yaml" >&2
+            exit 1
+          fi
+          echo "valor=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version a publicar: $VERSION"
+
+      - name: Verificar que el paquete este sano antes de construir
+        # El mismo chequeo que se corre a mano antes de publicar: CRLF en los
+        # .sh, continuaciones rotas en el Dockerfile, versiones desincronizadas.
+        # Los dos defectos que rompieron la primera instalacion en hardware real
+        # los introdujo el empaquetado, no el codigo.
+        run: python3 verificar_paquete.py
+
+      - name: Preparar QEMU (para construir arm64 en un runner x86)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Preparar buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Entrar al registro de GitHub
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Construir y publicar
+        uses: docker/build-push-action@v6
+        with:
+          context: ha_mirror
+          file: ha_mirror/Dockerfile
+          platforms: ${{ matrix.plataforma }}
+          push: true
+          # Dos etiquetas: la version exacta (que es la que usa config.yaml) y
+          # `latest` para poder mirar a mano cual fue la ultima.
+          tags: |
+            ghcr.io/jcanalyticscr/uniquex-mirror-${{ matrix.arch }}:${{ steps.version.outputs.valor }}
+            ghcr.io/jcanalyticscr/uniquex-mirror-${{ matrix.arch }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Resumen
+        run: |
+          echo "Publicada: ghcr.io/jcanalyticscr/uniquex-mirror-${{ matrix.arch }}:${{ steps.version.outputs.valor }}"
+          echo ""
+          echo "RECORDATORIO: para que las cajas puedan bajarla sin credencial,"
+          echo "el paquete tiene que estar en visibilidad PUBLICA en GitHub."
+          echo "Se cambia una sola vez, en la pagina del paquete."
