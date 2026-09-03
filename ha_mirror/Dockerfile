@@ -14,8 +14,53 @@ FROM python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3
 
 # tini para manejo correcto de señales (init: false en config.yaml)
 RUN apt-get update \
- && apt-get install -y --no-install-recommends tini \
+ && apt-get install -y --no-install-recommends tini curl ca-certificates \
  && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# cloudflared — el tunel que vuelve alcanzable la casa desde internet.
+#
+# SOLO lo usa el MODO FABRICA (`platform_base_url` con valor): la caja recibe su
+# token al activarse y `tunnel_client.py` levanta este binario. Una casa
+# artesanal NUNCA lo ejecuta — su tunel lo maneja el add-on Cloudflared aparte.
+# Viaja en la imagen para que una caja de producto no dependa de que alguien
+# instale nada en el momento de la activacion, que es justo lo que el flujo del
+# QR viene a eliminar.
+#
+# POR QUE SE DESCARGA ASI Y NO CON `curl | sh`: esto corre dentro de la casa de
+# un cliente. Un binario que se baja sin verificar es una puerta abierta a que
+# un mirror comprometido o un DNS envenenado metan otra cosa. Por eso version
+# FIJADA + checksum VERIFICADO: si GitHub sirviera un binario distinto bajo el
+# mismo tag, el build FALLA en vez de instalarlo.
+#
+# PARA ACTUALIZAR: cambiar CLOUDFLARED_VERSION, bajar los dos binarios, calcular
+# su sha256sum y reemplazar los dos ARG. Los tres se cambian juntos o falla.
+#
+# LAS BARRAS `\` DE CONTINUACION SON CRITICAS. En la primera instalacion real
+# este bloque llego con las continuaciones perdidas por el script de
+# empaquetado: cada linea paso a ser una instruccion suelta y el build murio con
+# `unknown instruction: ARCH="$(DPKG`. Se ve como "la instalacion falla a mitad"
+# y cuesta un rato entenderlo. `verificar_paquete.py` ahora lo chequea antes de
+# publicar.
+# ---------------------------------------------------------------------------
+ARG CLOUDFLARED_VERSION=2026.8.2
+ARG CLOUDFLARED_SHA256_AMD64=fcfb02b575a52ca1af2e3267af4e1517bcdeb30ac48c834c69abaed3c0576ad2
+ARG CLOUDFLARED_SHA256_ARM64=7747d94570fb390cf47dcb4f9555c193c6355cda9793f0d878d9049e5d6a7790
+
+RUN set -eu; \
+    arch="$(dpkg --print-architecture)"; \
+    case "${arch}" in \
+      amd64) sha="${CLOUDFLARED_SHA256_AMD64}" ;; \
+      arm64) sha="${CLOUDFLARED_SHA256_ARM64}" ;; \
+      *) echo "cloudflared: arquitectura no soportada: ${arch}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL --retry 3 -o /usr/local/bin/cloudflared \
+      "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-${arch}"; \
+    echo "${sha}  /usr/local/bin/cloudflared" | sha256sum -c -; \
+    chmod +x /usr/local/bin/cloudflared; \
+    cloudflared --version; \
+    apt-get purge -y --auto-remove curl; \
+    rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 

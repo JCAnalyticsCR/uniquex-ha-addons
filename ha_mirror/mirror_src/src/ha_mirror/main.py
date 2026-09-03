@@ -195,6 +195,21 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     device_identity = None
     if settings.modo_fabrica:
         logger.info("mirror.modo_fabrica", platform_base_url=settings.platform_base_url)
+        # Aviso AL ARRANCAR y no recien cuando alguien intente activar: si esta
+        # version se publico sin la llave publica de la plataforma, la caja va a
+        # rechazar toda respuesta del anuncio. Mejor que se vea en el log del
+        # taller que descubrirlo con el cliente esperando.
+        from ha_mirror.announce_client import hay_llave_de_plataforma
+
+        if not hay_llave_de_plataforma():
+            logger.error(
+                "mirror.sin_llave_de_plataforma",
+                msg=(
+                    "Modo fabrica SIN llave publica horneada: la activacion no "
+                    "va a poder verificarse y toda respuesta se rechaza. Esta "
+                    "caja no puede activarse con esta version del add-on."
+                ),
+            )
         try:
             from ha_mirror.device_identity import ensure_identity
 
@@ -470,12 +485,8 @@ def create_app() -> FastAPI:
     # usa) y las rutas no existen — un 404 en vez de una pantalla vacia.
     if settings.modo_fabrica:
         from ha_mirror.api.device import router as device_router
-        from ha_mirror.api.sticker import router as sticker_router
 
         app.include_router(device_router)
-        # La calcomania vive en `/` para poder abrirla por ingress desde la
-        # barra lateral de HA. Es lo que usa quien prepara la caja en el taller.
-        app.include_router(sticker_router)
 
     # Routers WebSocket
     app.include_router(ws_router)
@@ -494,5 +505,50 @@ def create_app() -> FastAPI:
     return app
 
 
+
+def create_sticker_app() -> FastAPI:
+    """
+    App SEPARADA que sirve unicamente la calcomania de activacion.
+
+    POR QUE VIVE APARTE Y NO EN LA APP PRINCIPAL
+    --------------------------------------------
+    La app principal se publica en el puerto 8099 del host porque el tunel de
+    Cloudflare de las casas artesanales rutea el frontend por ahi. Servir la
+    calcomania en esa misma app significaba que **cualquiera en la red de la
+    casa podia abrir `http://<ip>:8099/` y leer el codigo de activacion** — que
+    es todo lo que hace falta para quedarse con la caja, porque hoy no hay forma
+    de deshacer una activacion.
+
+    Se evaluaron dos parches y ninguno cierra:
+      · chequear la cabecera `X-Ingress-Path`: se falsifica con un `curl -H`.
+      · chequear la IP de origen: no es concluyente. Segun si Docker publica el
+        puerto con DNAT o con el proxy de usuario, el contenedor ve la IP real
+        del cliente o la del gateway — y en el segundo caso no distingue una
+        peticion de ingress de una de la LAN.
+
+    La solucion no es proteger mejor la pagina: es **no servirla en el puerto
+    que sale a la red**. Esta app corre en el 8001, que NO se publica al host.
+    El unico que llega es el ingress de Home Assistant, que ya autentico al
+    usuario antes de proxear.
+
+    Solo se levanta en modo fabrica. Una casa artesanal no la arranca nunca.
+    """
+    from ha_mirror.api.sticker import router as sticker_router
+
+    app = FastAPI(
+        title="UniquexCR — Activacion",
+        description="Calcomania de activacion. Solo accesible por el ingress de Home Assistant.",
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
+    app.include_router(sticker_router)
+    return app
+
+
 # Instancia para uvicorn: uvicorn ha_mirror.main:app
 app = create_app()
+
+# Instancia de la app de la calcomania (solo modo fabrica, puerto 8001).
+# Se construye siempre; el que decide si se levanta es run.sh.
+sticker_app = create_sticker_app()

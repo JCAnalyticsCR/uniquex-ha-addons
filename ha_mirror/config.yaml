@@ -3,7 +3,7 @@ name: UniquexCR Mirror
 # Si esto no sube, la casa no recibe nada aunque el código cambie.
 # Mantener sincronizado con mirror_src/pyproject.toml (de ahí sale la versión
 # que reporta /api/health).
-version: "0.25.0"
+version: "0.26.0"
 slug: ha_mirror
 description: >-
   Mirror del frontend de lujo UniquexCR. Se conecta a Home Assistant de forma
@@ -23,6 +23,26 @@ init: false
 homeassistant_api: true
 hassio_api: false
 host_network: false
+# Ingress: coloca el add-on en la barra lateral de HA y sirve `/` — la
+# calcomanía de activación. El técnico que prepara la caja hace clic y ve el QR
+# sin necesitar IP, API key ni terminal. Las peticiones por ingress ya vienen
+# autenticadas por Home Assistant, así que las rutas de la UI quedan protegidas.
+#
+# El resto de las rutas (/api/*, /ws/*) sigue exigiendo X-API-Key: habilitar
+# ingress NO las abre a usuarios sin token.
+#
+# Conviven con el puerto 8099 sin colisión:
+#   - ingress → proxy interno de HA para la UI del panel (mdi:qrcode)
+#   - ports   → binding directo en el host que el túnel Cloudflare de las
+#               casas artesanales usa para enrutar el frontend desde Railway.
+# Una casa artesanal real depende del puerto 8099 ahora mismo → no quitarlo.
+ingress: true
+# 8001, NO 8000: la calcomania corre en su propia app en ese puerto, que
+# no se publica al host. Asi el ingress es el UNICO camino hasta ella y
+# nadie en la red de la casa puede leer el codigo de activacion.
+ingress_port: 8001
+panel_icon: mdi:qrcode
+panel_title: Activación
 # Expone el puerto interno 8000 del Mirror en el puerto 8099 del host, para que
 # el add-on de Cloudflared lo pueda enrutar por el túnel hacia el frontend.
 ports:

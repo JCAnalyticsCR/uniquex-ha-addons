@@ -62,13 +62,18 @@ ERRORES ESPECIALES
 from __future__ import annotations
 
 import asyncio
+import base64
+import json as _json
 import random
 import secrets
+import struct
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 import aiohttp
 import structlog
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from ha_mirror.device_identity import (
     DeviceIdentity,
@@ -104,6 +109,144 @@ _BACKOFF_JITTER = 0.5  # ±50% del intervalo actual
 # Timeout total del HTTP request. No es tiempo-real; 15s absorbe latencias
 # altas de red sin bloquear el loop indefinidamente.
 _HTTP_TIMEOUT = 15.0
+
+# --- Llaves públicas de la plataforma (horneadas en el código) ---
+
+# Justificación del horneado: si vinieran de la configuración, un atacante que
+# pueda escribir `platform_base_url` también podría escribir la llave pública,
+# vaciando el candado. Horneada acá, solo un cambio de código (y su proceso de
+# revisión y despliegue) puede modificarla.
+#
+# El diccionario existe desde el primer día para rotación sin dejar cajas afuera:
+# durante una rotación conviven la llave vieja y la nueva bajo distintos key_id.
+# Cuando todas las cajas hayan actualizado, se retira la entrada vieja.
+#
+# TODO: reemplazar el valor "<pendiente...>" con la llave pública real en base64
+#       estándar (32 bytes crudos de Ed25519) cuando el agente del servidor de la
+#       plataforma la genere y comparta. Los tests usan su propio par generado en
+#       memoria — NUNCA esta constante.
+# Marcador de que todavía no se horneó ninguna llave real. Se compara contra
+# esto para poder fallar con un mensaje que diga QUÉ falta, en vez de con un
+# error de base64 que manda a buscar el problema al lugar equivocado.
+LLAVE_PENDIENTE = "PENDIENTE-GENERAR-LLAVE-DE-PLATAFORMA"
+
+LLAVES_PLATAFORMA: dict[str, str] = {
+    # key_id -> llave pública Ed25519, base64 estándar, 32 bytes crudos.
+    #
+    # ES UN DICCIONARIO Y NO UNA SOLA LLAVE A PROPÓSITO: durante una rotación
+    # conviven la vieja y la nueva, y así ninguna caja queda afuera mientras la
+    # plataforma cambia de llave.
+    #
+    # VA HORNEADA EN EL CÓDIGO, NO EN LA CONFIGURACIÓN. Si viniera de las
+    # opciones del add-on, quien pudiera escribir `platform_base_url` también
+    # podría escribir la llave — y el candado no serviría para nada, porque el
+    # atacante firmaría con la suya. Cambiarla exige publicar una versión.
+    #
+    # CÓMO SE OBTIENE: se corre `scripts/generar_llave_firma.py` del backend de
+    # la plataforma, EN UNA TERMINAL LIMPIA. Ese script imprime la privada (va a
+    # Railway, nunca a un archivo ni a un chat) y la pública (va acá).
+    "k1": LLAVE_PENDIENTE,
+}
+
+
+def hay_llave_de_plataforma() -> bool:
+    """True si alguna llave real fue horneada (o sea, si la firma puede verificarse)."""
+    return any(v != LLAVE_PENDIENTE for v in LLAVES_PLATAFORMA.values())
+
+# Prefijo de dominio que separa el material firmado de otros usos de Ed25519 en
+# el proyecto. Sin este prefijo, una firma construida para otro propósito podría
+# (en teoría) reutilizarse acá.
+_DOMINIO_FIRMA = b"uniquexcr/announce-response/v1"
+
+
+def _verificar_firma_respuesta(
+    body_bytes: bytes,
+    device_id: str,
+    nonce: str,
+    sig_header: str | None,
+    key_id_header: str | None,
+) -> None:
+    """
+    Verifica la firma Ed25519 de la respuesta de la plataforma.
+
+    POR QUÉ VERIFICAR ANTES DE PARSEAR EL JSON
+    -------------------------------------------
+    Sin verificación, quien logre responder el anuncio (p. ej. un dominio mal
+    escrito con un certificado Let's Encrypt perfectamente válido) puede proveer
+    un tunnel_token y un mirror_api_key falsos. HTTPS solo prueba que hay un
+    certificado válido para ESE dominio, no que ese dominio sea el nuestro.
+
+    MATERIAL FIRMADO (en este orden exacto)
+    ----------------------------------------
+        b"uniquexcr/announce-response/v1"
+        + len(device_id_utf8) como 4 bytes big-endian + device_id UTF-8
+        + len(nonce_utf8)     como 4 bytes big-endian + nonce UTF-8
+        + len(body_bytes)     como 4 bytes big-endian + body_bytes
+
+    Los largos de 4 bytes evitan ambigüedad: sin ellos, dos combinaciones
+    distintas de (device_id, nonce) podrían concatenar igual y una firma
+    valdría para dos mensajes distintos.
+
+    Se firma sobre los bytes crudos del cuerpo (no sobre JSON re-serializado)
+    para que ninguna diferencia mínima de serialización —orden de claves,
+    espacios, escape de no-ASCII— cause un falso "firma inválida".
+
+    El nonce es el que la caja mandó en ESE pedido: una respuesta capturada
+    no sirve para el siguiente anuncio porque el nonce habrá cambiado.
+
+    RESULTADO
+    ---------
+    Retorna None si la firma es válida.
+    Lanza RuntimeError con motivo legible si falla.
+    Nunca incluye el cuerpo ni la firma completa en el mensaje de error.
+    """
+    motivo: str | None = None
+
+    if not sig_header:
+        motivo = "cabecera X-Uniquex-Signature ausente o vacía"
+    elif not key_id_header:
+        motivo = "cabecera X-Uniquex-Key-Id ausente o vacía"
+    elif key_id_header not in LLAVES_PLATAFORMA:
+        motivo = f"key_id desconocido: {key_id_header!r}"
+    elif LLAVES_PLATAFORMA[key_id_header] == LLAVE_PENDIENTE:
+        # Sin esto el sintoma seria un error de base64, que manda a depurar la
+        # firma cuando lo que falta es hornear la llave.
+        motivo = (
+            "esta version del add-on se publico SIN la llave publica de la "
+            "plataforma: la activacion no puede verificarse. Generala con "
+            "scripts/generar_llave_firma.py y publica una version con la "
+            "llave horneada en LLAVES_PLATAFORMA."
+        )
+    else:
+        # Reconstruir exactamente el mismo material que firmó la plataforma
+        device_id_bytes = device_id.encode("utf-8")
+        nonce_bytes = nonce.encode("utf-8")
+        material = (
+            _DOMINIO_FIRMA
+            + struct.pack(">I", len(device_id_bytes))
+            + device_id_bytes
+            + struct.pack(">I", len(nonce_bytes))
+            + nonce_bytes
+            + struct.pack(">I", len(body_bytes))
+            + body_bytes
+        )
+
+        try:
+            sig_bytes = base64.b64decode(sig_header, validate=True)
+        except Exception:
+            motivo = "X-Uniquex-Signature no es base64 válido"
+        else:
+            try:
+                pub_bytes = base64.b64decode(LLAVES_PLATAFORMA[key_id_header], validate=True)
+                pub_key = Ed25519PublicKey.from_public_bytes(pub_bytes)
+                pub_key.verify(sig_bytes, material)
+                return  # Verificación exitosa — el flujo continúa
+            except InvalidSignature:
+                motivo = "firma Ed25519 no verifica"
+            except Exception as exc:
+                motivo = f"llave pública inválida o error interno: {type(exc).__name__}"
+
+    raise RuntimeError(motivo)
 
 
 def _calcular_claim_code_hash(privada: Ed25519PrivateKey, version: int) -> str:
@@ -333,7 +476,42 @@ class AnnounceClient:
 
         async with session.post(endpoint, json=payload) as resp:
             if resp.status == 200:
-                return await self._handle_ok(await resp.json())
+                # Leer los bytes CRUDOS antes de cualquier parseo.
+                # La verificación ocurre sobre los bytes tal como llegaron por
+                # la red — no sobre un JSON re-serializado — para que ninguna
+                # diferencia mínima de serialización cause un falso negativo.
+                body_bytes = await resp.read()
+                sig_header = resp.headers.get("X-Uniquex-Signature")
+                key_id_header = resp.headers.get("X-Uniquex-Key-Id")
+
+                try:
+                    _verificar_firma_respuesta(
+                        body_bytes,
+                        device_id,
+                        nonce,
+                        sig_header,
+                        key_id_header,
+                    )
+                except RuntimeError as exc:
+                    # Loguear solo key_id y el motivo — NUNCA el cuerpo ni la
+                    # firma completa. El loop sigue reintentando (puede ser un
+                    # problema transitorio del backend).
+                    logger.error(
+                        "announce.firma_invalida",
+                        device_id=device_id,
+                        key_id=key_id_header,
+                        motivo=str(exc),
+                        msg=(
+                            "La respuesta de la plataforma no pasó verificación "
+                            "de firma. Nada se escribe en disco ni en DB. "
+                            "El loop sigue reintentando."
+                        ),
+                    )
+                    raise RuntimeError(f"Firma de respuesta inválida: {exc}") from exc
+
+                # Parsear el JSON solo DESPUÉS de la verificación exitosa
+                body = _json.loads(body_bytes)
+                return await self._handle_ok(body)
 
             if resp.status == 401:
                 # Firma rechazada: bug de derivación o codificación en este lado.

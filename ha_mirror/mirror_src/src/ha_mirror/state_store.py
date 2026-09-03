@@ -97,18 +97,40 @@ _PLATAFORMAS_INTERNAS: frozenset[str] = frozenset(
         "todo",
         "calendar",
         "template",
+        # -----------------------------------------------------------------------
+        # Hardware del propio host — adaptadores y radios integrados a la placa.
+        #
+        # CONFIRMADO en hardware real: `bluetooth` bloqueó la calcomanía en la
+        # primera instalación porque `hci0` (el adaptador BT soldado a la placa de
+        # la mini PC) quedó registrado como dispositivo. La caja se contaba a sí
+        # misma.
+        #
+        # Los cinco siguientes son de la misma clase (hardware interno del host),
+        # pero NO se han verificado contra hardware real todavía. Si alguno da un
+        # falso positivo en campo, agregar la evidencia al lado del string.
+        "bluetooth",  # adaptador BT del host (hci0, hci1…) — CONFIRMADO en hardware real
+        "thread",  # radio 802.15.4 integrado — sin verificar en hardware
+        "otbr",  # OpenThread Border Router (daemon del host) — sin verificar
+        "usb",  # hub USB de la placa — sin verificar
+        "hardware",  # SoC / placa base expuesta por HA — sin verificar
+        "homeassistant_hardware",  # cajita oficial (Green, Yellow, SkyConnect) — sin verificar
+        #
+        # POR QUÉ `matter` NO ESTÁ ACÁ
+        # Un dispositivo Matter emparejado en el taller SÍ es hardware real del
+        # socio que no pertenece a la casa del cliente — debe bloquear la calcomanía.
+        # El próximo falso positivo probable: la integración Matter puede crear por
+        # su cuenta un device "Matter Server" que representa el daemon local, no
+        # hardware externo. Ese sí sería interno, pero aún no se verificó.
+        #
+        # POR QUÉ EXCLUIR `bluetooth` NO ABRE UN AGUJERO
+        # Un sensor BLE emparejado en el taller (Xiaomi de temperatura, SwitchBot,
+        # Govee…) lo registra su PROPIA integración (`xiaomi_ble`, `govee_ble`,
+        # `switchbot`…), no `bluetooth`. La plataforma `bluetooth` solo crea el
+        # dispositivo del adaptador del host. Excluir `bluetooth` no hace invisible
+        # ningún sensor externo.
+        # -----------------------------------------------------------------------
     }
 )
-
-# Tope de entidades que la reconciliación post-rehidratación manda una por una.
-# Por debajo, el diff es SIEMPRE más barato en bytes que un snapshot: el snapshot
-# lleva las 418 entidades MÁS el registro completo de servicios de HA (que no
-# cambia entre reconexiones y pesa tanto como los estados). Por encima estamos
-# reconstruyendo media casa entidad por entidad, y ahí manda otro costo: son N
-# frames sobre el túnel de Cloudflare y N slots de la cola de 1000 del cliente,
-# contra UN frame del snapshot. 200 ≈ la mitad de las entidades de esta casa.
-_RESYNC_MAX_DIFF = 200
-
 
 class StateStore:
     """
@@ -416,6 +438,63 @@ class StateStore:
             )
         return result
 
+    def listar_dispositivos_configurados(self) -> list[tuple[str, str]]:
+        """
+        Lista de dispositivos que dispararían el bloqueo de la calcomanía.
+
+        Devuelve tuplas ``(nombre_visible, plataforma)`` ordenadas por nombre,
+        con los mismos criterios de inclusión/exclusión que
+        ``contar_dispositivos_configurados()``.
+
+        RESOLUCIÓN DE NOMBRE (defensiva con getattr)
+        --------------------------------------------
+        ``HaDeviceRegistryEntry`` tiene ``extra="allow"``, por lo que campos
+        opcionales del upstream (como ``name_by_user``) aterrizan en
+        ``model_extra`` y son accesibles como atributos solo si llegaron.
+        Orden de precedencia:
+
+        1. ``name_by_user`` — el alias que le puso el usuario en HA.
+        2. ``name`` — el nombre que declaró la integración.
+        3. ``device_id`` — fallback de último recurso (identificador único).
+
+        PLATAFORMA
+        ----------
+        Si un dispositivo tiene varias entidades en plataformas distintas
+        (raro pero posible), se usa la de la primera entidad encontrada.
+
+        Si el store no se hidró todavía (HA no conectó), devuelve ``[]``.
+        """
+        # device_id → plataforma de la primera entidad encontrada
+        dispositivos: dict[str, str] = {}
+        for entry in self._entities.values():
+            # Sin device_id: entidad virtual, helper o integración de servicio puro.
+            if entry.device_id is None:
+                continue
+            # Plataforma interna: HA la crea sola, no la añadió el socio.
+            if entry.platform in _PLATAFORMAS_INTERNAS:
+                continue
+            # Solo registramos la plataforma la primera vez que vemos el device.
+            if entry.device_id not in dispositivos:
+                dispositivos[entry.device_id] = entry.platform or ""
+
+        resultado: list[tuple[str, str]] = []
+        for device_id, plataforma in dispositivos.items():
+            device = self._devices.get(device_id)
+            if device is not None:
+                # getattr defensivo: name_by_user puede no existir si la versión
+                # de HA que envió el registry no incluye ese campo.
+                nombre: str = (
+                    getattr(device, "name_by_user", None)
+                    or device.name
+                    or device_id
+                )
+            else:
+                # Device ausente del registry (entidad huérfana): usamos el id.
+                nombre = device_id
+            resultado.append((nombre, plataforma))
+
+        return sorted(resultado)
+
     def contar_dispositivos_configurados(self) -> int:
         """
         Cantidad de dispositivos físicos no-internos que HA tiene registrados.
@@ -442,18 +521,11 @@ class StateStore:
 
         Si el store no se hidró todavía (HA no conectó), devuelve 0 — en ese caso
         no hay datos y no se bloquea la calcomanía por falta de información.
+
+        Delega a listar_dispositivos_configurados() para que el número y la lista
+        nunca puedan discrepar.
         """
-        device_ids: set[str] = set()
-        for entry in self._entities.values():
-            # Sin device_id: entidad virtual, helper o integración de servicio puro.
-            # Nunca representa hardware que pudiera "viajar" a la casa del cliente.
-            if entry.device_id is None:
-                continue
-            # Plataforma interna: HA la crea sola, no la añadió el socio.
-            if entry.platform in _PLATAFORMAS_INTERNAS:
-                continue
-            device_ids.add(entry.device_id)
-        return len(device_ids)
+        return len(self.listar_dispositivos_configurados())
 
     def get_services(self) -> dict[str, Any]:
         return dict(self._services)

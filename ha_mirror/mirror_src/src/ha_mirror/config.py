@@ -288,6 +288,46 @@ class Settings(BaseSettings):
             raise ValueError("ha_url debe comenzar con ws:// o wss://")
         return v
 
+    @field_validator("platform_base_url")
+    @classmethod
+    def validate_platform_base_url(cls, v: str) -> str:
+        """
+        Exige HTTPS, y falla el arranque si no.
+
+        HALLAZGO DE AUDITORIA (2026-09-03). Esta variable no tenia ningun
+        validador, asi que un `http://` pasaba. Y por este canal viaja TODO lo
+        que hace que la caja sea de alguien: la credencial que controla la casa
+        y el token del tunel. En claro, cualquiera en el camino los lee y se
+        queda con la casa.
+
+        Ademas es la variable que un humano escribe a mano en las opciones del
+        add-on. Un `http://` por distraccion no puede ser algo que el sistema
+        acepte en silencio: si esta mal, el add-on NO ARRANCA y quien la puso
+        lo ve en el acto, en el taller, en vez de descubrirlo cuando ya no hay
+        forma de saber quien se quedo con la casa.
+
+        OJO — ESTO NO CIERRA EL AGUJERO GRANDE. HTTPS solo prueba que del otro
+        lado hay un certificado valido para ESE dominio, no que ese dominio sea
+        nuestra plataforma. Con un dominio mal escrito (y un Let's Encrypt
+        legitimo), o con una CA comprometida, el atacante sigue pudiendo
+        responder el anuncio y entregar SU credencial y SU token. El arreglo de
+        fondo es que la plataforma FIRME su respuesta y que la caja verifique
+        esa firma contra una llave publica horneada en el codigo, antes de
+        tocar disco. Mientras eso no exista, esto es una mitigacion parcial y
+        hay que decirlo asi.
+        """
+        value = v.strip().rstrip("/")
+        if not value:
+            return ""  # vacio = modo artesanal, la activacion no existe
+        if value.startswith("http://"):
+            raise ValueError(
+                "platform_base_url no puede ser http:// — por ese canal viajan "
+                "la credencial de la casa y el token del tunel. Usa https://"
+            )
+        if not value.startswith("https://"):
+            raise ValueError("platform_base_url debe comenzar con https://")
+        return value
+
     @field_validator("go2rtc_base_url")
     @classmethod
     def validate_go2rtc_base_url(cls, v: str | None) -> str | None:
