@@ -3,8 +3,25 @@ name: UniquexCR Mirror
 # Si esto no sube, la casa no recibe nada aunque el código cambie.
 # Mantener sincronizado con mirror_src/pyproject.toml (de ahí sale la versión
 # que reporta /api/health).
-version: "0.26.1"
+version: "0.27.0"
 slug: ha_mirror
+# La caja BAJA esta imagen en vez de construirla.
+#
+# Hasta la 0.26.1 cada caja compilaba el add-on al instalarlo: 8 pasos de build,
+# 102 dependencias de PyPI y la descarga de cloudflared. Entre 3 y 8 minutos por
+# caja (medido en la primera instalacion real), y dependiendo de que PyPI, Debian
+# y GitHub estuvieran arriba justo en ese momento, con el tecnico parado en la
+# casa del cliente. Ahora se construye UNA vez por release, en CI
+# (.github/workflows/construir-imagen.yml), y las cajas solo la descargan.
+#
+# {arch} lo reemplaza el Supervisor por la arquitectura del equipo (amd64 o
+# aarch64), que son las dos que se publican.
+#
+# El paquete es PUBLICO a proposito: asi la caja lo baja sin ninguna credencial.
+# Junto con el repositorio publico, eso elimina el token de todo el proceso —
+# antes cada caja guardaba uno en la URL del repositorio, y revocarlo dejaba a
+# toda la flota sin actualizaciones.
+image: ghcr.io/jcanalyticscr/uniquex-mirror-{arch}
 description: >-
   Mirror del frontend de lujo UniquexCR. Se conecta a Home Assistant de forma
   LOCAL (token del Supervisor, sin LLAT ni túnel) y expone estado + control por
