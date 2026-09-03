@@ -93,10 +93,28 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Probar que la imagen ARRANCA
+        # verificar_paquete.py (arriba) revisa los archivos EN DISCO antes de
+        # construir. Esto revisa lo que quedo DENTRO de la imagen, que es lo
+        # unico que llega a la caja del cliente.
+        #
+        # No es redundante: los dos defectos que rompieron la primera
+        # instalacion en hardware real —CRLF en run.sh y continuaciones rotas en
+        # el Dockerfile— producian imagenes que se CONSTRUIAN BIEN y morian al
+        # arrancar. Un build verde no prueba que el contenedor viva.
+        #
+        # Y ahora importa mas que antes: desde la 0.27.0 las cajas no construyen
+        # nada, bajan esta imagen. Si sale rota, sale rota para toda la flota.
+        #
+        # La imagen arm64 corre emulada por QEMU. Es lenta pero corre.
+        run: |
+          python3 verificar_imagen.py             "ghcr.io/jcanalyticscr/uniquex-mirror-${{ matrix.arch }}:${{ steps.version.outputs.valor }}"             "${{ matrix.plataforma }}"
+
       - name: Resumen
         run: |
-          echo "Publicada: ghcr.io/jcanalyticscr/uniquex-mirror-${{ matrix.arch }}:${{ steps.version.outputs.valor }}"
+          echo "Publicada y probada: ghcr.io/jcanalyticscr/uniquex-mirror-${{ matrix.arch }}:${{ steps.version.outputs.valor }}"
           echo ""
-          echo "RECORDATORIO: para que las cajas puedan bajarla sin credencial,"
-          echo "el paquete tiene que estar en visibilidad PUBLICA en GitHub."
-          echo "Se cambia una sola vez, en la pagina del paquete."
+          echo "Los dos paquetes quedaron PUBLICOS el 3 de septiembre de 2026,"
+          echo "asi que las cajas los bajan sin credencial. Si algun dia un"
+          echo "paquete NUEVO no se puede bajar desde una caja, revisar eso"
+          echo "primero: los paquetes de GitHub nacen privados."
