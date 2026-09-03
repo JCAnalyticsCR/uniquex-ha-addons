@@ -145,7 +145,15 @@ LLAVES_PLATAFORMA: dict[str, str] = {
     # CÓMO SE OBTIENE: se corre `scripts/generar_llave_firma.py` del backend de
     # la plataforma, EN UNA TERMINAL LIMPIA. Ese script imprime la privada (va a
     # Railway, nunca a un archivo ni a un chat) y la pública (va acá).
-    "k1": LLAVE_PENDIENTE,
+    # Generada el 2026-09-03 en una terminal limpia. Su mitad privada vive SOLO
+    # en las variables del servicio de la plataforma en Railway
+    # (ANNOUNCE_SIGNING_KEY) y nunca paso por un archivo, un chat ni un commit.
+    #
+    # OJO — hubo un par ANTERIOR cuya privada quedo expuesta en una captura de
+    # pantalla. Se descarto sin usarlo. Si alguna vez ves la publica
+    # "H477NrsxwCGyd424N3+uUJ5IOR8LJ9jUOg1uH2f3lYM=" en algun lado, es esa:
+    # NO la horneés, esta quemada.
+    "k1": "PGK+7ml81qyh3uIkvM7LYoApbc1KI8PFHFtfiS24I5s=",
 }
 
 
