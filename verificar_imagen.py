@@ -150,10 +150,18 @@ def verificar(imagen: str, plataforma: str) -> list[str]:
         "from ha_mirror.main import create_app, create_sticker_app; "
         "from ha_mirror.config import get_settings; "
         "a = create_app(); s = create_sticker_app(); "
-        "print(len(a.routes), len(s.routes), get_settings().modo_fabrica)",
+        # El Mirror escribe sus propios logs al construirse, asi que el resultado
+        # va marcado: se busca la linea, no se asume que sea la unica.
+        "print('RESULTADO', len(a.routes), len(s.routes), get_settings().modo_fabrica)",
         entorno=ENTORNO_DE_MENTIRA,
-    ).strip()
-    rutas_api, rutas_calco, modo_fabrica = salida.split()
+    )
+    marcadas = [l for l in salida.splitlines() if l.startswith("RESULTADO ")]
+    if len(marcadas) != 1:
+        raise Roto(
+            "no encontre la linea de resultado. Salida completa:
+" + salida.strip()
+        )
+    _, rutas_api, rutas_calco, modo_fabrica = marcadas[0].split()
 
     if int(rutas_api) < 10:
         raise Roto(f"la app principal quedo con {rutas_api} rutas: se armo mal")
