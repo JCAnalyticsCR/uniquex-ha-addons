@@ -145,46 +145,102 @@ def verificar(imagen: str, plataforma: str) -> list[str]:
     # dependencias y modelos. Un import roto en un router que nadie toca no
     # aparece hasta que la caja arranca en la casa del cliente.
     print("Revisando que el Mirror se construya...", flush=True)
+    # Se piden los ENDPOINTS del esquema OpenAPI, no `len(app.routes)`.
+    #
+    # Esa distincion costo una investigacion: `app.routes` cuenta lo que FastAPI
+    # guarda adentro, y eso CAMBIA entre versiones. La imagen trae FastAPI
+    # 0.141.1, que guarda un envoltorio por router incluido (13 objetos); una
+    # version anterior guardaba las rutas ya aplanadas (37). O sea que contar
+    # `app.routes` mide la version de FastAPI, no el Mirror. El esquema OpenAPI
+    # es el contrato publico y no depende de como FastAPI acomode sus objetos.
     salida = _en_la_imagen(
         imagen, plataforma, "/usr/bin/env", "python3", "-c",
         "from ha_mirror.main import create_app, create_sticker_app; "
         "from ha_mirror.config import get_settings; "
+        "import fastapi; "
         "a = create_app(); s = create_sticker_app(); "
-        # El Mirror escribe sus propios logs al construirse, asi que el resultado
-        # va marcado: se busca la linea, no se asume que sea la unica.
-        "print('RESULTADO', len(a.routes), len(s.routes), get_settings().modo_fabrica); "
-        "[print('RUTA', getattr(r, 'path', r)) for r in a.routes]",
+        # El Mirror escribe sus propios logs al construirse, asi que cada dato va
+        # marcado: se buscan las lineas, no se asume que sean las unicas.
+        "print('FASTAPI', fastapi.__version__); "
+        "print('MODO_FABRICA', get_settings().modo_fabrica); "
+        "[print('API', p) for p in sorted(a.openapi()['paths'])]; "
+        "[print('CALCO', p) for p in sorted(s.openapi()['paths'])]",
         entorno=ENTORNO_DE_MENTIRA,
     )
-    marcadas = [l for l in salida.splitlines() if l.startswith("RESULTADO ")]
-    if len(marcadas) != 1:
-        raise Roto(
-            "no encontre la linea de resultado. Salida completa:\n" + salida.strip()
-        )
-    _, rutas_api, rutas_calco, modo_fabrica = marcadas[0].split()
-    rutas = [l.split(" ", 1)[1] for l in salida.splitlines() if l.startswith("RUTA ")]
-    print(f"  rutas de la app principal ({len(rutas)}):")
-    for r in rutas:
-        print(f"    {r}")
 
-    if int(rutas_api) < 10:
-        raise Roto(f"la app principal quedo con {rutas_api} rutas: se armo mal")
-    # Las dos apps son separadas a proposito: la calcomania vive en su propia app
-    # (puerto 8001, sin publicar al host) para que no se pueda leer desde la red
-    # de la casa. Si algun dia vuelven a ser la misma, esto lo delata.
-    if int(rutas_calco) >= int(rutas_api):
+    def _marcadas(etiqueta: str) -> list[str]:
+        pref = etiqueta + " "
+        return [l[len(pref):] for l in salida.splitlines() if l.startswith(pref)]
+
+    def _unica(etiqueta: str) -> str:
+        v = _marcadas(etiqueta)
+        if len(v) != 1:
+            raise Roto(
+                f"esperaba una linea {etiqueta} y encontre {len(v)}.\n"
+                "Salida completa:\n" + salida.strip()
+            )
+        return v[0]
+
+    version_fastapi = _unica("FASTAPI")
+    modo_fabrica = _unica("MODO_FABRICA")
+    endpoints_api = _marcadas("API")
+    endpoints_calco = _marcadas("CALCO")
+
+    print(f"  endpoints de la app principal ({len(endpoints_api)}):")
+    for e in endpoints_api:
+        print(f"    {e}")
+    print(f"  endpoints de la calcomania ({len(endpoints_calco)}): "
+          f"{', '.join(endpoints_calco) or 'ninguno'}")
+
+    # Endpoints sin los cuales la app del cliente no funciona. Se nombran uno por
+    # uno en vez de exigir "al menos N": un numero se cumple aunque falte
+    # justamente el que importa.
+    IMPRESCINDIBLES = [
+        "/api/health",
+        "/api/entities",
+        "/api/areas",
+        "/api/cameras",
+        "/api/scenes",
+        "/api/preferences/home-layout",
+        "/api/ws-ticket",
+        # Organizar dispositivos: lo que permite que el cliente no entre a HA.
+        "/api/onboarding/capabilities",
+        "/api/onboarding/rooms",
+        "/api/onboarding/overrides",
+    ]
+    faltantes = [e for e in IMPRESCINDIBLES if e not in endpoints_api]
+    if faltantes:
         raise Roto(
-            f"la app de la calcomania tiene {rutas_calco} rutas y la principal "
-            f"{rutas_api}: parecen ser la misma app. La calcomania NO puede vivir "
-            "en la app que se publica al host."
+            "a la imagen le faltan endpoints imprescindibles:\n  " +
+            "\n  ".join(faltantes) +
+            "\nLa copia del Mirror que quedo adentro no es la que se espera."
         )
+    ok.append(f"{len(endpoints_api)} endpoints, con los {len(IMPRESCINDIBLES)} "
+              "imprescindibles presentes")
+
+    # Las dos apps son separadas a proposito: la calcomania vive en el puerto
+    # 8001, que no se publica al host, para que no se pueda leer desde la red de
+    # la casa. Si alguna ruta de la API apareciera ahi, esa separacion se rompio.
+    coladas = [e for e in endpoints_calco if e.startswith("/api/")]
+    if coladas:
+        raise Roto(
+            "la app de la calcomania expone rutas de la API: " + ", ".join(coladas) +
+            "\nEsa app existe justamente para NO exponer nada mas que la calcomania."
+        )
+    ok.append(f"la calcomania sigue aislada ({len(endpoints_calco)} endpoint/s, "
+              "ninguno de la API)")
+
     if modo_fabrica != "False":
         raise Roto(
             "sin platform_base_url la caja tendria que arrancar en modo artesanal, "
             f"y modo_fabrica dio {modo_fabrica}. El interruptor maestro esta al reves."
         )
-    ok.append(f"se construyen las dos apps ({rutas_api} rutas la principal, "
-              f"{rutas_calco} la calcomania) y el modo por defecto es artesanal")
+    ok.append("sin platform_base_url arranca en modo artesanal")
+
+    # No es una condicion de fallo, pero conviene tenerlo escrito en el log: las
+    # pruebas automaticas corren contra la version de FastAPI del entorno de
+    # desarrollo, que puede no ser esta.
+    ok.append(f"FastAPI dentro de la imagen: {version_fastapi}")
 
     return ok
 
