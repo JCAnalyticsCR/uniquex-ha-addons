@@ -53,9 +53,27 @@ def _correr(args: list[str], *, binario: bool = False):
     return r.stdout if binario else r.stdout.decode("utf-8", "replace")
 
 
-def _en_la_imagen(imagen: str, plataforma: str, entrypoint: str, *args: str, binario=False):
+# El Mirror construye su configuracion al importarse, asi que sin variables de
+# entorno ni siquiera se puede importar. En una caja se las da run.sh desde las
+# opciones del add-on; aca hay que darle valores de mentira.
+#
+# Son deliberadamente obvios: si alguno apareciera en un log de produccion, se
+# reconoce al instante que esa caja arranco sin configurar.
+ENTORNO_DE_MENTIRA = {
+    "HA_URL": "http://ha-que-no-existe:8123",
+    "MIRROR_API_KEY": "valor-de-mentira-solo-para-la-prueba-de-ci-no-sirve-para-nada",
+    "SESSION_SECRET": "valor-de-mentira-solo-para-la-prueba-de-ci-no-sirve-para-nada",
+    "IFRAME_TOKEN_SECRET": "valor-de-mentira-solo-para-la-prueba-de-ci-no-sirve-para-nada",
+}
+
+
+def _en_la_imagen(imagen: str, plataforma: str, entrypoint: str, *args: str,
+                  binario=False, entorno: dict[str, str] | None = None):
+    env: list[str] = []
+    for clave, valor in (entorno or {}).items():
+        env += ["-e", f"{clave}={valor}"]
     return _correr(
-        ["docker", "run", "--rm", "--platform", plataforma,
+        ["docker", "run", "--rm", "--platform", plataforma, *env,
          "--entrypoint", entrypoint, imagen, *args],
         binario=binario,
     )
@@ -115,15 +133,40 @@ def verificar(imagen: str, plataforma: str) -> list[str]:
                                "cloudflared --version 2>&1 | head -1").strip()
     ok.append(f"cloudflared responde: {version_cf}")
 
-    # --- 3. El Mirror importa de verdad ---
-    print("Revisando que el Mirror importe...", flush=True)
-    _en_la_imagen(
+    # --- 3. El Mirror se construye de verdad ---
+    #
+    # No alcanza con importar: construir las apps es lo que recorre routers,
+    # dependencias y modelos. Un import roto en un router que nadie toca no
+    # aparece hasta que la caja arranca en la casa del cliente.
+    print("Revisando que el Mirror se construya...", flush=True)
+    salida = _en_la_imagen(
         imagen, plataforma, "/usr/bin/env", "python3", "-c",
-        "import ha_mirror; from ha_mirror.main import create_app, create_sticker_app",
-    )
+        "from ha_mirror.main import create_app, create_sticker_app; "
+        "from ha_mirror.config import get_settings; "
+        "a = create_app(); s = create_sticker_app(); "
+        "print(len(a.routes), len(s.routes), get_settings().modo_fabrica)",
+        entorno=ENTORNO_DE_MENTIRA,
+    ).strip()
+    rutas_api, rutas_calco, modo_fabrica = salida.split()
+
+    if int(rutas_api) < 10:
+        raise Roto(f"la app principal quedo con {rutas_api} rutas: se armo mal")
     # Las dos apps son separadas a proposito: la calcomania vive en su propia app
-    # (puerto 8001, solo ingress) para que no se pueda leer desde la red de la casa.
-    ok.append("ha_mirror importa; create_app y create_sticker_app existen")
+    # (puerto 8001, sin publicar al host) para que no se pueda leer desde la red
+    # de la casa. Si algun dia vuelven a ser la misma, esto lo delata.
+    if int(rutas_calco) >= int(rutas_api):
+        raise Roto(
+            f"la app de la calcomania tiene {rutas_calco} rutas y la principal "
+            f"{rutas_api}: parecen ser la misma app. La calcomania NO puede vivir "
+            "en la app que se publica al host."
+        )
+    if modo_fabrica != "False":
+        raise Roto(
+            "sin platform_base_url la caja tendria que arrancar en modo artesanal, "
+            f"y modo_fabrica dio {modo_fabrica}. El interruptor maestro esta al reves."
+        )
+    ok.append(f"se construyen las dos apps ({rutas_api} rutas la principal, "
+              f"{rutas_calco} la calcomania) y el modo por defecto es artesanal")
 
     return ok
 
