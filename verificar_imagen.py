@@ -152,7 +152,8 @@ def verificar(imagen: str, plataforma: str) -> list[str]:
         "a = create_app(); s = create_sticker_app(); "
         # El Mirror escribe sus propios logs al construirse, asi que el resultado
         # va marcado: se busca la linea, no se asume que sea la unica.
-        "print('RESULTADO', len(a.routes), len(s.routes), get_settings().modo_fabrica)",
+        "print('RESULTADO', len(a.routes), len(s.routes), get_settings().modo_fabrica); "
+        "[print('RUTA', getattr(r, 'path', r)) for r in a.routes]",
         entorno=ENTORNO_DE_MENTIRA,
     )
     marcadas = [l for l in salida.splitlines() if l.startswith("RESULTADO ")]
@@ -161,6 +162,10 @@ def verificar(imagen: str, plataforma: str) -> list[str]:
             "no encontre la linea de resultado. Salida completa:\n" + salida.strip()
         )
     _, rutas_api, rutas_calco, modo_fabrica = marcadas[0].split()
+    rutas = [l.split(" ", 1)[1] for l in salida.splitlines() if l.startswith("RUTA ")]
+    print(f"  rutas de la app principal ({len(rutas)}):")
+    for r in rutas:
+        print(f"    {r}")
 
     if int(rutas_api) < 10:
         raise Roto(f"la app principal quedo con {rutas_api} rutas: se armo mal")
