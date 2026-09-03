@@ -38,7 +38,19 @@ router = APIRouter()
 # comprometida daría control total del gateway (reboot, backups, addons, RCE).
 # ---------------------------------------------------------------------------
 _FORBIDDEN_DOMAINS: frozenset[str] = frozenset(
-    {"hassio", "supervisor", "backup", "hardware", "host", "addon", "addons"}
+    {
+        "hassio",
+        "supervisor",
+        "backup",
+        "hardware",
+        "host",
+        "addon",
+        "addons",
+        # Fix C4 — "update.install" arranca un salto de versión del Core desde la casa.
+        # Un token comprometido podría forzar un update no solicitado. Bloqueado en el
+        # BFF y también acá (defensa en profundidad).
+        "update",
+    }
 )
 _FORBIDDEN_SERVICES: frozenset[tuple[str, str]] = frozenset(
     {

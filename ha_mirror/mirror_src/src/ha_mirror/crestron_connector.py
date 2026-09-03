@@ -24,6 +24,7 @@ import asyncio
 import re
 from contextlib import suppress
 from datetime import UTC, datetime
+from typing import Literal
 
 import structlog
 
@@ -59,6 +60,17 @@ _BINARY_ON = frozenset(
 _BINARY_OFF = frozenset(
     {"off", "closed", "clear", "no_motion", "inactive", "false", "0", "unoccupied", "away"}
 )
+
+# Domain HA -> tipo Crestron, para pasarle un "hint" a get_device() y que
+# pruebe el endpoint tipado correcto primero en vez de los 3 a ciegas
+# (2026-08-12: get_device ahora prueba /lights, /shades, /scenes en orden
+# porque no sabe de antemano cual es -- pero el connector SI lo sabe, por el
+# domain del service call).
+_DOMAIN_TO_CRESTRON_TYPE: dict[str, Literal["light", "shade", "scene"]] = {
+    "light": "light",
+    "cover": "shade",
+    "scene": "scene",
+}
 
 
 def _slugify(name: str | None) -> str:
@@ -224,7 +236,7 @@ class CrestronConnector:
             if device_id is None:
                 continue
             await self._dispatch_one(domain, service, eid, device_id, data)
-            await self._refresh_device(device_id, scene_activated=(domain == "scene"))
+            await self._refresh_device(device_id, hint=_DOMAIN_TO_CRESTRON_TYPE.get(domain))
 
     async def _dispatch_one(
         self, domain: str, service: str, entity_id: str, device_id: int, data: dict
@@ -269,15 +281,21 @@ class CrestronConnector:
         else:
             raise ValueError(f"dominio no manejado por Crestron: {domain!r}")
 
-    async def _refresh_device(self, device_id: int, *, scene_activated: bool) -> None:
+    async def _refresh_device(
+        self, device_id: int, *, hint: Literal["light", "shade", "scene"] | None
+    ) -> None:
         """
         Confirmación optimista: relee el dispositivo y actualiza el store.
+
+        `hint` viene del domain del service call que disparó esta acción —
+        se lo pasamos a `get_device()` para que pruebe el endpoint tipado
+        correcto primero en vez de los 3 a ciegas (ver `_DOMAIN_TO_CRESTRON_TYPE`).
 
         Si get_device falla NO propagamos: la acción ya se ejecutó y el próximo
         ciclo de polling reconciliará el estado. Solo lo logueamos.
         """
         try:
-            dev = await self._client.get_device(device_id)
+            dev = await self._client.get_device(device_id, hint=hint)
         except CrestronError as exc:
             logger.info(
                 "crestron.refresh_skip",
@@ -286,7 +304,7 @@ class CrestronConnector:
             )
             return
 
-        mapped = self._map_device(dev, scene_activated=scene_activated)
+        mapped = self._map_device(dev, scene_activated=(hint == "scene"))
         if mapped is None:
             return
         state, entry = mapped

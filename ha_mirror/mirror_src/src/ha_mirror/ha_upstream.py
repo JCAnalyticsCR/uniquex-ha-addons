@@ -197,6 +197,28 @@ class HAUpstream:
         }
         return await self._send_command(msg, timeout=self._service_call_timeout)
 
+    async def send_command(
+        self, msg: dict[str, Any], *, timeout: float = 10.0
+    ) -> dict[str, Any]:
+        """
+        Envía un comando administrativo al WebSocket de HA y espera el result.
+
+        Diseñado para comandos del registro de HA que solo el token del Supervisor
+        puede ejecutar (config_entries/get, config/entity_registry/*, etc.).
+        Si el token no tiene permisos admin, HA responde con un error cuyo code
+        contiene "unauthorized" — el llamador debe capturar HaProtocolError y
+        degradar en consecuencia.
+
+        Lanza UpstreamNotReadyError si no hay WS activo o el store no está
+        conectado — el llamador debe manejar esto como "funcionalidad no disponible"
+        (siempre 200 hacia el cliente, nunca 502).
+        """
+        from ha_mirror.errors import UpstreamNotReadyError
+
+        if self._ws is None or not self._store.connected:
+            raise UpstreamNotReadyError("Upstream no conectado")
+        return await self._send_command(msg, timeout=timeout)
+
     # -------------------------------------------------------------------------
     # Conexión y handshake
     # -------------------------------------------------------------------------
@@ -550,7 +572,7 @@ class HAUpstream:
                     logger.warning("ha.heartbeat_unexpected_response", type=result.get("type"))
             except TimeoutError:
                 logger.error("ha.heartbeat_timeout", timeout=self._ping_timeout)
-                raise HaConnectError("Heartbeat timeout — socket muerto")
+                raise HaConnectError("Heartbeat timeout — socket muerto") from None
 
     # -------------------------------------------------------------------------
     # Helpers de envío / recepción
@@ -618,7 +640,7 @@ class HAUpstream:
             try:
                 raw = await asyncio.wait_for(ws.receive(), timeout=remaining)
             except TimeoutError:
-                raise TimeoutError(f"Timeout esperando result id={msg_id} ({msg.get('type')})")
+                raise TimeoutError(f"Timeout esperando result id={msg_id} ({msg.get('type')})") from None
 
             if raw.type == aiohttp.WSMsgType.TEXT:
                 try:

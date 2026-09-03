@@ -6,12 +6,17 @@ canjea por un `AuthKey` de corta vida (~10 min de inactividad -> 401/511 -> re-l
 
 Decisiones de diseno que importan:
 
-- **Sin hardware real todavia.** La forma EXACTA del JSON de `/devices` y de los
-  cuerpos POST de control NO esta confirmada. Por eso el parseo es DEFENSIVO
-  (tolera campos faltantes o tipos raros sin crashear) y los payloads de control
-  quedan AISLADOS en cada metodo con un `# TODO verificar contra hardware real`
-  donde la forma sea una suposicion. La idea: dejar todo listo para que el dia que
-  tengamos IP+token solo haya que ajustar un puñado de literales bien marcados.
+- **Sin hardware real todavia — pero los payloads YA NO son una suposicion.**
+  (2026-08-12) Se investigo contra la doc oficial del SDK
+  (sdkcon78221.crestron.com/sdk/Crestron-Home-API) y el codigo fuente real de
+  dos integraciones que SI corren contra hardware (`ruudruud/ha-crestron-home`,
+  `Desluca/crestron-mcp`). Lo que queda sin confirmar de verdad (y por eso sigue
+  marcado `# TODO verificar contra hardware real`) es solo el SENTIDO de la
+  posicion de persiana (¿0 siempre es cerrada, o depende de como el instalador
+  configuro el motor?) — eso ninguna fuente lo garantiza, varia por instalacion.
+  El parseo se mantiene DEFENSIVO de todos modos (tolera campos faltantes o
+  tipos raros sin crashear) porque documentacion no es lo mismo que un dump real
+  de esta casa puntual.
 
 - **Anti-SSRF.** Todas las URLs se arman desde `base_url` + paths FIJOS del codigo,
   nunca desde datos externos. No se siguen redirects (`allow_redirects=False`) y
@@ -74,19 +79,26 @@ def _clamp(value: int, low: int, high: int) -> int:
 class CrestronClient:
     """Acceso saliente y acotado a la API REST local de un CP4-R (Crestron Home)."""
 
-    # Header con el que Crestron acepta primero el token y luego el AuthKey.
-    _AUTH_HEADER = "Crestron-RestAPI-AuthToken"
+    # 🔪 DOS headers distintos, no uno. Antes de esta correccion (2026-08-12) el
+    # cliente reusaba el MISMO nombre de header para el token de login y para el
+    # AuthKey de las llamadas siguientes — eso hubiera dado 401/511 en cada
+    # request despues del login contra hardware real. Confirmado en la doc
+    # oficial (Lights/Shades/Devices API) y en el codigo real de
+    # ruudruud/ha-crestron-home (api.py), que usa esta misma separacion.
+    _LOGIN_HEADER = "Crestron-RestAPI-AuthToken"  # SOLO en GET /cws/api/login
+    _AUTHKEY_HEADER = "Crestron-RestAPI-AuthKey"  # en TODAS las llamadas siguientes
 
     # Tope de bytes por respuesta: una respuesta enorme no deberia reventar la RAM.
     _MAX_RESPONSE_BYTES = 4 * 1024 * 1024  # 4 MB
     # Tope de dispositivos parseados por sanidad (una casa real no llega a esto).
     _MAX_DEVICES = 2000
 
-    # Escala de nivel del hardware. En varias builds de la CWS API el nivel de un
-    # dimmer/persiana va de 0 a 65535 (no 0-100). Convertimos el 0-100 del contrato
-    # a esta escala al mandar, y de vuelta a 0-100 al parsear.
-    # TODO verificar contra hardware real: puede ser 0-100 directo. Si asi fuera,
-    # poner _LEVEL_MAX = 100 y todo el resto sigue funcionando sin tocar mas nada.
+    # Escala de nivel del hardware: 0-65535, CONFIRMADO (2026-08-12) triangulando
+    # 3 fuentes independientes — doc oficial (JSON Payload Fields: "Lights: level
+    # Integer 0-65535"), la constante CRESTRON_MAX_LEVEL=65535 del codigo real de
+    # ha-crestron-home, y la conversion equivalente en crestron-mcp. El wire
+    # format de la API SIEMPRE es esta escala; herramientas que exponen 0-100
+    # hacia afuera convierten antes de tocar el wire, igual que este cliente.
     _LEVEL_MAX = 65535
 
     def __init__(
@@ -161,7 +173,7 @@ class CrestronClient:
         """Login efectivo; asume el `_auth_lock` tomado."""
         session = self._require_session()
         url = self._url("/cws/api/login")
-        headers = {self._AUTH_HEADER: self._token, "Accept": "application/json"}
+        headers = {self._LOGIN_HEADER: self._token, "Accept": "application/json"}
         try:
             async with session.get(
                 url, headers=headers, allow_redirects=False, ssl=self._ssl
@@ -253,7 +265,7 @@ class CrestronClient:
         """Un unico request con el AuthKey vigente (sin logica de reintento)."""
         session = self._require_session()
         url = self._url(path)
-        headers = {self._AUTH_HEADER: self._authkey or "", "Accept": "application/json"}
+        headers = {self._AUTHKEY_HEADER: self._authkey or "", "Accept": "application/json"}
         try:
             async with session.request(
                 method,
@@ -294,33 +306,207 @@ class CrestronClient:
             raise CrestronError("crestron_invalid_json", 502) from exc
 
     # ── Lectura de dispositivos ───────────────────────────────────────────────
+    #
+    # 🔪 REDISEÑADO 2026-08-12. `GET /cws/api/devices` (el unico que se usaba
+    # antes) NO trae nivel/posicion/estado — confirmado con el ejemplo verbatim
+    # de la doc oficial (Devices API): solo `id`, `name`, `type`, `subType`,
+    # `roomId`. Y las escenas NO aparecen ahi en absoluto — viven solo en
+    # `/scenes`. O sea que con una sola llamada, antes de este cambio, las luces
+    # y persianas iban a reportarse SIEMPRE sin nivel, y las escenas nunca se
+    # iban a descubrir. La solucion combina 4 llamadas — ver `get_devices()`.
+
+    async def get_rooms(self) -> dict[int, str]:
+        """Trae el mapa id->nombre de sala desde `GET /cws/api/rooms`.
+
+        Confirmado contra la doc oficial (Rooms API):
+        `{"rooms": [{"id": 1, "name": "Atrium"}, ...], "version": "..."}`.
+        Hace falta porque el resto de los endpoints (`/devices`, `/lights`,
+        `/shades`, `/scenes`) solo traen `roomId` (numero), nunca un nombre.
+
+        Degrada con gracia: si esta llamada falla, se loguea y se devuelve {}
+        — los dispositivos van a aparecer sin nombre de cuarto en vez de tumbar
+        el ciclo de polling entero por un problema en un endpoint secundario.
+        """
+        try:
+            data = await self._request("GET", "/cws/api/rooms")
+        except CrestronError as exc:
+            logger.warning(
+                "crestron.rooms_fetch_failed", code=exc.code, status=exc.status_code
+            )
+            return {}
+        items = data.get("rooms") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            return {}
+        rooms: dict[int, str] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            room_id = item.get("id")
+            name = item.get("name")
+            if isinstance(room_id, int) and isinstance(name, str) and name:
+                rooms[room_id] = name
+        return rooms
+
+    async def get_lights(self, rooms: dict[int, str] | None = None) -> list[CrestronDevice]:
+        """Trae luces CON nivel real desde `GET /cws/api/lights`.
+
+        Confirmado (doc oficial, Lights API):
+        `{"lights": [{"id","name","type","subType","level" (0-65535),
+        "connectionStatus","roomId"}], "version"}`.
+        """
+        data = await self._request("GET", "/cws/api/lights")
+        items = data.get("lights") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            return []
+        return [
+            self._parse_device(item, rooms=rooms, known_type="light")
+            for item in items
+            if isinstance(item, dict)
+        ]
+
+    async def get_shades(self, rooms: dict[int, str] | None = None) -> list[CrestronDevice]:
+        """Trae persianas CON posicion real desde `GET /cws/api/shades`.
+
+        Confirmado (doc oficial, Shades API):
+        `{"shades": [{"position" (0-65535),"id","name","subType",
+        "connectionStatus","roomId"}], "version"}`.
+        """
+        data = await self._request("GET", "/cws/api/shades")
+        items = data.get("shades") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            return []
+        return [
+            self._parse_device(item, rooms=rooms, known_type="shade")
+            for item in items
+            if isinstance(item, dict)
+        ]
+
+    async def get_scenes(self, rooms: dict[int, str] | None = None) -> list[CrestronDevice]:
+        """Trae escenas desde `GET /cws/api/scenes` — NO aparecen en `/devices`.
+
+        Confirmado (doc oficial, Scenes API):
+        `{"scenes": [{"id","name","type" (categoria, ej. "Lighting"/"Shade"),
+        "status" (bool),"roomId"}], "version"}`.
+        """
+        data = await self._request("GET", "/cws/api/scenes")
+        items = data.get("scenes") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            return []
+        return [
+            self._parse_device(item, rooms=rooms, known_type="scene")
+            for item in items
+            if isinstance(item, dict)
+        ]
 
     async def get_devices(self) -> list[CrestronDevice]:
-        """Trae y normaliza todos los dispositivos de `/cws/api/devices`."""
+        """Trae y normaliza TODOS los dispositivos que el Mirror sabe mapear.
+
+        Combina 4 llamadas (ver el comentario de arriba de esta seccion):
+          1. `/rooms`  -> mapa id->nombre, para resolver el `roomId` numerico.
+          2. `/lights`, `/shades`, `/scenes` -> los 3 tipos con endpoint propio
+             y estado REAL confirmado.
+          3. `/devices` -> inventario generico, para no perder lo que todavia
+             no tiene endpoint dedicado (sensores, thermostats, locks, media).
+             Se descartan de aca los id que ya vinieron por (2), para no
+             duplicar una luz/persiana/escena con una copia sin estado real.
+        """
+        rooms = await self.get_rooms()
+        lights = await self.get_lights(rooms)
+        shades = await self.get_shades(rooms)
+        scenes = await self.get_scenes(rooms)
+
         data = await self._request("GET", "/cws/api/devices")
         items = self._extract_device_list(data)
-        if len(items) > self._MAX_DEVICES:
+        generic = [
+            self._parse_device(item, rooms=rooms)
+            for item in items
+            if isinstance(item, dict)
+        ]
+
+        typed_ids = {d.id for d in lights} | {d.id for d in shades} | {d.id for d in scenes}
+        devices = [*lights, *shades, *scenes, *(d for d in generic if d.id not in typed_ids)]
+
+        if len(devices) > self._MAX_DEVICES:
             logger.warning(
-                "crestron.devices_truncated", total=len(items), max=self._MAX_DEVICES
+                "crestron.devices_truncated", total=len(devices), max=self._MAX_DEVICES
             )
-            items = items[: self._MAX_DEVICES]
-        devices = [self._parse_device(item) for item in items if isinstance(item, dict)]
-        logger.info("crestron.devices_fetched", count=len(devices))
+            devices = devices[: self._MAX_DEVICES]
+
+        logger.info(
+            "crestron.devices_fetched",
+            total=len(devices),
+            lights=len(lights),
+            shades=len(shades),
+            scenes=len(scenes),
+            other=len(devices) - len(lights) - len(shades) - len(scenes),
+        )
         return devices
 
-    async def get_device(self, device_id: int) -> CrestronDevice:
-        """Trae y normaliza un dispositivo por id desde `/cws/api/devices/{id}`."""
+    async def get_device(
+        self, device_id: int, *, hint: Literal["light", "shade", "scene"] | None = None
+    ) -> CrestronDevice:
+        """Trae y normaliza UN dispositivo por id, con su estado real si se puede.
+
+        Quien llama (el connector, tras ejecutar un control) suele SABER el
+        dominio de la entidad — pasarlo en `hint` ahorra intentos: se prueba
+        ese endpoint tipado primero. Sin `hint`, se prueban los 3 endpoints
+        tipados en orden y recien despues se cae al generico `/devices/{id}`
+        (que NO trae estado, confirmado — sirve para identidad nada mas, mejor
+        que un 404 duro en tipos que aun no tienen endpoint propio).
+        Un 404 en un endpoint tipado significa "no es de ese tipo": se prueba
+        el siguiente, no se trata como error.
+        """
+        typed: list[Literal["light", "shade", "scene"]] = ["light", "shade", "scene"]
+        if hint in typed:
+            typed.remove(hint)
+            typed.insert(0, hint)
+
+        paths: dict[Literal["light", "shade", "scene"], str] = {
+            "light": "/cws/api/lights",
+            "shade": "/cws/api/shades",
+            "scene": "/cws/api/scenes",
+        }
+        for known_type in typed:
+            try:
+                data = await self._request("GET", f"{paths[known_type]}/{device_id}")
+            except CrestronError as exc:
+                if exc.code == "crestron_not_found":
+                    continue
+                raise
+            item = self._unwrap_single(data)
+            if item is not None:
+                return self._parse_device(item, known_type=known_type)
+
+        # Ninguno tipado lo tenia: cae al generico (identidad sin estado real,
+        # pero mejor que un 404 duro para sensores/thermostats/locks/media que
+        # todavia no tienen endpoint propio en este cliente).
         data = await self._request("GET", f"/cws/api/devices/{device_id}")
-        # El CWS puede devolver el device directo, envuelto en una lista, o en un
-        # dict {"devices": [...]}. Cubrimos las tres formas sin crashear.
-        if isinstance(data, dict):
-            items = self._extract_device_list(data)
-            if items and isinstance(items[0], dict):
-                return self._parse_device(items[0])
-            return self._parse_device(data)
-        if isinstance(data, list) and data and isinstance(data[0], dict):
-            return self._parse_device(data[0])
+        item = self._unwrap_single(data)
+        if item is not None:
+            return self._parse_device(item)
         raise CrestronError("crestron_device_not_found", 404)
+
+    @staticmethod
+    def _unwrap_single(data: Any) -> dict[str, Any] | None:
+        """Desenvuelve la respuesta de un GET de un solo item.
+
+        El CWS puede devolver el objeto directo, envuelto en una lista, o en
+        un dict `{"lights": [...]}`/`{"devices": [...]}`. Cubre las formas sin
+        crashear; `None` si no se pudo extraer nada usable.
+        """
+        if isinstance(data, dict):
+            for key in ("lights", "shades", "scenes", "devices", "Devices", "results"):
+                value = data.get(key)
+                if isinstance(value, list) and value and isinstance(value[0], dict):
+                    return value[0]
+            # No vino envuelto en ninguna lista conocida: puede ser el objeto
+            # directo (heuristica: trae "id" o "name").
+            if "id" in data or "name" in data:
+                return data
+            return None
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            return data[0]
+        return None
 
     @staticmethod
     def _extract_device_list(data: Any) -> list[Any]:
@@ -341,28 +527,56 @@ class CrestronClient:
     # ── Normalizacion ─────────────────────────────────────────────────────────
 
     @classmethod
-    def _parse_device(cls, raw: dict[str, Any]) -> CrestronDevice:
+    def _parse_device(
+        cls,
+        raw: dict[str, Any],
+        *,
+        rooms: dict[int, str] | None = None,
+        known_type: Literal["light", "shade", "scene"] | None = None,
+    ) -> CrestronDevice:
         """Normaliza un dict crudo de Crestron a `CrestronDevice`.
 
         Todo con `.get()`/lookup tolerante y defaults: un campo faltante o de tipo
-        raro nunca debe tumbar el parseo. Los strings exactos de "type"/"subType"
-        no estan confirmados sin hardware, asi que la clasificacion es heuristica.
+        raro nunca debe tumbar el parseo.
+
+        `rooms` — el JSON real NO trae un nombre de cuarto, trae `roomId`
+        (numero) — confirmado contra la doc oficial de Devices/Lights/Shades/
+        Scenes API. Si se pasa el mapa id->nombre (de `get_rooms()`), se resuelve
+        aca; si no hay mapa o el id no esta, `room` queda en `None` en vez de
+        mostrar un numero pelado que no le dice nada a nadie.
+
+        `known_type` — cuando el item viene de un endpoint TIPADO (`/lights`,
+        `/shades`, `/scenes`) ya sabemos la categoria con certeza y no hace
+        falta adivinarla por substring. Sin esto (ej. items de `/devices`, que
+        cubre tipos sin endpoint propio todavia) se usa la heuristica de
+        siempre.
         """
         raw_type = cls._as_str(cls._get_ci(raw, "type", "subType", "deviceType"), "")
         name = cls._as_str(cls._get_ci(raw, "name", "deviceName"), "")
         device_id = cls._coerce_int(cls._get_ci(raw, "id", "deviceId"))
+
+        # Nombre de cuarto: preferir un string ya armado si el CWS algun dia lo
+        # manda asi (roomName/room); si no, resolver el roomId numerico real
+        # contra el mapa de /rooms.
         room = cls._get_ci(raw, "roomName", "room")
+        room_name = str(room) if room is not None else None
+        if room_name is None and rooms:
+            room_id_raw = cls._get_ci(raw, "roomId", "RoomId")
+            if room_id_raw is not None:
+                room_name = rooms.get(cls._coerce_int(room_id_raw))
+
         level = cls._coerce_level(cls._get_ci(raw, "level", "position", "value"))
         status_val = cls._get_ci(raw, "status", "state", "powerState")
         reachable = cls._coerce_reachable(
             cls._get_ci(raw, "reachable", "available", "online", "connectionStatus")
         )
+        device_type = known_type or cls._classify(raw_type, name)
         return CrestronDevice(
             id=device_id,
             name=name,
-            device_type=cls._classify(raw_type, name),
+            device_type=device_type,
             raw_type=raw_type,
-            room=str(room) if room is not None else None,
+            room=room_name,
             level=level,
             status=str(status_val) if status_val is not None else None,
             reachable=reachable,
@@ -436,11 +650,13 @@ class CrestronClient:
 
     @classmethod
     def _coerce_level(cls, value: Any) -> int | None:
-        """Normaliza el nivel reportado a 0-100, o None si no aplica/no es numerico.
+        """Normaliza el nivel reportado (0-65535, confirmado) a 0-100.
 
-        TODO verificar contra hardware real: si el CWS reporta el nivel en escala
-        0-65535 lo bajamos a 0-100 (heuristica: cualquier valor > 100 se asume en
-        esa escala); si ya viene 0-100 se deja igual.
+        La heuristica ">100 => esta en escala 65535" se mantiene como
+        salvaguarda defensiva aunque la escala ya este confirmada: si algun
+        dia un endpoint reporta distinto (ej. un `subType` que resulte no
+        tener nivel real y devuelva un numero chico por accidente), esto no
+        rompe — simplemente no reescala algo que ya viene 0-100.
         """
         if isinstance(value, bool) or value is None:
             return None
@@ -489,7 +705,16 @@ class CrestronClient:
     async def set_light(
         self, device_id: int, *, on: bool, level: int | None = None
     ) -> None:
-        """Enciende/apaga una luz y, si es dimmer, fija el nivel (0-100, se acota)."""
+        """Enciende/apaga una luz y, si es dimmer, fija el nivel (0-100, se acota).
+
+        Confirmado (doc oficial, Lights API + codigo real de ha-crestron-home):
+        el endpoint es BATCH, `POST /cws/api/lights/SetState` con
+        `{"lights": [{"id": N, "level": 0-65535, "time": ms}]}` — no
+        `/cws/api/lights/{id}`. No existe un campo on/off separado: `level=0`
+        es apagado, `level>0` es encendido. `time` es la duracion del fade; se
+        manda `0` para cambio instantaneo (no confirmado si es obligatorio,
+        pero mandarlo siempre es lo mas seguro).
+        """
         if not on:
             target_pct = 0
         elif level is None:
@@ -497,14 +722,10 @@ class CrestronClient:
         else:
             target_pct = _clamp(level, 0, 100)
 
-        # TODO verificar contra hardware real: la ruta y el cuerpo exactos del POST
-        # de control de luces no estan confirmados sin la cajita. Suposicion:
-        #   POST /cws/api/lights/{id}   body {"level": <0-65535>}
-        #   (0 = apagado, 65535 = 100%). Alternativa vista en otras builds:
-        #   body {"state": "on"|"off", "level": <0-100>}. Si es esa, cambiar solo
-        #   este dict y la ruta de abajo.
-        payload = {"level": self._scale_level(target_pct)}
-        await self._request("POST", f"/cws/api/lights/{device_id}", json_body=payload)
+        payload = {
+            "lights": [{"id": device_id, "level": self._scale_level(target_pct), "time": 0}]
+        }
+        await self._request("POST", "/cws/api/lights/SetState", json_body=payload)
         logger.info(
             "crestron.control",
             device_id=device_id,
@@ -520,18 +741,38 @@ class CrestronClient:
         position: int | None = None,
         action: Literal["open", "close", "stop"] | None = None,
     ) -> None:
-        """Mueve una persiana a una posicion 0-100 (se acota) o ejecuta open/close/stop."""
+        """Mueve una persiana a una posicion 0-100 (se acota) o ejecuta open/close/stop.
+
+        Confirmado (doc oficial, Shades API): el endpoint es BATCH,
+        `POST /cws/api/shades/SetState` con
+        `{"shades": [{"id": N, "position": 0-65535}]}` — no `/cws/api/shades/{id}`.
+
+        🔪 NO EXISTE un endpoint de "stop" en ningun lado (ni la doc oficial ni
+        ninguna integracion open-source lo tiene). Confirmado leyendo el
+        codigo real de `ha-crestron-home` (`cover.py`, `async_stop_cover`):
+        "parar" una persiana es RELEER su posicion actual y reenviarla como
+        destino al mismo `SetState` — el motor recibe la orden y, como ya esta
+        ahi, no se mueve mas. Por eso `action="stop"` hace un `GET /shades/{id}`
+        antes de mandar el POST.
+
+        TODO verificar contra hardware real: el SENTIDO de la posicion (¿0
+        siempre es cerrada, o depende de como el instalador configuro el
+        motor?). Ninguna fuente lo garantiza — esto SI varia por instalacion.
+        """
         if position is None and action is None:
             raise CrestronError("crestron_bad_request", 400)
 
         if action == "stop":
-            # TODO verificar contra hardware real: se asume un endpoint de stop
-            # dedicado sin cuerpo. Alternativa: POST /cws/api/shades/{id} con
-            # body {"action": "stop"}.
-            await self._request(
-                "POST", f"/cws/api/shades/{device_id}/stop", json_body={}
+            current = await self.get_device(device_id, hint="shade")
+            target_pct = current.level if current.level is not None else 0
+            payload = {"shades": [{"id": device_id, "position": self._scale_level(target_pct)}]}
+            await self._request("POST", "/cws/api/shades/SetState", json_body=payload)
+            logger.info(
+                "crestron.control",
+                device_id=device_id,
+                action="shade_stop",
+                held_position=target_pct,
             )
-            logger.info("crestron.control", device_id=device_id, action="shade_stop")
             return
 
         if action is not None:
@@ -540,13 +781,8 @@ class CrestronClient:
         else:
             target_pct = _clamp(position if position is not None else 0, 0, 100)
 
-        # TODO verificar contra hardware real: ruta/cuerpo de posicion de persiana
-        # asumidos. Suposicion:
-        #   POST /cws/api/shades/{id}   body {"position": <0-65535>}
-        #   (0 = cerrada, 65535 = abierta). Confirmar tambien el sentido: en
-        #   algunas instalaciones 0 = abierta. Si se invierte, negar aca el pct.
-        payload = {"position": self._scale_level(target_pct)}
-        await self._request("POST", f"/cws/api/shades/{device_id}", json_body=payload)
+        payload = {"shades": [{"id": device_id, "position": self._scale_level(target_pct)}]}
+        await self._request("POST", "/cws/api/shades/SetState", json_body=payload)
         logger.info(
             "crestron.control",
             device_id=device_id,
@@ -555,11 +791,13 @@ class CrestronClient:
         )
 
     async def recall_scene(self, device_id: int) -> None:
-        """Dispara (recall) una escena por su id."""
-        # TODO verificar contra hardware real: el recall de escena podria ser
-        #   POST /cws/api/scenes/recall/{id}   (sin cuerpo) -- asumido aqui -- o
-        #   GET  /cws/api/scenes/recall/{id}, o POST /cws/api/scenes/{id} con
-        #   body {"action": "recall"}. Aislado para ajustar de una sola linea.
+        """Dispara (recall) una escena por su id.
+
+        Confirmado (doc oficial, Scenes API): `POST /cws/api/scenes/recall/{id}`
+        sin cuerpo. Esta es la unica de las tres acciones de control que YA
+        estaba bien desde el principio — coincide exacto con lo que ya usaba
+        el codigo antes de esta revision.
+        """
         await self._request(
             "POST", f"/cws/api/scenes/recall/{device_id}", json_body={}
         )

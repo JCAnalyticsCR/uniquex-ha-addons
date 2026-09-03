@@ -121,6 +121,46 @@ CREATE TABLE IF NOT EXISTS preferences (
     updated_at  TEXT NOT NULL,
     PRIMARY KEY (tenant_id, key)
 );
+
+-- Overrides de organización por entidad (habitación, nombre visible, icono,
+-- orden, ocultar). El cliente los gestiona desde la app sin tocar HA.
+-- Diseñada COMPLETA de entrada: ver nota en scenes sobre migraciones.
+CREATE TABLE IF NOT EXISTS entity_overrides (
+    tenant_id    INTEGER NOT NULL DEFAULT 1 REFERENCES tenants(id),
+    entity_id    TEXT NOT NULL,
+    room_id      TEXT,               -- referencia a custom_rooms.room_id o área de HA
+    display_name TEXT,               -- nombre visible personalizado
+    icon         TEXT,               -- icono (slug, ej: "lightbulb")
+    hidden       INTEGER NOT NULL DEFAULT 0,  -- 0|1
+    sort_order   INTEGER,            -- orden dentro de la habitación
+    updated_at   TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, entity_id)
+);
+
+-- Habitaciones custom creadas por el cliente (complementan las áreas de HA).
+-- room_id siempre tiene el prefijo "custom:" para distinguirlas de las áreas HA.
+CREATE TABLE IF NOT EXISTS custom_rooms (
+    tenant_id   INTEGER NOT NULL DEFAULT 1 REFERENCES tenants(id),
+    room_id     TEXT NOT NULL,       -- "custom:<slug>" (ej: "custom:sala-de-estar")
+    name        TEXT NOT NULL,
+    icon        TEXT,
+    sort_order  INTEGER NOT NULL DEFAULT 0,
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, room_id)
+);
+
+-- Registro de entidades conocidas para detección de dispositivos nuevos.
+-- acknowledged_at NULL = pendiente de revisión por el cliente.
+CREATE TABLE IF NOT EXISTS known_entities (
+    tenant_id       INTEGER NOT NULL DEFAULT 1 REFERENCES tenants(id),
+    entity_id       TEXT NOT NULL,
+    first_seen_at   TEXT NOT NULL,
+    acknowledged_at TEXT,            -- NULL mientras el cliente no las confirme
+    PRIMARY KEY (tenant_id, entity_id)
+);
+CREATE INDEX IF NOT EXISTS idx_known_entities_ack
+    ON known_entities(tenant_id, acknowledged_at);
 """
 
 
@@ -481,3 +521,325 @@ class Database:
             (tenant_id, key, json.dumps(value, separators=(",", ":")), utc_now_iso()),
         )
         await conn.commit()
+
+    # -------------------------------------------------------------------------
+    # Entity overrides (onboarding: habitación, nombre visible, icono, ocultar)
+    #
+    # Misma decisión que escenas: _require_conn() en lugar de silencio.
+    # Devolver listas vacías cuando la DB no está montada ocultaría los overrides
+    # del cliente en cada reconexión — mejor un 500 ruidoso.
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _override_row_to_dict(row: aiosqlite.Row) -> dict[str, Any]:
+        """Fila cruda de entity_overrides → dict normalizado."""
+        return {
+            "entity_id": row["entity_id"],
+            "room_id": row["room_id"],
+            "display_name": row["display_name"],
+            "icon": row["icon"],
+            "hidden": bool(row["hidden"]),
+            "sort_order": row["sort_order"],
+            "updated_at": row["updated_at"],
+        }
+
+    async def list_overrides(self, tenant_id: int = 1) -> list[dict[str, Any]]:
+        """Todos los overrides del tenant, ordenados por entity_id."""
+        conn = self._require_conn()
+        async with conn.execute(
+            "SELECT * FROM entity_overrides WHERE tenant_id = ? ORDER BY entity_id",
+            (tenant_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [self._override_row_to_dict(r) for r in rows]
+
+    async def get_override(self, entity_id: str, tenant_id: int = 1) -> dict[str, Any] | None:
+        """Override de una entidad, o None si no existe."""
+        conn = self._require_conn()
+        async with conn.execute(
+            "SELECT * FROM entity_overrides WHERE tenant_id = ? AND entity_id = ?",
+            (tenant_id, entity_id),
+        ) as cur:
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            return self._override_row_to_dict(row)
+
+    async def save_override(
+        self,
+        entity_id: str,
+        *,
+        room_id: str | None,
+        display_name: str | None,
+        icon: str | None,
+        hidden: bool,
+        sort_order: int | None,
+        tenant_id: int = 1,
+    ) -> dict[str, Any]:
+        """Upsert completo de un override. Devuelve la fila resultante."""
+        conn = self._require_conn()
+        ahora = utc_now_iso()
+        await conn.execute(
+            """
+            INSERT INTO entity_overrides
+                (tenant_id, entity_id, room_id, display_name, icon, hidden, sort_order, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(tenant_id, entity_id) DO UPDATE SET
+                room_id      = excluded.room_id,
+                display_name = excluded.display_name,
+                icon         = excluded.icon,
+                hidden       = excluded.hidden,
+                sort_order   = excluded.sort_order,
+                updated_at   = excluded.updated_at
+            """,
+            (tenant_id, entity_id, room_id, display_name, icon, int(hidden), sort_order, ahora),
+        )
+        await conn.commit()
+        resultado = await self.get_override(entity_id, tenant_id)
+        if resultado is None:  # pragma: no cover
+            raise RuntimeError(f"Override {entity_id} desapareció tras el INSERT")
+        return resultado
+
+    async def delete_override(self, entity_id: str, tenant_id: int = 1) -> bool:
+        """True si borró algo; False si no existía (idempotente desde el router)."""
+        conn = self._require_conn()
+        async with conn.execute(
+            "DELETE FROM entity_overrides WHERE tenant_id = ? AND entity_id = ?",
+            (tenant_id, entity_id),
+        ) as cur:
+            borradas = cur.rowcount
+        await conn.commit()
+        return bool(borradas)
+
+    # -------------------------------------------------------------------------
+    # Custom rooms (onboarding: habitaciones propias del cliente)
+    # -------------------------------------------------------------------------
+
+    @staticmethod
+    def _room_row_to_dict(row: aiosqlite.Row) -> dict[str, Any]:
+        """Fila cruda de custom_rooms → dict normalizado."""
+        return {
+            "room_id": row["room_id"],
+            "name": row["name"],
+            "icon": row["icon"],
+            "sort_order": row["sort_order"],
+            "source": "custom",
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+        }
+
+    async def list_rooms(self, tenant_id: int = 1) -> list[dict[str, Any]]:
+        """Todas las habitaciones custom del tenant, en orden de sort_order."""
+        conn = self._require_conn()
+        async with conn.execute(
+            "SELECT * FROM custom_rooms WHERE tenant_id = ? ORDER BY sort_order, created_at",
+            (tenant_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [self._room_row_to_dict(r) for r in rows]
+
+    async def get_room(self, room_id: str, tenant_id: int = 1) -> dict[str, Any] | None:
+        """Una habitación custom por room_id, o None si no existe."""
+        conn = self._require_conn()
+        async with conn.execute(
+            "SELECT * FROM custom_rooms WHERE tenant_id = ? AND room_id = ?",
+            (tenant_id, room_id),
+        ) as cur:
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            return self._room_row_to_dict(row)
+
+    async def get_rooms_max_sort_order(self, tenant_id: int = 1) -> int:
+        """Máximo sort_order actual entre las habitaciones custom del tenant."""
+        conn = self._require_conn()
+        async with conn.execute(
+            "SELECT MAX(sort_order) AS mx FROM custom_rooms WHERE tenant_id = ?",
+            (tenant_id,),
+        ) as cur:
+            row = await cur.fetchone()
+            return int(row["mx"]) if row and row["mx"] is not None else -1
+
+    async def create_room(
+        self,
+        *,
+        room_id: str,
+        name: str,
+        icon: str | None,
+        sort_order: int,
+        tenant_id: int = 1,
+    ) -> dict[str, Any]:
+        """Inserta una habitación custom nueva. Lanza IntegrityError si room_id duplicado."""
+        conn = self._require_conn()
+        ahora = utc_now_iso()
+        await conn.execute(
+            """
+            INSERT INTO custom_rooms
+                (tenant_id, room_id, name, icon, sort_order, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (tenant_id, room_id, name, icon, sort_order, ahora, ahora),
+        )
+        await conn.commit()
+        creada = await self.get_room(room_id, tenant_id)
+        if creada is None:  # pragma: no cover
+            raise RuntimeError(f"Habitación {room_id} desapareció tras el INSERT")
+        return creada
+
+    async def update_room(
+        self,
+        room_id: str,
+        *,
+        name: str | None = None,
+        icon: str | None = None,
+        sort_order: int | None = None,
+        tenant_id: int = 1,
+    ) -> dict[str, Any] | None:
+        """
+        Actualiza campos opcionales de una habitación.
+
+        Solo modifica los campos que se pasan (no None). None como valor de
+        icon es válido (borra el icono), así que el flag de "no tocar" se
+        decide por qué argumentos se pasaron en el router.
+        """
+        conn = self._require_conn()
+        actual = await self.get_room(room_id, tenant_id)
+        if actual is None:
+            return None
+        nuevo_name = name if name is not None else actual["name"]
+        nuevo_icon = icon  # None borra; el router decide cuándo pasar None
+        nuevo_sort = sort_order if sort_order is not None else actual["sort_order"]
+        ahora = utc_now_iso()
+        await conn.execute(
+            """
+            UPDATE custom_rooms
+            SET name = ?, icon = ?, sort_order = ?, updated_at = ?
+            WHERE tenant_id = ? AND room_id = ?
+            """,
+            (nuevo_name, nuevo_icon, nuevo_sort, ahora, tenant_id, room_id),
+        )
+        await conn.commit()
+        return await self.get_room(room_id, tenant_id)
+
+    async def delete_room(self, room_id: str, tenant_id: int = 1) -> bool:
+        """
+        Borra una habitación custom y limpia los overrides que la referencian.
+
+        Ambas operaciones ocurren en la misma transacción para garantizar
+        consistencia: ningún override queda apuntando a una habitación inexistente.
+        """
+        conn = self._require_conn()
+        # Limpiar referencias en entity_overrides ANTES de borrar la habitación
+        await conn.execute(
+            "UPDATE entity_overrides SET room_id = NULL WHERE tenant_id = ? AND room_id = ?",
+            (tenant_id, room_id),
+        )
+        async with conn.execute(
+            "DELETE FROM custom_rooms WHERE tenant_id = ? AND room_id = ?",
+            (tenant_id, room_id),
+        ) as cur:
+            borradas = cur.rowcount
+        await conn.commit()
+        return bool(borradas)
+
+    # -------------------------------------------------------------------------
+    # Known entities (onboarding: detección de dispositivos nuevos)
+    # -------------------------------------------------------------------------
+
+    async def count_known_entities(self, tenant_id: int = 1) -> int:
+        """Cuántas entidades están registradas para el tenant."""
+        conn = self._require_conn()
+        async with conn.execute(
+            "SELECT COUNT(*) AS n FROM known_entities WHERE tenant_id = ?",
+            (tenant_id,),
+        ) as cur:
+            row = await cur.fetchone()
+            return int(row["n"]) if row else 0
+
+    async def seed_known_entities(
+        self, ids: list[str], acknowledged: bool = True, tenant_id: int = 1
+    ) -> None:
+        """
+        Siembra las entidades como 'conocidas'.
+
+        Se usa en la primera visita al endpoint /pending para que una
+        instalación nueva no muestre cientos de dispositivos como "nuevos".
+        INSERT OR IGNORE para no pisar registros que ya existan (idempotente).
+        """
+        conn = self._require_conn()
+        ahora = utc_now_iso()
+        ack = ahora if acknowledged else None
+        for eid in ids:
+            await conn.execute(
+                """
+                INSERT OR IGNORE INTO known_entities
+                    (tenant_id, entity_id, first_seen_at, acknowledged_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (tenant_id, eid, ahora, ack),
+            )
+        await conn.commit()
+
+    async def insert_unknown_entities(
+        self, ids: list[str], tenant_id: int = 1
+    ) -> list[str]:
+        """
+        Inserta entidades no conocidas como pendientes de revisión.
+
+        Las entidades ya registradas se ignoran (idempotente).
+        Devuelve la lista de entity_ids efectivamente insertados.
+        """
+        conn = self._require_conn()
+        ahora = utc_now_iso()
+        nuevas: list[str] = []
+        for eid in ids:
+            async with conn.execute(
+                """
+                INSERT OR IGNORE INTO known_entities
+                    (tenant_id, entity_id, first_seen_at, acknowledged_at)
+                VALUES (?, ?, ?, NULL)
+                """,
+                (tenant_id, eid, ahora),
+            ) as cur:
+                if cur.rowcount > 0:
+                    nuevas.append(eid)
+        await conn.commit()
+        return nuevas
+
+    async def list_unacknowledged(self, tenant_id: int = 1) -> list[dict[str, Any]]:
+        """Entidades pendientes de revisión (acknowledged_at IS NULL)."""
+        conn = self._require_conn()
+        async with conn.execute(
+            """
+            SELECT entity_id, first_seen_at
+            FROM known_entities
+            WHERE tenant_id = ? AND acknowledged_at IS NULL
+            ORDER BY first_seen_at
+            """,
+            (tenant_id,),
+        ) as cur:
+            rows = await cur.fetchall()
+        return [{"entity_id": r["entity_id"], "first_seen_at": r["first_seen_at"]} for r in rows]
+
+    async def acknowledge_entities(self, ids: list[str], tenant_id: int = 1) -> int:
+        """
+        Marca entidades como revisadas.
+
+        Solo actualiza las que aún no estaban confirmadas.
+        Devuelve el número de filas efectivamente marcadas.
+        """
+        conn = self._require_conn()
+        ahora = utc_now_iso()
+        total = 0
+        for eid in ids:
+            async with conn.execute(
+                """
+                UPDATE known_entities
+                SET acknowledged_at = ?
+                WHERE tenant_id = ? AND entity_id = ? AND acknowledged_at IS NULL
+                """,
+                (ahora, tenant_id, eid),
+            ) as cur:
+                total += cur.rowcount
+        await conn.commit()
+        return total

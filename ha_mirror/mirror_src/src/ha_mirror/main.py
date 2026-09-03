@@ -37,6 +37,7 @@ from ha_mirror.api.camera_ws import router as camera_ws_router
 from ha_mirror.api.entities import router as entities_router
 from ha_mirror.api.health import router as health_router
 from ha_mirror.api.iframe_token import router as iframe_router
+from ha_mirror.api.onboarding import router as onboarding_router
 from ha_mirror.api.preferences import router as preferences_router
 from ha_mirror.api.scenes import router as scenes_router
 from ha_mirror.api.service import router as service_router
@@ -50,6 +51,7 @@ from ha_mirror.db import Database
 from ha_mirror.errors import HaAuthError
 from ha_mirror.ha_upstream import HAUpstream
 from ha_mirror.logging_setup import configure_logging
+from ha_mirror.onboarding import OnboardingService
 from ha_mirror.state_store import StateStore
 
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
@@ -259,6 +261,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # si una actualización entró o un rollback funcionó, sin entrar a la cajita.
     app.state.mirror_version = _MIRROR_VERSION
 
+    # Servicio de onboarding (sin tareas de fondo propias).
+    app.state.onboarding = OnboardingService(
+        store=store,
+        upstream=upstream,
+        db=db,
+        mirror_version=_MIRROR_VERSION,
+    )
+
     # 6. Lanzar el upstream como task supervisado
     upstream_task = asyncio.create_task(upstream.run_forever(), name="ha_upstream")
 
@@ -345,6 +355,7 @@ def create_app() -> FastAPI:
     app.include_router(camera_media_router)
     app.include_router(scenes_router)
     app.include_router(preferences_router)
+    app.include_router(onboarding_router)
     # Emisor de tickets de WebSocket (0.21.0). Lo llama el frontend desde el
     # servidor con X-API-Key; el navegador nunca recibe la key.
     app.include_router(ws_ticket_router)
