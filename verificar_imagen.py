@@ -60,7 +60,8 @@ def _correr(args: list[str], *, binario: bool = False):
 # Son deliberadamente obvios: si alguno apareciera en un log de produccion, se
 # reconoce al instante que esa caja arranco sin configurar.
 ENTORNO_DE_MENTIRA = {
-    "HA_URL": "http://ha-que-no-existe:8123",
+    # ha_url es un WebSocket, no HTTP: el Mirror lo valida y rechaza http://.
+    "HA_URL": "ws://ha-que-no-existe:8123/api/websocket",
     "MIRROR_API_KEY": "valor-de-mentira-solo-para-la-prueba-de-ci-no-sirve-para-nada",
     "SESSION_SECRET": "valor-de-mentira-solo-para-la-prueba-de-ci-no-sirve-para-nada",
     "IFRAME_TOKEN_SECRET": "valor-de-mentira-solo-para-la-prueba-de-ci-no-sirve-para-nada",
