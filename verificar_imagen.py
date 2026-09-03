@@ -65,6 +65,11 @@ ENTORNO_DE_MENTIRA = {
     "MIRROR_API_KEY": "valor-de-mentira-solo-para-la-prueba-de-ci-no-sirve-para-nada",
     "SESSION_SECRET": "valor-de-mentira-solo-para-la-prueba-de-ci-no-sirve-para-nada",
     "IFRAME_TOKEN_SECRET": "valor-de-mentira-solo-para-la-prueba-de-ci-no-sirve-para-nada",
+    # Esta NO la exporta run.sh: la inyecta Home Assistant al arrancar el add-on.
+    # Se usa el nombre real (SUPERVISOR_TOKEN, que el Mirror acepta como alias de
+    # ha_token) y no HA_TOKEN, para que la prueba se parezca a una caja de verdad.
+    # Sin ella el Mirror cae al modo standalone y exige archivos Fernet en disco.
+    "SUPERVISOR_TOKEN": "valor-de-mentira-solo-para-la-prueba-de-ci-no-sirve-para-nada",
 }
 
 
