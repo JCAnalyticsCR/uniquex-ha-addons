@@ -49,16 +49,32 @@ def falla(mensaje: str, solucion: str = "") -> None:
 # ---------------------------------------------------------------------------
 
 def check_crlf_sh(addon_dir: Path) -> list[str]:
-    """Ningún .sh debe tener CRLF — causa 'bad interpreter' en Linux."""
+    """
+    Ningún archivo que Linux vaya a interpretar debe tener CRLF.
+
+    En los `.sh` el CRLF causa 'bad interpreter' y mata el contenedor al
+    arrancar. Es el defecto que rompió la primera instalación en hardware real.
+
+    El Dockerfile entra en la misma revisión aunque su parser tolere CRLF: el
+    retorno de carro se cuela dentro de los valores (un ENV queda con un \\r
+    invisible al final) y adentro de cualquier heredoc de un RUN, donde vuelve a
+    ser 'bad interpreter' pero recién en tiempo de build. Es la misma familia de
+    defecto y no hay ninguna razón para tenerlo.
+    """
     errores = []
-    for sh in addon_dir.rglob("*.sh"):
-        data = sh.read_bytes()
+    candidatos = sorted(addon_dir.rglob("*.sh"))
+    dockerfile = addon_dir / "Dockerfile"
+    if dockerfile.exists():
+        candidatos.append(dockerfile)
+
+    for archivo in candidatos:
+        data = archivo.read_bytes()
         count = data.count(b"\r\n")
         if count:
             errores.append(
-                f"{sh.relative_to(addon_dir)} tiene {count} líneas CRLF.\n"
+                f"{archivo.relative_to(addon_dir)} tiene {count} líneas CRLF.\n"
                 f"  Arreglo: python3 -c \""
-                f"p='{sh}'; open(p,'wb').write(open(p,'rb').read().replace(b'\\r\\n',b'\\n'))\""
+                f"p='{archivo}'; open(p,'wb').write(open(p,'rb').read().replace(b'\\r\\n',b'\\n'))\""
             )
     return errores
 
@@ -274,7 +290,7 @@ def main() -> int:
     todos_errores: list[str] = []
 
     checks = [
-        ("Saltos de linea en .sh (CRLF -> bad interpreter)",  check_crlf_sh),
+        ("Saltos de linea en .sh y Dockerfile (CRLF)",  check_crlf_sh),
         ("Continuaciones del Dockerfile (barras rotas -> build muerto)", check_dockerfile_continuations),
         ("YAML valido + version sincronizada con pyproject.toml", check_yaml_version),
         ("Archivos referenciados por COPY en el Dockerfile", check_dockerfile_copies),

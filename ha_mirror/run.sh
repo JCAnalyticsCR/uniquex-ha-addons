@@ -31,19 +31,52 @@ if [ -z "${CAMERA_LABELS}" ] || [ "${CAMERA_LABELS}" = "null" ]; then
   CAMERA_LABELS='{}'
 fi
 
-# --- MIRROR_API_KEY (se comparte con el frontend) ---
-# Fix C5/A2/M6 — la key es OBLIGATORIA (config.yaml la exige) y NUNCA se
-# autogenera ni se imprime en el Log: los logs del add-on son visibles a
-# cualquier admin de HA y persisten. Fail-closed con mensaje claro.
+# --- MIRROR_API_KEY: qué pasa si se deja vacía depende del MODO ---
+#
+# Esta key NUNCA se imprime en el Log: los logs del add-on los ve cualquier
+# admin de HA y persisten. Se lee del archivo cuando hace falta.
+#
+# ARTESANAL (platform_base_url vacía) → OBLIGATORIA.
+#   Acá esta key es el secreto COMPARTIDO con el frontend: hay que ponerla en
+#   los dos lados a mano. Si la caja se generara una sola, el frontend no la
+#   conocería y la app se quedaría sin datos — un fallo confuso, porque el
+#   add-on habría arrancado bien.
+#
+# FÁBRICA (platform_base_url con valor) → si se deja vacía, la caja se genera
+# una sola vez y la guarda en /data.
+#   Acá ya no es el secreto compartido: la plataforma emite su PROPIA credencial
+#   al activar (el campo mirror_api_key del anuncio) y esa es la que usa la app.
+#   Esta queda solo para acceso local y diagnóstico. Autogenerarla es un paso
+#   manual menos por caja y, sobre todo, una oportunidad menos de que alguien
+#   reutilice la misma key en dos equipos al armar en serie — que es justo el
+#   patrón de secreto compartido que este proyecto evita.
+#
+# 🔪 La distinción por modo es el punto. La rama de fábrica autogeneraba SIEMPRE,
+# porque ahí toda caja era de producto. Traído tal cual al código unificado,
+# habría roto cualquier casa artesanal que dejara la opción vacía.
 if [ -z "${API_KEY}" ] || [ "${API_KEY}" = "null" ]; then
-  echo "[mirror] ERROR: falta 'mirror_api_key' en la configuración del add-on."
-  echo "[mirror] Generala en tu laptop con:  openssl rand -hex 32"
-  echo "[mirror] Pegala en Configuración -> mirror_api_key y reiniciá el add-on."
-  exit 1
+  if [ -n "${PLATFORM_BASE_URL}" ] && [ "${PLATFORM_BASE_URL}" != "null" ]; then
+    if [ -f /data/bootstrap_api_key ]; then
+      API_KEY="$(cat /data/bootstrap_api_key)"
+    else
+      API_KEY="$(gen_secret)"
+      # umask antes de escribir: el archivo nunca existe siendo legible por
+      # otros, ni siquiera un instante.
+      (umask 077; printf '%s' "${API_KEY}" > /data/bootstrap_api_key)
+      echo "[mirror] Key de arranque generada y guardada en /data (no se imprime)."
+    fi
+  else
+    echo "[mirror] ERROR: falta 'mirror_api_key' en la configuración del add-on."
+    echo "[mirror] En modo artesanal es obligatoria: es la misma key que va en el"
+    echo "[mirror] frontend, así que tiene que ponerse en los dos lados."
+    echo "[mirror] Generala en tu laptop con:  openssl rand -hex 32"
+    exit 1
+  fi
 fi
 if [ "${#API_KEY}" -lt 32 ]; then
   echo "[mirror] ERROR: 'mirror_api_key' muy corta (${#API_KEY} chars, mínimo 32)."
-  echo "[mirror] Generá una fuerte con:  openssl rand -hex 32"
+  echo "[mirror] En modo fábrica podés dejarla vacía y la caja genera una sola."
+  echo "[mirror] Si no, generá una fuerte con:  openssl rand -hex 32"
   exit 1
 fi
 

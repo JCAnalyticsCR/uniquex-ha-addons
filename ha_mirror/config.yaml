@@ -3,7 +3,7 @@ name: UniquexCR Mirror
 # Si esto no sube, la casa no recibe nada aunque el código cambie.
 # Mantener sincronizado con mirror_src/pyproject.toml (de ahí sale la versión
 # que reporta /api/health).
-version: "0.27.0"
+version: "0.28.0"
 slug: ha_mirror
 # La caja BAJA esta imagen en vez de construirla.
 #
@@ -82,7 +82,7 @@ options:
   camera_stream_map: "{}"
   camera_labels: "{}"
 schema:
-  mirror_api_key: "password"
+  mirror_api_key: "password?"
   platform_base_url: "str?"
   frontend_origin: "str?"
   log_level: "list(DEBUG|INFO|WARNING|ERROR)?"
