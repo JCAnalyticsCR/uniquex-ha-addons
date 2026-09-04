@@ -82,6 +82,8 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from ha_mirror.device_identity import (
     DeviceIdentity,
     borrar_secreto_de_plataforma,
+    cargar_clave_mirror,
+    cargar_token_tunel,
     derivar_claim_code,
     firmar,
     guardar_clave_mirror,
@@ -542,6 +544,26 @@ class AnnounceClient:
             "signature": signature,
         }
 
+        # QUÉ LE FALTA A ESTA CAJA
+        # ------------------------
+        # La plataforma entrega sus secretos UNA vez y da por hecho que
+        # llegaron: borra el token del túnel de su base en el mismo commit en
+        # que lo manda, y marca la credencial como entregada. Si la respuesta se
+        # pierde en la red, o el disco no deja escribirla, el secreto se perdió
+        # para los dos lados y la casa nunca levanta.
+        #
+        # No es hipotético: es un commit que ocurre ANTES de que la caja
+        # confirme nada. Y no había recuperación — el endpoint de reintento del
+        # túnel contesta "ya_provisionado" porque el tunnel_id existe, aunque el
+        # token no lo tenga nadie.
+        #
+        # Con esto la caja dice en cada anuncio qué le falta de verdad, mirando
+        # el disco y no lo que cree recordar. Solo tiene sentido preguntarlo si
+        # está emparejada: sin casa, no hay nada que entregarle.
+        if self._identity.paired:
+            payload["necesita_clave_mirror"] = cargar_clave_mirror(self._mirror_key_path) is None
+            payload["necesita_token_tunel"] = cargar_token_tunel(self._tunnel_token_path) is None
+
         async with session.post(endpoint, json=payload) as resp:
             if resp.status == 200:
                 # Leer los bytes CRUDOS antes de cualquier parseo.
@@ -681,13 +703,22 @@ class AnnounceClient:
 
         if nueva is None:
             # La base ya lo tenía limpio. Puede pasar si un intento anterior
-            # murió entre el borrado y el UPDATE: los secretos ya no están y el
-            # estado es el correcto, así que no hay nada que reparar.
+            # murió entre el borrado y el UPDATE.
+            #
+            # HAY QUE RELEER LA IDENTIDAD IGUAL. Si nos quedáramos con la de
+            # memoria —que sigue diciendo "emparejada"— `_quizas_desemparejar`
+            # volvería a dispararse cada tres latidos para siempre: mataría
+            # cloudflared, reintentaría los borrados y llenaría el log, sin
+            # converger nunca. El UPDATE no actualizó nada justamente porque el
+            # estado deseado YA está en la base; lo único desincronizado es la
+            # copia en memoria.
+            nueva = await self._db.get_device_identity()
             logger.info(
                 "announce.ya_desemparejada_en_db",
                 device_id=self._identity.device_id,
             )
-        else:
+
+        if nueva is not None:
             identidad = DeviceIdentity(**nueva)
             self._identity = identidad
             if self._on_paired is not None:
