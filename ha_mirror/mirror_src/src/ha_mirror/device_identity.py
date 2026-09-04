@@ -264,6 +264,39 @@ def cargar_token_tunel(path: Path) -> str | None:
         return None
 
 
+def borrar_secreto_de_plataforma(path: Path) -> bool:
+    """
+    Borra un secreto que emitió la plataforma (token de túnel o clave del Mirror).
+
+    Existe para el des-emparejamiento: cuando la plataforma deja de reconocer a
+    esta caja, los secretos que emitió para la casa anterior tienen que
+    desaparecer del disco. Si se quedaran, la caja seguiría levantando el túnel
+    de una casa que ya no existe, y la credencial del dueño anterior seguiría
+    abriendo este Mirror.
+
+    Devuelve True si había algo y se borró. `missing_ok=True` porque el caso
+    normal —no había nada— no es un error: esta función se llama sin saber si el
+    archivo existe.
+
+    No revienta ante un OSError: si el disco no deja borrar, es mucho mejor
+    seguir corriendo y gritarlo que tumbar el Mirror de una familia.
+    """
+    try:
+        existia = path.exists()
+        path.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.error(
+            "device_identity.secreto_no_borrado",
+            path=str(path),
+            exc=str(exc),
+            msg="No se pudo borrar un secreto de la plataforma. Revisar a mano.",
+        )
+        return False
+    if existia:
+        logger.info("device_identity.secreto_borrado", path=str(path))
+    return existia
+
+
 # -----------------------------------------------------------------------------
 # Hash del código de emparejamiento — una sola definición
 # -----------------------------------------------------------------------------

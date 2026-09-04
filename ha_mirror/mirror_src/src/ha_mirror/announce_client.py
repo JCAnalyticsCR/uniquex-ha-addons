@@ -9,8 +9,12 @@ llamar a la caja: el flujo tiene que arrancar desde la caja hacia afuera.
 Este módulo implementa ese anuncio periódico: un POST firmado al endpoint
 `/api/boxes/announce` de la plataforma. El backend lo usa para saber qué cajas
 están encendidas y disponibles para ser reclamadas. Cuando alguien escanea el
-QR e ingresa el código, el backend responde `paired: true` en el próximo anuncio
-y el loop se detiene.
+QR e ingresa el código, el backend responde `paired: true` en el próximo anuncio.
+
+El loop NO se detiene ahí: baja a un latido lento y sigue. Es lo que permite que
+la caja se entere si la plataforma la libera y vuelva sola al estado activable,
+sin que nadie tenga que entrar a Home Assistant a reiniciar el add-on. Ver
+_HEARTBEAT_INTERVAL y _DESEMPAREJOS_PARA_CONFIRMAR.
 
 El módulo corre como task de background supervisado en el lifespan, igual al
 patrón de HAUpstream.run_forever(). Si falla (por red caída, servicio de la
@@ -67,7 +71,7 @@ import json as _json
 import random
 import secrets
 import struct
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from typing import TYPE_CHECKING, Any
 
 import aiohttp
@@ -77,6 +81,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 
 from ha_mirror.device_identity import (
     DeviceIdentity,
+    borrar_secreto_de_plataforma,
     derivar_claim_code,
     firmar,
     guardar_clave_mirror,
@@ -99,6 +104,40 @@ logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
 # Intervalo entre anuncios cuando la caja está sana (sin errores de red).
 # Ver sección "INTERVALO NORMAL" en el docstring del módulo.
 _ANNOUNCE_INTERVAL = 120.0
+
+# Intervalo una vez EMPAREJADA. El loop ya no termina al emparejarse: baja a un
+# latido lento y sigue.
+#
+# Antes el loop hacía `return` en cuanto el backend respondía `paired: true`, y
+# eso dejaba a la caja sorda para siempre. La plataforma sí puede liberar una
+# caja (`POST /boxes/{id}/deactivate`), pero la caja no tenía forma de
+# enterarse: quedaba convencida de tener dueño, con su túnel arriba, y ninguna
+# calcomanía podía reactivarla porque el claim exige un anuncio reciente y ya no
+# había ninguno. Recuperarla exigía que alguien entrara a Home Assistant a
+# reiniciar el add-on — justo lo que no se puede pedir en la casa de un cliente.
+#
+# 600s y no 120s: emparejada, el anuncio ya no es lo que destraba una activación
+# (eso ya pasó). Solo sirve para enterarse de un cambio de estado y para que la
+# plataforma sepa que la casa sigue viva. Con 600s son 144 peticiones por caja
+# por día — nada para el backend, y una caja liberada se recupera sola en menos
+# de diez minutos sin que nadie viaje.
+_HEARTBEAT_INTERVAL = 600.0
+
+# Cuántas respuestas seguidas tienen que decir "esta caja no está emparejada"
+# antes de que la caja se libere de verdad.
+#
+# NO es 1 a propósito. Des-emparejarse implica bajar el túnel y borrar los
+# secretos de la casa: es destructivo y de cara al cliente. Un pico raro del
+# backend —una réplica con la base vieja, un despliegue a mitad de camino— que
+# devolviera un `paired: false` aislado dejaría a una familia sin acceso remoto
+# sin que nadie hubiera pedido nada.
+#
+# Con 3 confirmaciones separadas por el latido, hacen falta ~20 minutos de
+# respuestas coherentes para soltar la casa. Un desliz momentáneo no alcanza;
+# una desactivación de verdad sí, porque es un estado permanente en la base.
+# La respuesta viene FIRMADA (Ed25519, ver _DOMINIO_FIRMA), así que además
+# nadie puede falsificar un `paired: false` desde la red.
+_DESEMPAREJOS_PARA_CONFIRMAR = 3
 
 # Backoff exponencial ante fallos de red o respuestas HTTP inesperadas.
 # Misma fórmula que ha_upstream.py: sleep = min(backoff × jitter_factor, CAP).
@@ -306,6 +345,8 @@ class AnnounceClient:
         upstream: HAUpstream | None = None,
         announce_interval: float = _ANNOUNCE_INTERVAL,
         on_paired: Callable[[DeviceIdentity], None] | None = None,
+        on_unpaired: Callable[[DeviceIdentity], Awaitable[None]] | None = None,
+        heartbeat_interval: float = _HEARTBEAT_INTERVAL,
     ) -> None:
         """
         Parámetros
@@ -342,6 +383,13 @@ class AnnounceClient:
             DeviceIdentity actualizada (leída de DB). El lifespan lo usa para
             actualizar app.state.device_identity en memoria y que el endpoint
             /api/device/identity refleje el estado real sin necesitar un reinicio.
+        on_unpaired
+            Callback opcional (async) invocado cuando la plataforma deja de
+            reconocer esta caja y el des-emparejamiento local ya se persistió.
+            El lifespan lo usa para bajar cloudflared: el túnel de la casa
+            anterior ya no existe del otro lado.
+        heartbeat_interval
+            Segundos entre anuncios una vez emparejada. Default: 600s.
         """
         self._identity = identity
         self._privada = private_key
@@ -351,16 +399,23 @@ class AnnounceClient:
         self._mirror_key_path = mirror_key_path
         self._upstream = upstream
         self._announce_interval = announce_interval
+        self._heartbeat_interval = heartbeat_interval
         self._on_paired = on_paired
+        self._on_unpaired = on_unpaired
+        # Cuántas respuestas seguidas dijeron "no la conozco" mientras esta caja
+        # se cree emparejada. Ver _DESEMPAREJOS_PARA_CONFIRMAR.
+        self._desemparejos_seguidos = 0
 
     async def run_forever(self) -> None:
         """
         Loop principal de anuncio con backoff exponencial.
 
-        Termina limpiamente en dos casos:
-          1. La caja se empareja: backend responde `paired: true`, se persiste
-             en DB y el loop sale. El task queda "done" sin excepción.
-          2. asyncio.CancelledError (shutdown del lifespan).
+        NO termina al emparejarse: cambia de cadencia (120s → 600s) y sigue.
+        Ese latido es lo que le permite a la caja enterarse de que la plataforma
+        la liberó y volver sola al estado activable. Ver _HEARTBEAT_INTERVAL.
+
+        Termina limpiamente en un solo caso:
+          - asyncio.CancelledError (shutdown del lifespan).
 
         Termina con error sin reintentar:
           - 409 (posible clonación): _SecurityHalt propaga y el task queda
@@ -421,14 +476,19 @@ class AnnounceClient:
                     continue
 
                 if paired:
-                    # Emparejamiento confirmado y persistido. El loop termina
-                    # limpiamente; el task queda "done" sin excepción.
-                    logger.info(
-                        "announce.loop_done",
-                        device_id=self._identity.device_id,
-                        msg="Caja emparejada — loop de anuncio finalizado.",
-                    )
-                    return
+                    # Emparejada. El loop NO termina: baja al latido lento y
+                    # sigue escuchando, que es lo único que permite enterarse de
+                    # una desactivación sin que un humano reinicie el add-on.
+                    if primer_anuncio_ok:
+                        primer_anuncio_ok = False
+                        logger.info(
+                            "announce.ok",
+                            device_id=self._identity.device_id,
+                            msg="Caja emparejada. Sigue el latido lento.",
+                        )
+                    backoff = _BACKOFF_BASE
+                    await asyncio.sleep(self._heartbeat_interval)
+                    continue
 
                 # Anuncio exitoso, caja todavía disponible para reclamar.
                 if primer_anuncio_ok:
@@ -564,6 +624,95 @@ class AnnounceClient:
                 f"Respuesta inesperada del backend: HTTP {resp.status} — {body[:256]}"
             )
 
+    async def _quizas_desemparejar(self) -> None:
+        """
+        La plataforma no reconoce una caja que localmente se cree emparejada.
+
+        Cuenta confirmaciones consecutivas y, al llegar al umbral, suelta la casa
+        de verdad. Ver _DESEMPAREJOS_PARA_CONFIRMAR para por qué no alcanza una.
+
+        El orden importa y no es arbitrario:
+
+          1. Se borran los secretos de la plataforma (token de túnel y clave del
+             Mirror). Van PRIMERO porque son lo peligroso: mientras existan, la
+             caja sigue publicando la casa anterior y la credencial del dueño
+             anterior sigue abriendo este Mirror.
+          2. Se limpia el emparejamiento en la base local. Es lo que hace que la
+             calcomanía vuelva a mostrar el QR.
+          3. Se baja cloudflared (callback del lifespan).
+
+        Si el paso 2 fallara después del 1, la caja queda sin secretos y con la
+        base diciendo "emparejada": inofensivo, y el siguiente latido lo
+        reintenta. Al revés —base limpia y secretos vivos— dejaría un túnel
+        publicando la casa de alguien sin que nada lo registre.
+        """
+        self._desemparejos_seguidos += 1
+        faltan = _DESEMPAREJOS_PARA_CONFIRMAR - self._desemparejos_seguidos
+
+        if faltan > 0:
+            logger.warning(
+                "announce.desemparejo_sospechado",
+                device_id=self._identity.device_id,
+                house_id=self._identity.paired_house_id,
+                confirmaciones=self._desemparejos_seguidos,
+                faltan=faltan,
+                msg=(
+                    "La plataforma no reconoce esta caja. Se espera confirmación "
+                    "antes de soltar la casa."
+                ),
+            )
+            return
+
+        logger.error(
+            "announce.desemparejando",
+            device_id=self._identity.device_id,
+            house_id=self._identity.paired_house_id,
+            msg=(
+                "La plataforma liberó esta caja. Bajando el túnel y borrando los "
+                "secretos de la casa anterior. La calcomanía vuelve a servir."
+            ),
+        )
+
+        borrar_secreto_de_plataforma(self._tunnel_token_path)
+        borrar_secreto_de_plataforma(self._mirror_key_path)
+
+        nueva = await self._db.unmark_device_paired()
+        self._desemparejos_seguidos = 0
+
+        if nueva is None:
+            # La base ya lo tenía limpio. Puede pasar si un intento anterior
+            # murió entre el borrado y el UPDATE: los secretos ya no están y el
+            # estado es el correcto, así que no hay nada que reparar.
+            logger.info(
+                "announce.ya_desemparejada_en_db",
+                device_id=self._identity.device_id,
+            )
+        else:
+            identidad = DeviceIdentity(**nueva)
+            self._identity = identidad
+            if self._on_paired is not None:
+                # Mismo callback que al emparejar: refresca app.state para que
+                # /api/device/identity y la calcomanía dejen de mentir sin
+                # necesidad de reiniciar.
+                self._on_paired(identidad)
+            logger.info(
+                "announce.desemparejada",
+                device_id=identidad.device_id,
+                msg="Caja liberada. Vuelve a anunciarse cada 120s, lista para activar.",
+            )
+
+        if self._on_unpaired is not None:
+            try:
+                await self._on_unpaired(self._identity)
+            except Exception as exc:
+                # Que no se pueda bajar cloudflared no puede impedir el resto:
+                # sin token, el túnel se cae solo en cuanto Cloudflare lo cierre.
+                logger.error(
+                    "announce.on_unpaired_fallo",
+                    exc=str(exc),
+                    msg="No se pudo bajar el túnel. Sin token ya no va a poder reconectar.",
+                )
+
     async def _handle_ok(self, body: dict[str, Any]) -> bool:
         """
         Procesa una respuesta 200 del endpoint de anuncio.
@@ -646,8 +795,23 @@ class AnnounceClient:
         )
 
         if not paired or not house_id:
-            # Caja viva pero todavía no reclamada. Nada que persistir.
+            # Caja viva pero sin casa del lado de la plataforma. Hay dos formas
+            # muy distintas de llegar acá y confundirlas sería grave:
+            #
+            #   · nunca se activó → estado normal del taller, nada que hacer.
+            #   · SÍ estaba activada y la plataforma la liberó → hay que soltar
+            #     la casa: bajar el túnel y borrar los secretos que emitió.
+            #
+            # Lo que las distingue es la identidad LOCAL, no la respuesta.
+            if self._identity.paired:
+                await self._quizas_desemparejar()
             return False
+
+        # La plataforma la reconoce: cualquier sospecha previa se cancela. Sin
+        # este reset, tres respuestas raras espaciadas por horas —con la caja
+        # sana en el medio— se sumarían hasta soltar una casa que nunca dejó de
+        # estar emparejada. Solo cuentan las CONSECUTIVAS.
+        self._desemparejos_seguidos = 0
 
         # La caja fue reclamada. Persistir en DB antes de notificar al callback:
         # si la app muere aquí, en el próximo arranque ensure_identity leerá de DB

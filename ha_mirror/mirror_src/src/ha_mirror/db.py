@@ -993,6 +993,47 @@ class Database:
             return None
         return await self.get_device_identity()
 
+    async def unmark_device_paired(self) -> dict[str, Any] | None:
+        """
+        Deshace el emparejamiento local: la caja vuelve a estar disponible.
+
+        Es el espejo exacto de `mark_device_paired` y existe porque la plataforma
+        SÍ tiene forma de liberar una caja (`POST /boxes/{id}/deactivate`) y la
+        caja no tenía ninguna de enterarse. El resultado era una caja convencida
+        de tener dueño para siempre, callada, que ninguna calcomanía podía
+        volver a activar.
+
+        Limpia también los campos del túnel: el túnel de la casa anterior ya no
+        existe del lado de Cloudflare, y dejar su hostname acá haría que la
+        calcomanía y `/api/device/identity` mintieran sobre el estado real.
+
+        NO toca `device_id` ni el par de llaves: la identidad criptográfica de la
+        caja es del hardware, no de la casa. Regenerarla obligaría a reimprimir
+        la calcomanía, que es justo lo que se quiere evitar — la que está pegada
+        tiene que seguir sirviendo.
+
+        `WHERE paired_at IS NOT NULL` es el simétrico del un-solo-uso del mark:
+        devuelve None si no había nada que deshacer, y así quien llama distingue
+        "la liberé" de "ya estaba libre" sin leer antes.
+        """
+        conn = self._require_conn()
+        async with conn.execute(
+            """
+            UPDATE device_identity
+            SET paired_at = NULL,
+                paired_house_id = NULL,
+                tunnel_provider = NULL,
+                tunnel_hostname = NULL,
+                tunnel_ready_at = NULL
+            WHERE id = 1 AND paired_at IS NOT NULL
+            """,
+        ) as cur:
+            actualizadas = cur.rowcount
+        await conn.commit()
+        if not actualizadas:
+            return None
+        return await self.get_device_identity()
+
     async def set_device_tunnel(
         self,
         *,

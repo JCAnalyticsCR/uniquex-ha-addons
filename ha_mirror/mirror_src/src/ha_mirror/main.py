@@ -360,6 +360,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 mirror_key_path=settings.platform_mirror_key_path,
                 upstream=upstream,
                 on_paired=lambda nueva: setattr(app.state, "device_identity", nueva),
+                # La caja soltó la casa: hay que bajar cloudflared. El token ya
+                # fue borrado por el propio cliente de anuncio, así que el
+                # supervisor vuelve a quedar esperando uno nuevo.
+                on_unpaired=lambda _identidad: tunnel_client.detener_por_desemparejo(),
             )
             # El tunel corre EN PARALELO al anuncio, no despues: el token puede
             # llegar en cualquier momento (cuando alguien escanee el QR) y
@@ -394,7 +398,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 if exc:
                     logger.error("announce.task_failed", exc=str(exc))
                 else:
-                    logger.info("announce.task_finished_paired")
+                    # El loop ya no termina solo: emparejada sigue con el latido
+                    # lento. Si llega acá sin excepcion es un cambio de contrato,
+                    # no el final feliz que este mensaje decia antes.
+                    logger.error(
+                        "announce.task_finished_inesperado",
+                        msg=(
+                            "El loop de anuncio terminó sin error. La caja deja "
+                            "de enterarse de cambios de la plataforma."
+                        ),
+                    )
 
             announce_task.add_done_callback(_on_announce_done)
         except Exception as exc:

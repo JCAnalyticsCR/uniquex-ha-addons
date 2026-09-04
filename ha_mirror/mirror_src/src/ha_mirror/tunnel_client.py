@@ -72,6 +72,22 @@ class TunnelClient:
         self._token_path = token_path
         self._binario = binario
         self._proc: asyncio.subprocess.Process | None = None
+        # Se levanta cuando alguien baja el túnel a propósito (des-emparejamiento).
+        # Sin esta distinción, la salida del proceso se leería como una caída:
+        # warning de alarma y backoff creciente para algo que hicimos nosotros.
+        self._parada_intencional = False
+
+    async def detener_por_desemparejo(self) -> None:
+        """
+        Baja el túnel porque esta caja dejó de tener casa.
+
+        No termina el supervisor: el loop sigue vivo sondeando, así que cuando la
+        caja se vuelva a activar y llegue un token nuevo, el túnel levanta solo.
+        Matar el task obligaría a reiniciar el add-on para volver a tener acceso
+        remoto — exactamente el trabajo manual que este arreglo elimina.
+        """
+        self._parada_intencional = True
+        await self._terminar()
 
     async def run_forever(self) -> None:
         """
@@ -111,6 +127,20 @@ class TunnelClient:
                 raise
 
             vivio = asyncio.get_running_loop().time() - arrancado
+
+            if self._parada_intencional:
+                # Lo bajamos nosotros. Ni warning ni backoff: se vuelve al
+                # sondeo del token, que ya no está, y el loop queda esperando
+                # tranquilo a que una activación nueva entregue otro.
+                self._parada_intencional = False
+                backoff = _BACKOFF_BASE
+                logger.info(
+                    "tunnel.detenido_por_desemparejo",
+                    vivio_s=round(vivio, 1),
+                    msg="La caja dejó de tener casa. Esperando una activación nueva.",
+                )
+                continue
+
             if vivio >= _SESION_SANA_S:
                 # Estuvo arriba un rato: el problema fue puntual, no de config.
                 backoff = _BACKOFF_BASE
