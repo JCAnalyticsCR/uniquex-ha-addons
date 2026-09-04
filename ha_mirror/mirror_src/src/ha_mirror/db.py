@@ -889,6 +889,39 @@ class Database:
     # existente: un schema incompleto se arrastraría para siempre.
     # -------------------------------------------------------------------------
 
+    @staticmethod
+    def _device_identity_row_to_dict(row: aiosqlite.Row) -> dict[str, Any]:
+        """
+        Fila cruda → dict con las claves EXACTAS del dataclass DeviceIdentity.
+
+        Se listan a mano en vez de hacer `dict(row)` porque la fila guarda la
+        columna `id` (siempre 1) que el dataclass no tiene: un `dict(row)` haría
+        reventar el constructor con un argumento inesperado.
+
+        🔪 Este método se perdió al unificar las dos ramas del Mirror y estuvo
+        AUSENTE en la 0.28.0, que llegó a instalarse en hardware real. El efecto:
+        `get_device_identity` lo llamaba, tiraba AttributeError, el lifespan lo
+        atrapaba con su `except Exception` y la caja arrancaba con
+        `device_identity.unavailable` — o sea, sin poder activarse nunca, pero
+        sin un solo traceback visible. Las 453 pruebas seguían en verde porque
+        ninguna ejercitaba `ensure_identity` contra una Database de verdad.
+        Ahora sí: ver `test_identidad_contra_db_real.py`.
+        """
+        return {
+            "device_id": row["device_id"],
+            "public_key": row["public_key"],
+            "hardware_id": row["hardware_id"],
+            "key_algorithm": row["key_algorithm"],
+            "created_at": row["created_at"],
+            "claim_code_version": row["claim_code_version"],
+            "paired_at": row["paired_at"],
+            "paired_house_id": row["paired_house_id"],
+            "backend_base_url": row["backend_base_url"],
+            "tunnel_provider": row["tunnel_provider"],
+            "tunnel_hostname": row["tunnel_hostname"],
+            "tunnel_ready_at": row["tunnel_ready_at"],
+        }
+
     async def get_device_identity(self) -> dict[str, Any] | None:
         """La identidad de esta caja, o None si nunca arrancó (primer boot)."""
         conn = self._require_conn()

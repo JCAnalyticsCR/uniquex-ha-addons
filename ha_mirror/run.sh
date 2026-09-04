@@ -127,19 +127,25 @@ export CAMERA_LABELS="${CAMERA_LABELS}"
 
 NIVEL="$(printf '%s' "${LOG_LEVEL}" | tr '[:upper:]' '[:lower:]')"
 
-# --- Calcomania de activacion, SOLO en modo fabrica ---
-# Va en su propio puerto (8001) que NO se publica al host: el unico que llega
-# es el ingress de Home Assistant, que ya autentico al usuario. Servirla en el
-# 8000 la dejaba legible desde cualquier punto de la red de la casa, y con el
-# codigo de activacion alcanza para quedarse con la caja.
-# Una casa artesanal no levanta esto: no tiene calcomania.
-if [ -n "${PLATFORM_BASE_URL:-}" ]; then
-  echo "[mirror] Calcomania de activacion en :8001 (solo ingress)"
-  python3 -m uvicorn ha_mirror.main:sticker_app \
-    --host 0.0.0.0 --port 8001 --log-level "${NIVEL}" &
-fi
+export LOG_LEVEL="${NIVEL}"
 
+# --- Arranque: UN proceso, hasta dos servidores ---
+#
+# La API va en el 8000 y, solo en modo fabrica, la calcomania en el 8001. El
+# 8001 NO se publica al host: el unico que llega es el ingress de Home
+# Assistant, que ya autentico al usuario. Servir la calcomania en el puerto que
+# sale a la red la dejaba legible desde cualquier punto de la casa, y con el
+# codigo de activacion alcanza para quedarse con la caja.
+#
+# 🔪 Hasta la 0.28.0 esto eran DOS PROCESOS de uvicorn, y ese era el defecto:
+# solo la app principal tiene lifespan, que es lo que puebla app.state con la
+# identidad de la caja. El proceso de la calcomania nunca lo poblaba, asi que la
+# pagina decia "todavia no tiene identidad" aunque la identidad existiera
+# perfectamente en el otro proceso — con un 200 y sin un solo traceback.
+#
+# Ahora los dos servidores corren en el mismo event loop y comparten app.state:
+# un solo lifespan, cero conexiones duplicadas a SQLite y a Home Assistant, y la
+# separacion de puertos intacta. Quien decide si levanta el 8001 es el propio
+# modulo, mirando platform_base_url. Ver ha_mirror/arranque.py.
 echo "[mirror] Arrancando → HA local (ws://supervisor/core/websocket) en :8000"
-exec python3 -m uvicorn ha_mirror.main:app \
-  --host 0.0.0.0 --port 8000 \
-  --log-level "${NIVEL}"
+exec python3 -m ha_mirror.arranque

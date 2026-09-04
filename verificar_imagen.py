@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from pathlib import Path
 
 # El shebang y el resto de run.sh tienen que terminar en LF. Con CRLF el kernel
 # busca un interprete llamado "/usr/bin/bashi\r" y el contenedor muere con
@@ -236,6 +237,35 @@ def verificar(imagen: str, plataforma: str) -> list[str]:
             f"y modo_fabrica dio {modo_fabrica}. El interruptor maestro esta al reves."
         )
     ok.append("sin platform_base_url arranca en modo artesanal")
+
+    # --- 4. La calcomanía RENDERIZA, no solo responde ---
+    #
+    # El punto ciego que dejó salir la 0.28.0. Los chequeos de arriba —"la app se
+    # construye", "los endpoints existen por nombre"— pasaban en verde mientras
+    # la calcomanía estaba rota, porque lo que fallaba era lo que `/` contestaba,
+    # no que `/` existiera. Y como la página de fallo devuelve 200, un chequeo de
+    # código de estado tampoco habría servido.
+    print("Revisando que la calcomania renderice...", flush=True)
+    guion = str((Path(__file__).parent / "prueba_calcomania.py").resolve())
+    salida_calco = _correr([
+        "docker", "run", "--rm", "--platform", plataforma,
+        "-v", f"{guion}:/tmp/prueba_calcomania.py:ro",
+        *[x for c, v in {
+            **ENTORNO_DE_MENTIRA,
+            # Modo fábrica: sin esto no hay identidad ni calcomanía que probar.
+            "PLATFORM_BASE_URL": "https://plataforma-que-no-existe.example.com",
+            # Todo lo que escribe va a /tmp del contenedor, que muere con él.
+            "MIRROR_DB_PATH": "/tmp/prueba.sqlite3",
+            "DEVICE_KEY_PATH": "/tmp/prueba_device_identity.key",
+        }.items() for x in ("-e", f"{c}={v}")],
+        "--entrypoint", "/usr/bin/env", imagen,
+        "python3", "/tmp/prueba_calcomania.py",
+    ])
+    for linea in salida_calco.strip().splitlines():
+        if linea.startswith("OK  "):
+            ok.append(linea[4:])
+        else:
+            print(f"    {linea}")
 
     # No es una condicion de fallo, pero conviene tenerlo escrito en el log: las
     # pruebas automaticas corren contra la version de FastAPI del entorno de
