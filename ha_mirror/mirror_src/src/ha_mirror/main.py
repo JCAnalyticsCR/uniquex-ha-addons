@@ -33,6 +33,7 @@ from starlette.responses import Response
 
 from ha_mirror.api.areas import router as areas_router
 from ha_mirror.api.camera_media import router as camera_media_router
+from ha_mirror.api.canales import router as canales_router
 from ha_mirror.api.camera_ws import router as camera_ws_router
 from ha_mirror.api.costumbres import router as costumbres_router
 from ha_mirror.api.entities import router as entities_router
@@ -505,6 +506,9 @@ def create_app() -> FastAPI:
     # Matter: comisionar con el codigo impreso del aparato. Puerta dedicada al
     # comando `matter/commission`, NO un pasamanos de comandos WS.
     app.include_router(matter_router)
+    # Sondeo de canales del NVR: averigua si hay camaras conectadas que la app
+    # no muestra. Solo acepta NUMEROS de canal — la URL la arma el servidor.
+    app.include_router(canales_router)
     app.include_router(preferences_router)
     app.include_router(onboarding_router)
     # Emisor de tickets de WebSocket (0.21.0). Lo llama el frontend desde el
