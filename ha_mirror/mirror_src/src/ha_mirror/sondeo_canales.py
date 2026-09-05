@@ -240,6 +240,28 @@ class SondeoCanales:
 
         return salida, None
 
+    async def registrar_permanente(self, nombre: str, canal: int) -> bool:
+        """
+        Deja un stream registrado en go2rtc para un canal, con nombre propio.
+
+        Se usa al dar de alta una cámara Y cada vez que arranca el Mirror: los
+        streams que se agregan por API viven en la MEMORIA de go2rtc, así que un
+        reinicio suyo se los lleva. Volver a registrarlos al arrancar es más
+        barato y más honesto que confiar en que persistan.
+
+        La URL se deriva acá, igual que en el sondeo: el que llama pasa un
+        número de canal, nunca una dirección.
+        """
+        referencia = await self._url_de_referencia()
+        if referencia is None:
+            return False
+        derivada = _cambiar_canal(referencia, canal)
+        if derivada is None:
+            return False
+        await self._registrar(nombre, derivada)
+        logger.info("camara.stream_registrado", stream=nombre, canal=canal)
+        return True
+
     async def limpiar_huerfanos(self) -> int:
         """
         Borra streams `_sondeo_*` que hayan quedado de un sondeo interrumpido.

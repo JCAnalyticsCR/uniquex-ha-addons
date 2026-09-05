@@ -33,15 +33,15 @@ from starlette.responses import Response
 
 from ha_mirror.api.areas import router as areas_router
 from ha_mirror.api.camera_media import router as camera_media_router
-from ha_mirror.api.canales import router as canales_router
 from ha_mirror.api.camera_ws import router as camera_ws_router
+from ha_mirror.api.canales import router as canales_router
 from ha_mirror.api.costumbres import router as costumbres_router
 from ha_mirror.api.entities import router as entities_router
 from ha_mirror.api.health import router as health_router
 from ha_mirror.api.iframe_token import router as iframe_router
+from ha_mirror.api.matter import router as matter_router
 from ha_mirror.api.onboarding import router as onboarding_router
 from ha_mirror.api.preferences import router as preferences_router
-from ha_mirror.api.matter import router as matter_router
 from ha_mirror.api.pronostico import router as pronostico_router
 from ha_mirror.api.scenes import router as scenes_router
 from ha_mirror.api.service import router as service_router
@@ -256,6 +256,32 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         camera_streams=settings.camera_streams,
     )
     await camera_media.start()
+
+    # 🔪 LAS CAMARAS DADAS DE ALTA VIVEN EN LA MEMORIA DE go2rtc.
+    #
+    # Se registran por su API, asi que un reinicio de go2rtc —o de la cajita—
+    # se las lleva. La base del Mirror es la fuente de verdad; esto las vuelve a
+    # poner cada vez que arranca. Sin este bloque, una camara agregada desde la
+    # app desapareceria sola en el proximo corte de luz, y nadie sabria por que.
+    #
+    # Si go2rtc no contesta, se sigue igual: es preferible arrancar sin las
+    # camaras propias que no arrancar. Vuelven al proximo reinicio.
+    try:
+        from ha_mirror.sondeo_canales import SondeoCanales
+
+        propias = await db.listar_camaras_propias(getattr(settings, "tenant_id", 1))
+        if propias and settings.go2rtc_base_url:
+            registrador = SondeoCanales(
+                base_url=camera_media._go2rtc_base_url,  # noqa: SLF001
+                auth=camera_media._go2rtc_auth,  # noqa: SLF001
+                session=camera_media._require_session(),  # noqa: SLF001
+            )
+            for c in propias:
+                camera_media.agregar_stream(c["entity_id"], c["stream_name"])
+                await registrador.registrar_permanente(c["stream_name"], c["canal"])
+            logger.info("camaras.propias_restauradas", cuantas=len(propias))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("camaras.propias_no_restauradas", error=str(exc)[:160])
 
     # Borrar el token de la variable local lo antes posible
     # (Python no garantiza wipe de memoria, pero reducimos ventana de exposición)

@@ -484,6 +484,19 @@ class CameraMediaClient:
     def has_stream(self, entity_id: str) -> bool:
         return self.webrtc_enabled and entity_id in self._camera_streams
 
+    def agregar_stream(self, entity_id: str, stream_name: str) -> None:
+        """
+        Suma una cámara al allowlist EN CALIENTE, sin reiniciar el add-on.
+
+        El allowlist es lo que decide qué streams puede pedir el cliente, así
+        que esto solo lo llama el alta —que ya validó el canal contra el NVR— y
+        el arranque, al releer las cámaras propias de la base.
+        """
+        self._camera_streams[entity_id] = stream_name
+
+    def quitar_stream(self, entity_id: str) -> None:
+        self._camera_streams.pop(entity_id, None)
+
     def list_stream_entities(self) -> list[str]:
         """entity_ids con stream go2rtc mapeado (allowlist), en orden estable."""
         if not self.webrtc_enabled:

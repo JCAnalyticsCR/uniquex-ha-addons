@@ -150,6 +150,30 @@ CREATE TABLE IF NOT EXISTS custom_rooms (
     PRIMARY KEY (tenant_id, room_id)
 );
 
+-- Cámaras sumadas desde la app, además de las que trae la configuración del
+-- add-on (`camera_stream_map`).
+--
+-- POR QUÉ ACÁ Y NO EN LA CONFIGURACIÓN DEL ADD-ON: cambiar una opción del
+-- add-on exige permisos de Supervisor, que el token de la app no tiene. Y
+-- aunque los tuviera, dejar que el cliente edite la configuración de un add-on
+-- es darle una llave que no necesita: por acá solo puede sumar canales del NVR
+-- que ya está configurado.
+--
+-- 🔪 EL `canal` SE GUARDA PORQUE LA URL NO. La dirección RTSP lleva usuario y
+-- contraseña del NVR; se vuelve a derivar de un stream que funcione cada vez
+-- que hace falta. Así la credencial vive en un solo lugar (la configuración de
+-- go2rtc) y no se copia a una segunda base que después habría que proteger,
+-- respaldar y borrar igual de bien.
+CREATE TABLE IF NOT EXISTS custom_cameras (
+    tenant_id   INTEGER NOT NULL DEFAULT 1 REFERENCES tenants(id),
+    entity_id   TEXT NOT NULL,       -- "camera.nvr_c21_bodega"
+    stream_name TEXT NOT NULL,       -- nombre del stream en go2rtc
+    label       TEXT NOT NULL,       -- "Bodega de atrás"
+    canal       INTEGER NOT NULL,
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, entity_id)
+);
+
 -- Registro de entidades conocidas para detección de dispositivos nuevos.
 -- acknowledged_at NULL = pendiente de revisión por el cliente.
 -- Alembic y CREATE TABLE IF NOT EXISTS NO agrega columnas a una tabla que ya
@@ -646,6 +670,55 @@ class Database:
             borradas = cur.rowcount
         await conn.commit()
         return bool(borradas)
+
+    # -------------------------------------------------------------------------
+    # Cámaras sumadas desde la app
+    # -------------------------------------------------------------------------
+
+    async def listar_camaras_propias(self, tenant_id: int = 1) -> list[dict[str, Any]]:
+        """Las cámaras que sumó el cliente, además de las del add-on."""
+        conn = self._require_conn()
+        async with conn.execute(
+            "SELECT entity_id, stream_name, label, canal, created_at "
+            "FROM custom_cameras WHERE tenant_id = ? ORDER BY canal",
+            (tenant_id,),
+        ) as cur:
+            filas = await cur.fetchall()
+        return [dict(f) for f in filas]
+
+    async def guardar_camara_propia(
+        self,
+        *,
+        entity_id: str,
+        stream_name: str,
+        label: str,
+        canal: int,
+        tenant_id: int = 1,
+    ) -> None:
+        conn = self._require_conn()
+        await conn.execute(
+            "INSERT OR REPLACE INTO custom_cameras "
+            "(tenant_id, entity_id, stream_name, label, canal, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                tenant_id,
+                entity_id,
+                stream_name,
+                label,
+                canal,
+                datetime.now(UTC).isoformat(),
+            ),
+        )
+        await conn.commit()
+
+    async def borrar_camara_propia(self, entity_id: str, tenant_id: int = 1) -> bool:
+        conn = self._require_conn()
+        cur = await conn.execute(
+            "DELETE FROM custom_cameras WHERE tenant_id = ? AND entity_id = ?",
+            (tenant_id, entity_id),
+        )
+        await conn.commit()
+        return bool(cur.rowcount)
 
     # -------------------------------------------------------------------------
     # Custom rooms (onboarding: habitaciones propias del cliente)

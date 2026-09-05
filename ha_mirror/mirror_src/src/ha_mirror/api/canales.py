@@ -27,8 +27,10 @@ misma razón medida: Cloudflare corta cualquier respuesta que pase de 100 s.
 from __future__ import annotations
 
 import asyncio
+import re
 import secrets
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -206,3 +208,127 @@ async def ver_sondeo(trabajo: str, _: None = Depends(require_api_key)) -> Avance
         ],
         motivo=t.motivo,
     )
+
+
+# ── El alta ───────────────────────────────────────────────────────────────────
+#
+# 🔪 EL CLIENTE PASA UN NÚMERO Y UN NOMBRE. NADA MÁS.
+#
+# Ni URL, ni host, ni usuario. La dirección se deriva de una cámara que ya
+# funciona, del lado servidor — misma regla que el sondeo, y por el mismo
+# antecedente: acá ya se coló una vez un `src` del cliente en una URL de go2rtc.
+#
+# Y antes de guardar nada, se COMPRUEBA que ese canal tenga cámara. Dar de alta
+# un canal vacío no falla: crea un recuadro negro permanente en la pantalla del
+# dueño, que es peor que un error, porque nadie sabe si es la cámara o la app.
+
+
+class Alta(BaseModel):
+    canal: int = Field(ge=CANAL_MIN, le=CANAL_MAX)
+    nombre: str = Field(min_length=2, max_length=40)
+
+
+class Camara(BaseModel):
+    entity_id: str
+    label: str
+    canal: int
+
+
+def _slug(texto: str) -> str:
+    """`Bodega de atrás` → `bodega_de_atras`. Para armar el entity_id."""
+    limpio = unicodedata.normalize("NFD", texto).encode("ascii", "ignore").decode()
+    limpio = re.sub(r"[^a-zA-Z0-9]+", "_", limpio).strip("_").lower()
+    return limpio[:28] or "camara"
+
+
+@router.get("/api/cameras/alta", response_model=list[Camara], summary="Cámaras sumadas desde la app")
+async def listar_altas(request: Request, _: None = Depends(require_api_key)) -> list[Camara]:
+    db = request.app.state.db
+    tenant = int(getattr(request.app.state.settings, "tenant_id", 1))
+    return [
+        Camara(entity_id=c["entity_id"], label=c["label"], canal=c["canal"])
+        for c in await db.listar_camaras_propias(tenant)
+    ]
+
+
+@router.post(
+    "/api/cameras/alta",
+    response_model=Camara,
+    status_code=status.HTTP_201_CREATED,
+    summary="Suma una cámara de un canal del NVR",
+)
+async def dar_de_alta(
+    request: Request, cuerpo: Alta, _: None = Depends(require_api_key)
+) -> Camara:
+    cliente = getattr(request.app.state, "camera_media", None)
+    if cliente is None or not getattr(cliente, "webrtc_enabled", False):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Esta casa no tiene go2rtc configurado.",
+        )
+
+    db = request.app.state.db
+    tenant = int(getattr(request.app.state.settings, "tenant_id", 1))
+
+    propias = await db.listar_camaras_propias(tenant)
+    ya = [c for c in propias if c["canal"] == cuerpo.canal]
+    if ya:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"El canal {cuerpo.canal} ya está agregado como «{ya[0]['label']}».",
+        )
+
+    sondeo = SondeoCanales(
+        base_url=cliente._go2rtc_base_url,  # noqa: SLF001
+        auth=cliente._go2rtc_auth,  # noqa: SLF001
+        session=cliente._require_session(),  # noqa: SLF001
+    )
+
+    # Comprobar ANTES de guardar. Un canal vacío da un recuadro negro para
+    # siempre, y nadie sabría si el problema es la cámara o la app.
+    resultados, motivo = await sondeo.sondear([cuerpo.canal])
+    if motivo is not None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=motivo)
+    if not resultados or resultados[0].estado != "con_camara":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"El canal {cuerpo.canal} no está dando video. Revisá que la cámara "
+                "esté conectada y configurada en el NVR antes de agregarla acá."
+            ),
+        )
+
+    stream = f"NVR_CH{cuerpo.canal:02d}_uq"
+    entity_id = f"camera.nvr_c{cuerpo.canal:02d}_{_slug(cuerpo.nombre)}"
+    if not await sondeo.registrar_permanente(stream, cuerpo.canal):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="No se pudo registrar el stream en go2rtc.",
+        )
+
+    await db.guardar_camara_propia(
+        entity_id=entity_id, stream_name=stream,
+        label=cuerpo.nombre.strip(), canal=cuerpo.canal, tenant_id=tenant,
+    )
+    cliente.agregar_stream(entity_id, stream)
+    logger.info("camara.alta", canal=cuerpo.canal, entity_id=entity_id)
+    return Camara(entity_id=entity_id, label=cuerpo.nombre.strip(), canal=cuerpo.canal)
+
+
+@router.delete(
+    "/api/cameras/alta/{entity_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Quita una cámara sumada desde la app",
+)
+async def quitar_alta(
+    entity_id: str, request: Request, _: None = Depends(require_api_key)
+) -> None:
+    db = request.app.state.db
+    tenant = int(getattr(request.app.state.settings, "tenant_id", 1))
+    if not await db.borrar_camara_propia(entity_id, tenant):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No existe.")
+    cliente = getattr(request.app.state, "camera_media", None)
+    if cliente is not None:
+        # Sale del allowlist en caliente: deja de poder pedirse de inmediato.
+        cliente.quitar_stream(entity_id)
+    logger.info("camara.baja", entity_id=entity_id)
