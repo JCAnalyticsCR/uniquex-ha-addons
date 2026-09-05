@@ -17,13 +17,21 @@ import asyncio
 import re
 import time
 import unicodedata
+from collections.abc import Callable
 from typing import Any
 
 import structlog
 
 from ha_mirror.db import Database
 from ha_mirror.errors import HaProtocolError, UpstreamNotReadyError
-from ha_mirror.onboarding_familias import enmascarar_titulo, es_recargable, familia_de
+from ha_mirror.onboarding_familias import (
+    FAMILIAS,
+    enmascarar_titulo,
+    es_recargable,
+    familia_de,
+    nombre_de_marca,
+    puede_darse_de_alta,
+)
 
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
 
@@ -51,6 +59,10 @@ class OnboardingEntryNotFoundError(OnboardingError):
 
 class OnboardingForbiddenDomainError(OnboardingError):
     """Dominio en deny-list o no elegible — 403."""
+
+
+class OnboardingFlowNoEncontradoError(OnboardingError):
+    """El formulario de alta no existe o ya terminó — 404."""
 
 
 # ---------------------------------------------------------------------------
@@ -102,11 +114,24 @@ class OnboardingService:
         upstream: Any,
         db: Database,
         mirror_version: str,
+        ha_http_url: str | None = None,
+        ha_token_provider: Callable[[], str] | None = None,
     ) -> None:
         self._store = store
         self._upstream = upstream
         self._db = db
         self._mirror_version = mirror_version
+        # Solo para el asistente de alta, que es REST. Opcionales para no romper
+        # a quien ya construye el servicio con cuatro argumentos: sin ellos el
+        # alta se apaga sola y el resto del modulo sigue igual.
+        #
+        # 🔪 El token se pide por FUNCION, no se guarda. `main.py` borra su copia
+        # local apenas termina de usarla, a proposito, para achicar la ventana en
+        # que anda dando vueltas por memoria. Guardarlo aca lo tendria vivo todo
+        # el tiempo que viva el add-on, y eso seria deshacer esa decision de
+        # costado. Con un proveedor, existe solo durante la llamada.
+        self._ha_http_url = ha_http_url
+        self._ha_token_provider = ha_token_provider
         # Lock asyncio para single-flight en rescan
         self._rescan_lock = asyncio.Lock()
         # Caché de capabilities: tenant_id → (monotonic_timestamp, result_dict)
@@ -166,6 +191,16 @@ class OnboardingService:
                     "overrides": True,
                     "pending": True,
                     "rescan": any(s["rescan_supported"] for s in systems),
+                    # Si la sonda admin funciono, `config_entries/flow/progress`
+                    # tambien va a funcionar: los dos son comandos admin del
+                    # mismo WebSocket. Se declara aca para que la app pueda
+                    # esconder el aviso entero en las casas donde no aplica, sin
+                    # tener que pedir la lista para descubrir que no hay lista.
+                    "encontrados": True,
+                    # El alta necesita ADEMAS la via REST, que depende de que el
+                    # add-on tenga la URL y el token. Sin eso el asistente no se
+                    # ofrece, aunque el WebSocket admin funcione.
+                    "alta": self._flow_client() is not None,
                 },
                 "systems": systems,
             }
@@ -187,7 +222,13 @@ class OnboardingService:
         return {
             "admin": False,
             "mirror_version": self._mirror_version,
-            "features": {"overrides": True, "pending": True, "rescan": False},
+            "features": {
+                "overrides": True,
+                "pending": True,
+                "rescan": False,
+                "encontrados": False,
+                "alta": False,
+            },
             "systems": [],
         }
 
@@ -450,6 +491,413 @@ class OnboardingService:
         """Marca entidades como revisadas. Devuelve cuántas fueron marcadas."""
         n = await self._db.acknowledge_entities(entity_ids, tenant_id)
         return {"acknowledged": n}
+
+    # -------------------------------------------------------------------------
+    # Encontrados (lo que HA ya descubrió y nadie confirmó)
+    # -------------------------------------------------------------------------
+
+    async def encontrados(self, tenant_id: int = 1) -> dict[str, Any]:
+        """
+        Aparatos que Home Assistant ya detectó y que están esperando a alguien.
+
+        POR QUÉ ESTO NO ES LO MISMO QUE `pending`
+        -----------------------------------------
+        `pending` son entidades que YA existen en la casa y solo les falta
+        nombre y habitación. Esto son cosas que **todavía no existen en la app**:
+        HA las vio en la red y dejó un formulario a medio llenar esperando que
+        alguien lo conteste. Mientras nadie lo conteste, el aparato no existe.
+
+        Y ahí está el problema que esto viene a resolver: **ese formulario solo
+        se ve entrando a Home Assistant**. En la casa de referencia había cuatro
+        esperando, y uno de ellos era un `reauth` de Overkiz — las persianas
+        Somfy llevaban MESES sin funcionar y HA tenía la pregunta hecha desde el
+        primer día. Nadie la vio porque nadie abre HA. Ese es exactamente el
+        agujero que la app tapa.
+
+        LOS DOS TONOS
+        -------------
+        La misma llamada devuelve dos cosas que no se parecen en nada:
+
+          · `reauth` / `reconfigure` → algo QUE FUNCIONABA se rompió. Es una
+            falla y hay que decirlo así.
+          · `zeroconf` / `dhcp` / `ssdp` / `usb` / `bluetooth` → apareció algo
+            nuevo en la red. Es una oferta, sin urgencia.
+
+        Se devuelve `es_falla` ya resuelto para que la app no tenga que conocer
+        los nombres internos de HA.
+
+        Degrada igual que `capabilities`: si el token no es admin o la casa está
+        caída, devuelve la lista vacía y `disponible: False`. Nunca revienta —
+        esto se pinta en una pantalla que el cliente abre todos los días.
+        """
+        try:
+            resp = await self._upstream.send_command(
+                {"type": "config_entries/flow/progress"}, timeout=10.0
+            )
+        except UpstreamNotReadyError:
+            logger.debug("onboarding.encontrados_upstream_down")
+            return {"disponible": False, "encontrados": []}
+        except HaProtocolError as exc:
+            if "unauthorized" in str(exc).lower():
+                logger.info("onboarding.encontrados_unauthorized")
+            else:
+                logger.warning(
+                    "onboarding.encontrados_protocol_error",
+                    exc_type=type(exc).__name__,
+                )
+            return {"disponible": False, "encontrados": []}
+        except Exception:
+            logger.warning("onboarding.encontrados_unexpected_error")
+            return {"disponible": False, "encontrados": []}
+
+        flows: list[dict[str, Any]] = resp.get("result") or []
+        salida = [
+            item
+            for item in (self._parsear_flow(f) for f in flows)
+            if item is not None
+        ]
+
+        logger.info(
+            "onboarding.encontrados_ok",
+            total=len(flows),
+            visibles=len(salida),
+            fallas=sum(1 for s in salida if s["es_falla"]),
+        )
+        return {"disponible": True, "encontrados": salida}
+
+    # Orígenes que significan "esto ANTES funcionaba y ahora no".
+    _ORIGENES_DE_FALLA = frozenset({"reauth", "reconfigure"})
+
+    def _parsear_flow(self, flow: dict[str, Any]) -> dict[str, Any] | None:
+        """
+        Un flow crudo de HA → lo que la app necesita. None si no se debe mostrar.
+
+        Se filtra por la MISMA deny-list del rescan. Un flow de `hassio` o de
+        `update` no es un aparato de la casa: es administración del sistema, y
+        eso sigue siendo terreno nuestro y no del cliente.
+        """
+        handler = flow.get("handler") or ""
+        if not handler or not es_recargable(handler):
+            return None
+
+        flow_id = flow.get("flow_id")
+        if not flow_id:
+            return None
+
+        contexto = flow.get("context") or {}
+        origen = str(contexto.get("source") or "desconocido")
+        family, family_label = familia_de(handler, handler)
+
+        return {
+            "flow_id": flow_id,
+            "handler": handler,
+            "family": family,
+            "family_label": family_label,
+            "origen": origen,
+            "es_falla": origen in self._ORIGENES_DE_FALLA,
+            "paso": flow.get("step_id"),
+            "nombre": self._nombre_del_flow(contexto, family_label),
+        }
+
+    @staticmethod
+    def _nombre_del_flow(contexto: dict[str, Any], respaldo: str) -> str:
+        """
+        Un nombre legible para el aparato encontrado.
+
+        HA deja pistas en `title_placeholders`, pero son distintas en cada
+        integración: `name`, `device`, `host`, `gateway_id`… Se prueban en orden
+        de cuán humano es cada una.
+
+        🔪 Va enmascarado. `title_placeholders` viene de HA y **puede traer datos
+        de un tercero** — el correo del instalador ya se filtró una vez por esta
+        misma vía. La regla que quedó: antes de pintar algo que vino de HA,
+        preguntarse de quién es.
+        """
+        ph = contexto.get("title_placeholders") or {}
+        if isinstance(ph, dict):
+            for clave in ("name", "device", "title", "model", "host", "gateway_id"):
+                valor = ph.get(clave)
+                if isinstance(valor, str) and valor.strip():
+                    return enmascarar_titulo(valor.strip())
+        return respaldo
+
+
+    # -------------------------------------------------------------------------
+    # Alta de dispositivos (el asistente)
+    # -------------------------------------------------------------------------
+
+    async def marcas_de_alta(self) -> dict[str, Any]:
+        """
+        Qué se puede dar de alta desde la app, agrupado por familia.
+
+        Es el cruce de tres cosas:
+          1. lo que HA sabe dar de alta en ESTA casa (728 dominios medidos en la
+             casa de referencia),
+          2. la lista negra —lo que NO es un aparato de la casa: sistema del
+             gateway, descubrimiento, helpers de HA—,
+          3. y el nombre en español de las familias que conocemos; el resto sale
+             con su nombre de dominio presentable.
+
+        El cruce con (1) importa: ofrecer una marca que esa casa no soporta es
+        prometer algo que va a fallar recién cuando la persona ya eligió.
+
+        Nunca lanza: sin admin o con la casa caída devuelve `disponible:false` y
+        la app esconde el botón.
+        """
+        cliente = self._flow_client()
+        if cliente is None:
+            return {"disponible": False, "familias": []}
+
+        try:
+            soportados = set(await cliente.marcas_disponibles())
+        except (UpstreamNotReadyError, HaProtocolError):
+            logger.info("onboarding.alta_marcas_no_disponible")
+            return {"disponible": False, "familias": []}
+        except Exception:
+            logger.warning("onboarding.alta_marcas_error_inesperado")
+            return {"disponible": False, "familias": []}
+
+        por_familia: dict[str, dict[str, Any]] = {}
+        for dominio in sorted(soportados):
+            if not puede_darse_de_alta(dominio):
+                continue
+            family, family_label = familia_de(dominio, dominio)
+            grupo = por_familia.setdefault(
+                family, {"family": family, "family_label": family_label, "marcas": []}
+            )
+            # El label del GRUPO es la familia; el de la marca es la marca. Con
+            # la lista blanca los dos eran lo mismo porque cada familia tenía
+            # una marca conocida. Con 728 dominios cayendo en "otros", repetir
+            # el label de la familia en cada fila dejaría una lista de cientos
+            # de entradas idénticas e inservible.
+            conocida = FAMILIAS.get(dominio)
+            grupo["marcas"].append(
+                {
+                    "handler": dominio,
+                    "label": conocida[1] if conocida else nombre_de_marca(dominio),
+                }
+            )
+
+        familias = sorted(por_familia.values(), key=lambda g: g["family_label"])
+        logger.info(
+            "onboarding.alta_marcas_ok",
+            soportados=len(soportados),
+            ofrecidos=sum(len(g["marcas"]) for g in familias),
+        )
+        return {"disponible": True, "familias": familias}
+
+    async def iniciar_alta(self, handler: str) -> dict[str, Any]:
+        """
+        Arranca el formulario de una marca.
+
+        🔪 EL CANDADO SE APLICA ACÁ, antes de tocar HA. El `handler` viene del
+        navegador, así que son dos preguntas distintas y hacen falta las dos:
+
+          1. ¿Es un aparato de la casa? — la lista negra. Bloquea el sistema del
+             gateway (supervisor, backups, HACS) y la infraestructura interna.
+          2. ¿EXISTE de verdad en esta casa? — se cruza con `flow_handlers`, o
+             sea con lo que HA dice que sabe dar de alta acá.
+
+        La (2) reemplaza a la lista blanca de 30 marcas que había antes. Es
+        mejor candado y a la vez mucha más cobertura: el permiso ya no sale de
+        una lista escrita a mano —que dejaba afuera el 96% del catálogo y había
+        que ampliar a mano por cada cliente que compraba algo— sino del propio
+        Home Assistant. Lo que HA no sabe hacer, no se ofrece; lo que sabe y es
+        un aparato, sí.
+        """
+        if not puede_darse_de_alta(handler):
+            raise OnboardingForbiddenDomainError(
+                f"La marca {handler!r} no se puede dar de alta desde la app"
+            )
+        cliente = self._flow_client()
+        if cliente is None:
+            raise OnboardingAdminRequiredError("Se requieren permisos admin en HA")
+
+        # Se pregunta ANTES de arrancar nada. Un dominio inventado que llegara a
+        # HA daría un error feo y un formulario colgado a medio abrir.
+        try:
+            soportados = set(await cliente.marcas_disponibles())
+        except (UpstreamNotReadyError, HaProtocolError):
+            raise
+        if handler not in soportados:
+            logger.warning("onboarding.alta_handler_inexistente", handler=handler)
+            raise OnboardingForbiddenDomainError(
+                f"Esta casa no sabe dar de alta {handler!r}"
+            )
+
+        crudo = await cliente.iniciar(handler)
+        logger.info("onboarding.alta_iniciada", handler=handler, tipo=crudo.get("type"))
+        return self._paso_limpio(crudo)
+
+    async def avanzar_alta(self, flow_id: str, datos: dict[str, Any]) -> dict[str, Any]:
+        """
+        Contesta un paso del formulario.
+
+        🔪 SEGUNDA VUELTA DE LA LISTA BLANCA, y hace falta.
+
+        Un `flow_id` también viene del navegador. Sin revisar de quién es, la
+        app dejaría avanzar CUALQUIER formulario abierto en HA —incluido uno del
+        Supervisor— con solo adivinar o conocer su id. Así que antes de mandar
+        nada se busca el flow entre los que están en curso y se comprueba que su
+        marca esté permitida.
+
+        La comprobación se hace contra la lista de flows en curso (WebSocket, de
+        solo lectura) y no contra un registro nuestro, a propósito: los
+        descubrimientos de HA —el reauth de las persianas, por ejemplo— no los
+        inició la app, y aun así tienen que poder continuarse desde acá.
+
+        `datos` es lo que escribió la persona. Pasa de largo: no se loguea, no se
+        guarda, no se cachea.
+        """
+        await self._exigir_flow_permitido(flow_id)
+        cliente = self._flow_client()
+        if cliente is None:
+            raise OnboardingAdminRequiredError("Se requieren permisos admin en HA")
+
+        crudo = await cliente.avanzar(flow_id, datos)
+        # Se loguea el TIPO de resultado, nunca el contenido.
+        logger.info("onboarding.alta_avanzada", tipo=crudo.get("type"))
+        return self._paso_limpio(crudo)
+
+    async def cancelar_alta(self, flow_id: str) -> None:
+        """Abandona un formulario. Misma comprobación que avanzar."""
+        await self._exigir_flow_permitido(flow_id)
+        cliente = self._flow_client()
+        if cliente is None:
+            raise OnboardingAdminRequiredError("Se requieren permisos admin en HA")
+        await cliente.cancelar(flow_id)
+        logger.info("onboarding.alta_cancelada")
+
+    # --- Helpers del alta ----------------------------------------------------
+
+    def _flow_client(self) -> Any:
+        """
+        El cliente REST, o None si esta casa no puede usarlo.
+
+        Se construye por llamada y no en el constructor porque depende del token,
+        y porque así una casa sin admin no arrastra un objeto que no sirve.
+        """
+        if self._ha_http_url is None or self._ha_token_provider is None:
+            return None
+        try:
+            token = self._ha_token_provider()
+        except Exception:
+            logger.warning("onboarding.alta_sin_token")
+            return None
+        if not token:
+            return None
+
+        from ha_mirror.ha_flow_client import HaFlowClient
+
+        return HaFlowClient(self._ha_http_url, token)
+
+    async def _exigir_flow_permitido(self, flow_id: str) -> None:
+        """Revienta si el flow no existe o si su marca no está permitida."""
+        try:
+            resp = await self._upstream.send_command(
+                {"type": "config_entries/flow/progress"}, timeout=10.0
+            )
+        except UpstreamNotReadyError:
+            raise
+        except HaProtocolError as exc:
+            if "unauthorized" in str(exc).lower():
+                raise OnboardingAdminRequiredError("Se requieren permisos admin en HA") from exc
+            raise
+
+        for f in resp.get("result") or []:
+            if f.get("flow_id") == flow_id:
+                handler = str(f.get("handler") or "")
+                if not puede_darse_de_alta(handler):
+                    logger.warning(
+                        "onboarding.alta_handler_prohibido", handler=handler
+                    )
+                    raise OnboardingForbiddenDomainError(
+                        f"El formulario pertenece a {handler!r}, que no se maneja desde la app"
+                    )
+                return
+        raise OnboardingFlowNoEncontradoError(f"Formulario {flow_id!r} desconocido")
+
+    def _paso_limpio(self, crudo: dict[str, Any]) -> dict[str, Any]:
+        """
+        La respuesta de HA, filtrada a lo que la app necesita.
+
+        Se copian campos uno por uno en vez de reenviar el diccionario entero.
+        HA devuelve tambien `result` cuando el alta termina —la config entry
+        recien creada, que puede traer adentro lo que la persona escribio,
+        contraseñas incluidas— y eso no tiene por que llegar al navegador.
+
+        `title` y los placeholders van enmascarados: HA los rellena con datos del
+        aparato y del sistema, y ya sabemos que por ahi puede salir el correo de
+        un tercero.
+        """
+        tipo = str(crudo.get("type") or "")
+        salida: dict[str, Any] = {
+            "tipo": tipo,
+            "flow_id": crudo.get("flow_id"),
+            "handler": crudo.get("handler"),
+            "paso": crudo.get("step_id"),
+        }
+
+        if tipo == "form":
+            salida["campos"] = self._campos_limpios(crudo.get("data_schema"))
+            salida["errores"] = crudo.get("errors") or {}
+        elif tipo == "create_entry":
+            # Solo el nombre. NUNCA `result`.
+            salida["titulo"] = enmascarar_titulo(str(crudo.get("title") or ""))
+        elif tipo == "abort":
+            salida["razon"] = str(crudo.get("reason") or "")
+        elif tipo in ("external_step", "external_step_done", "progress", "show_progress"):
+            # Estos son los que NO se pueden completar desde la app: mandan a
+            # abrir una ventana de la nube del fabricante o esperan a algo de
+            # afuera. Se declaran tal cual para que la app lo diga sin inventar.
+            salida["paso"] = crudo.get("step_id")
+
+        ph = crudo.get("description_placeholders")
+        if isinstance(ph, dict) and ph:
+            salida["textos"] = {
+                str(k): enmascarar_titulo(str(v)) for k, v in ph.items()
+            }
+        return salida
+
+    @staticmethod
+    def _campos_limpios(schema: Any) -> list[dict[str, Any]]:
+        """
+        El `data_schema` de HA, filtrado.
+
+        Esto es lo que hace que el espejo sea generico: HA no solo acepta el
+        formulario, lo DESCRIBE. Cada campo viene con nombre, tipo y si es
+        obligatorio, asi que la app puede dibujar el formulario de cualquier
+        marca sin que nadie programe una pantalla por marca.
+
+        Se pasan solo las claves que la app sabe dibujar. Un campo con una forma
+        que no entendemos se deja pasar igual con su tipo crudo: es mejor
+        mostrarlo como texto que esconderlo y que el alta no se pueda completar.
+        """
+        if not isinstance(schema, list):
+            return []
+        campos: list[dict[str, Any]] = []
+        for bruto in schema:
+            if not isinstance(bruto, dict):
+                continue
+            nombre = bruto.get("name")
+            if not nombre:
+                continue
+            campo: dict[str, Any] = {
+                "nombre": str(nombre),
+                "tipo": str(bruto.get("type") or "string"),
+                "obligatorio": bool(bruto.get("required")),
+            }
+            if "default" in bruto:
+                campo["valor_inicial"] = bruto["default"]
+            if bruto.get("options"):
+                campo["opciones"] = bruto["options"]
+            # HA marca asi los campos de contraseña. La app tiene que pintarlos
+            # ocultos: en una tablet en la cocina, una clave en claro se lee
+            # desde el otro lado de la mesa.
+            if bruto.get("format") == "password" or "password" in str(nombre).lower():
+                campo["secreto"] = True
+            campos.append(campo)
+        return campos
 
     # -------------------------------------------------------------------------
     # Rescan

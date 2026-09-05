@@ -3,7 +3,7 @@ name: UniquexCR Mirror
 # Si esto no sube, la casa no recibe nada aunque el código cambie.
 # Mantener sincronizado con mirror_src/pyproject.toml (de ahí sale la versión
 # que reporta /api/health).
-version: "0.31.0"
+version: "0.32.0"
 slug: ha_mirror
 # La caja BAJA esta imagen en vez de construirla.
 #

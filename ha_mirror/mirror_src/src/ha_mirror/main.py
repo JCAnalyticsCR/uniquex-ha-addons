@@ -34,12 +34,12 @@ from starlette.responses import Response
 from ha_mirror.api.areas import router as areas_router
 from ha_mirror.api.camera_media import router as camera_media_router
 from ha_mirror.api.camera_ws import router as camera_ws_router
+from ha_mirror.api.costumbres import router as costumbres_router
 from ha_mirror.api.entities import router as entities_router
 from ha_mirror.api.health import router as health_router
 from ha_mirror.api.iframe_token import router as iframe_router
 from ha_mirror.api.onboarding import router as onboarding_router
 from ha_mirror.api.preferences import router as preferences_router
-from ha_mirror.api.costumbres import router as costumbres_router
 from ha_mirror.api.pronostico import router as pronostico_router
 from ha_mirror.api.scenes import router as scenes_router
 from ha_mirror.api.service import router as service_router
@@ -317,6 +317,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         upstream=upstream,
         db=db,
         mirror_version=_MIRROR_VERSION,
+        # El asistente de alta habla REST con HA (los formularios no tienen
+        # comando WebSocket). El token se pasa como FUNCION y no como valor: la
+        # copia local ya se borro mas arriba a proposito, y guardarlo en el
+        # servicio lo tendria vivo mientras viva el add-on.
+        ha_http_url=settings.ha_http_url,
+        ha_token_provider=settings.get_ha_token,
     )
 
     # 6. Lanzar el upstream como task supervisado

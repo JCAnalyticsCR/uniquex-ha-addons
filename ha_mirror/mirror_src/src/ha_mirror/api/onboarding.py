@@ -13,7 +13,9 @@ Prefijo: /api/onboarding
 
 from __future__ import annotations
 
+import contextlib
 import re
+from collections.abc import AsyncIterator
 from typing import Any
 
 import structlog
@@ -25,6 +27,7 @@ from ha_mirror.errors import UpstreamNotReadyError
 from ha_mirror.onboarding import (
     OnboardingAdminRequiredError,
     OnboardingEntryNotFoundError,
+    OnboardingFlowNoEncontradoError,
     OnboardingForbiddenDomainError,
     OnboardingRescanInProgressError,
     OnboardingService,
@@ -519,6 +522,188 @@ async def ack_pending(
     """Marca entidades como revisadas. Devuelve cuántas fueron marcadas."""
     svc = _svc(request)
     return await svc.ack_pending(body.entity_ids, _tenant_id(request))
+
+
+# ---------------------------------------------------------------------------
+# Endpoints — Alta de dispositivos (el asistente)
+# ---------------------------------------------------------------------------
+#
+# Es el espejo del "Agregar integracion" de Home Assistant. La idea entera es
+# que HA no solo acepta el formulario: lo DESCRIBE. Cada paso vuelve con los
+# campos en JSON, asi que la app puede dibujar el formulario de cualquier marca
+# sin que nadie programe una pantalla por marca.
+#
+# 🔪 Los tres endpoints reciben datos del navegador y los tres tienen candado:
+#   · `handler` se valida contra la lista blanca ANTES de tocar HA,
+#   · `flow_id` se valida buscando de que marca es el formulario,
+#   · lo que la persona escribe pasa de largo y NUNCA se loguea.
+
+
+@contextlib.asynccontextmanager
+async def _errores_http() -> AsyncIterator[None]:
+    """
+    Traduce los errores del servicio a codigos HTTP.
+
+    Los tres endpoints del alta fallan de las mismas maneras, asi que la tabla
+    vive en un solo lugar. Repetirla tres veces es como se termina con un
+    endpoint que devuelve 500 donde los otros devuelven 403.
+    """
+    try:
+        yield
+    except UpstreamNotReadyError:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Upstream HA desconectado",
+        ) from None
+    except OnboardingAdminRequiredError:
+        raise HTTPException(
+            status_code=status.HTTP_501_NOT_IMPLEMENTED,
+            detail="Se requieren permisos admin en HA (token del Supervisor)",
+        ) from None
+    except OnboardingForbiddenDomainError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail=str(exc)
+        ) from None
+    except OnboardingFlowNoEncontradoError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)
+        ) from None
+
+
+class AltaBody(BaseModel):
+    """Marca que se quiere dar de alta."""
+
+    handler: str = Field(min_length=1, max_length=64)
+
+
+class PasoBody(BaseModel):
+    """
+    Lo que la persona contesto en un paso.
+
+    `dict[str, Any]` a proposito: los campos los define HA por marca y no hay
+    forma de tiparlos de antemano. Se valida el tamaño para que nadie use este
+    endpoint como tuberia hacia HA.
+    """
+
+    datos: dict[str, Any] = Field(default_factory=dict)
+
+
+@router.get(
+    "/alta/marcas",
+    summary="Marcas que se pueden dar de alta desde la app",
+)
+async def get_alta_marcas(
+    request: Request,
+    _: None = Depends(require_api_key),
+) -> dict[str, Any]:
+    """
+    El catalogo, agrupado por familia y en español.
+
+    Es el cruce de lo que HA soporta en ESTA casa con nuestra lista blanca. Un
+    dominio que HA soporta pero que no esta en el catalogo de familias no se
+    ofrece: entre los 728 que HA sabe dar de alta hay administracion del
+    gateway, no solo aparatos.
+
+    SIEMPRE 200. Sin admin devuelve `disponible:false` y la app esconde el boton.
+    """
+    svc = _svc(request)
+    return await svc.marcas_de_alta()
+
+
+@router.post(
+    "/alta",
+    summary="Empieza el alta de una marca",
+)
+async def post_alta(
+    body: AltaBody,
+    request: Request,
+    _: None = Depends(require_api_key),
+) -> dict[str, Any]:
+    """
+    Arranca el formulario y devuelve el primer paso.
+
+    - 403: la marca no esta en la lista blanca.
+    - 501: el token de HA no es admin.
+    - 502: la casa no responde.
+    """
+    svc = _svc(request)
+    async with _errores_http():
+        return await svc.iniciar_alta(body.handler)
+
+
+@router.post(
+    "/alta/{flow_id}",
+    summary="Contesta un paso del formulario",
+)
+async def post_alta_paso(
+    flow_id: str,
+    body: PasoBody,
+    request: Request,
+    _: None = Depends(require_api_key),
+) -> dict[str, Any]:
+    """
+    Manda las respuestas y devuelve el paso siguiente.
+
+    El resultado puede ser otro formulario, el alta terminada (`create_entry`),
+    un aborto con su motivo, o un paso que NO se puede completar desde la app
+    (`external_step`: los que mandan a la nube del fabricante).
+
+    - 403: el formulario pertenece a una marca que no se maneja desde la app.
+    - 404: el formulario no existe o ya termino.
+    """
+    svc = _svc(request)
+    async with _errores_http():
+        return await svc.avanzar_alta(flow_id, body.datos)
+
+
+@router.delete(
+    "/alta/{flow_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Abandona un formulario a medio llenar",
+)
+async def delete_alta(
+    flow_id: str,
+    request: Request,
+    _: None = Depends(require_api_key),
+) -> None:
+    """
+    Cancela el alta.
+
+    Importa que exista: un formulario abandonado queda en curso dentro de HA y
+    reaparece en la bandeja de "Encontrados" como si fuera un hallazgo, cuando
+    en realidad es basura que dejo alguien que se arrepintio a mitad de camino.
+    """
+    svc = _svc(request)
+    async with _errores_http():
+        await svc.cancelar_alta(flow_id)
+
+
+# ---------------------------------------------------------------------------
+# Endpoint — Encontrados
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/encontrados",
+    summary="Aparatos que HA ya detecto y estan esperando confirmacion",
+)
+async def get_encontrados(
+    request: Request,
+    _: None = Depends(require_api_key),
+) -> dict[str, Any]:
+    """
+    Lo que Home Assistant vio y nadie contesto.
+
+    No son entidades: son formularios a medio llenar dentro de HA. Mientras
+    nadie los conteste, el aparato no existe para la casa — y solo se ven
+    entrando a HA, que es justo lo que el cliente no hace nunca.
+
+    SIEMPRE responde 200. Si el token no es admin o la casa esta caida devuelve
+    `disponible: false` con la lista vacia, y la app esconde el aviso sola. Un
+    500 aca pintaria un error en una pantalla que se abre todos los dias.
+    """
+    svc = _svc(request)
+    return await svc.encontrados(_tenant_id(request))
 
 
 # ---------------------------------------------------------------------------

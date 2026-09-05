@@ -144,6 +144,44 @@ _FAMILIA_DEFAULT = "otros"
 
 
 # ---------------------------------------------------------------------------
+# Qué se puede dar de alta: lista NEGRA, no blanca.
+#
+# Esto era `d in FAMILIAS`, o sea una lista blanca de 30 marcas. Home Assistant
+# sabe dar de alta 728 dominios en la casa de referencia: la lista blanca dejaba
+# afuera el 96%, y entre lo que bloqueaba estaban TP-Link (Kasa/Tapo), WiZ,
+# Yeelight, Xiaomi, SwitchBot, Aqara y Broadlink — justo las marcas de los
+# bombillos y enchufes baratos que un cliente compra en una tienda cualquiera.
+#
+# Una lista blanca es un techo de marcas por diseño, y solo se levanta si
+# alguien edita este archivo. Eso convierte "compré un aparato nuevo" en un
+# ticket de soporte, que es exactamente lo que este producto quiere evitar.
+#
+# Lo que se bloquea ahora es lo que NO es un aparato de la casa: administración
+# del gateway (supervisor, backups, HACS, actualizaciones), infraestructura de
+# descubrimiento (zeroconf, dhcp, bluetooth, usb) y los helpers de la propia
+# interfaz de HA. Ese criterio ya existía en el proyecto para el reload; acá se
+# reusa en vez de inventar otro.
+#
+# LA CONTRAPARTIDA, DICHA DE FRENTE: un cliente puede configurarse mal una
+# integración y romperse su propia app. Se aguanta porque "quitar" está siempre
+# disponible y porque ningún alta puede tocar la casa de otro cliente. Lo que NO
+# se aguanta —y sigue bloqueado— es tocar el sistema de la cajita.
+#
+# FAMILIAS deja de ser la puerta y pasa a ser lo que siempre debió: el mapa de
+# nombres lindos en español. Una marca que no esté ahí se ofrece igual, con su
+# nombre de dominio.
+# ---------------------------------------------------------------------------
+
+
+def puede_darse_de_alta(domain: str) -> bool:
+    """True si la app puede ofrecer dar de alta este dominio."""
+    d = domain.lower().strip()
+    if not d:
+        return False
+    return d not in DENY_LIST
+
+
+# ---------------------------------------------------------------------------
 # Enmascarado de títulos — privacidad del INSTALADOR, no del cliente.
 #
 # Home Assistant titula muchas config entries con la CUENTA con la que se
@@ -165,6 +203,21 @@ _RE_CORREO = re.compile(r"[^@\s]+@[^@\s]+\.[A-Za-z]{2,}")
 def enmascarar_titulo(title: str) -> str:
     """Reemplaza cualquier correo dentro del título por una etiqueta neutra."""
     return _RE_CORREO.sub("cuenta privada", title)
+
+
+def nombre_de_marca(domain: str) -> str:
+    """
+    Un nombre presentable a partir del dominio de HA.
+
+    HA entrega dominios, no nombres comerciales: `xiaomi_miio`, `tplink`. Con la
+    lista blanca esto no hacía falta porque las 30 marcas conocidas traían su
+    nombre a mano; con 728 hay que generar algo legible para el resto.
+
+    No inventa nombres comerciales —"tplink" no se convierte en "TP-Link"— para
+    no arriesgar mostrar una marca equivocada. Solo separa y capitaliza, que es
+    honesto y suficiente para buscar.
+    """
+    return domain.replace("_", " ").strip().title() or domain
 
 
 def familia_de(domain: str, title: str) -> tuple[str, str]:

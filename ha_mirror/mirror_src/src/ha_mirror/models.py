@@ -14,7 +14,6 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-
 # ---------------------------------------------------------------------------
 # Modelos HA (upstream → mirror)
 # ---------------------------------------------------------------------------
@@ -92,7 +91,7 @@ class StateChangedData(BaseModel):
     new_state: HaState | None = None
 
     @model_validator(mode="after")
-    def at_least_one_state(self) -> "StateChangedData":
+    def at_least_one_state(self) -> StateChangedData:
         """Entidad nueva: old_state=None. Entidad eliminada: new_state=None."""
         if self.old_state is None and self.new_state is None:
             raise ValueError("old_state y new_state no pueden ser ambos None")
