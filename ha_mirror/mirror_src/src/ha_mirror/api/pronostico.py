@@ -34,6 +34,7 @@ from pydantic import BaseModel
 
 from ha_mirror.auth import require_api_key
 from ha_mirror.errors import UpstreamNotReadyError
+from ha_mirror.models import leer_atributo
 
 logger = structlog.get_logger(__name__)
 
@@ -130,8 +131,17 @@ async def _pedir(upstream: Any, entity_id: str, tipo: str) -> list[dict[str, Any
             "return_response": True,
         },
     )
-    # HA envuelve la respuesta dos veces: {"response": {"<entity>": {"forecast": [...]}}}
-    respuesta = resultado.get("response") if isinstance(resultado, dict) else None
+    # 🔪 HA envuelve la respuesta TRES veces, no dos, y `_send_command` agrega
+    # una más: resuelve el future con el MENSAJE COMPLETO, no con su `result`.
+    # O sea que el camino real es
+    #     msg["result"]["response"]["<entity_id>"]["forecast"]
+    # Leer un nivel de menos devuelve `None` en silencio y la sección aparece
+    # vacía sin que nada falle — el peor tipo de defecto. Verificado hablando
+    # WebSocket directo con la casa (2026-09-05).
+    if not isinstance(resultado, dict):
+        return []
+    interno = resultado.get("result")
+    respuesta = interno.get("response") if isinstance(interno, dict) else None
     if not isinstance(respuesta, dict):
         return []
     porEntidad = respuesta.get(entity_id)
@@ -185,9 +195,9 @@ async def obtener_pronostico(
         logger.warning("pronostico.fallo", entity_id=entity_id, error=str(exc))
         return Pronostico(disponible=False, entity_id=entity_id)
 
-    estado = store.get_state(entity_id)
-    atributos = getattr(estado, "attributes", None) or {}
-    atribucion = atributos.get("attribution")
+    # `leer_atributo` y NO `.attributes.get(...)`: `HaState.attributes` es un
+    # modelo de Pydantic, no un dict, y no tiene `.get()`. Ver models.py.
+    atribucion = leer_atributo(store.get_state(entity_id), "attribution")
 
     p = Pronostico(
         disponible=bool(diario or horario),

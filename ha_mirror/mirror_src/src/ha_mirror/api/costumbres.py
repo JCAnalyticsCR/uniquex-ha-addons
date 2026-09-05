@@ -49,6 +49,7 @@ from pydantic import BaseModel, Field
 
 from ha_mirror.auth import require_api_key
 from ha_mirror.config import Settings
+from ha_mirror.models import leer_atributo
 
 logger = structlog.get_logger(__name__)
 
@@ -112,8 +113,12 @@ def _objetivos(store: Any, dominio: str) -> list[str]:
         crudo = getattr(estado, "state", None)
         if crudo in ("unavailable", "unknown", None):
             continue
-        atributos = getattr(estado, "attributes", None) or {}
-        nombre = str(atributos.get("friendly_name") or "")
+        # `leer_atributo` y NO `.attributes.get(...)`: `HaState.attributes` es un
+        # modelo de Pydantic. Acá importa el doble — el nombre visible es lo
+        # ÚNICO que delata a los relés de cochera (`switch.1002375306_3` se
+        # llama "Entrada Garage-Cochera 2"), así que leerlo mal deja pasar la
+        # barrera entera.
+        nombre = str(leer_atributo(estado, "friendly_name") or "")
         if es_de_ambiente(entity_id, nombre):
             salida.append(entity_id)
     return sorted(salida)

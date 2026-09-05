@@ -26,6 +26,35 @@ class HaAttributes(BaseModel):
     model_config = ConfigDict(extra="allow")
 
 
+def leer_atributo(estado: object | None, nombre: str) -> object | None:
+    """
+    Lee un atributo de una entidad, venga como modelo o como diccionario.
+
+    🔪 EXISTE POR UN 500 EN PRODUCCIÓN (2026-09-05). `HaState.attributes` NO es
+    un `dict`: es `HaAttributes`, un modelo de Pydantic con `extra="allow"`.
+    Dos endpoints nuevos hacían `estado.attributes.get("...")` y reventaban con
+    `AttributeError: 'HaAttributes' object has no attribute 'get'`.
+
+    Lo que hizo que el defecto llegara a la casa fue el TEST: los dos módulos se
+    probaron con el store simulado por `MagicMock` y `attributes` puesto como
+    diccionario. El mock tenía `.get()`; el modelo real no. Las pruebas pasaban
+    contra una forma que la aplicación nunca ve.
+
+    Por eso esto vive acá, al lado de `HaAttributes`, y no copiado en cada
+    módulo: la próxima vez que alguien necesite un atributo, encuentra el lector
+    correcto antes de escribir el equivocado.
+
+    Acepta las dos formas a propósito — un `dict` sigue funcionando, así que
+    sirve igual para datos que vienen crudos de la red.
+    """
+    atributos = getattr(estado, "attributes", None)
+    if atributos is None:
+        return None
+    if isinstance(atributos, dict):
+        return atributos.get(nombre)
+    return getattr(atributos, nombre, None)
+
+
 class HaContext(BaseModel):
     """Contexto de un evento HA."""
 
