@@ -39,6 +39,7 @@ from ha_mirror.api.health import router as health_router
 from ha_mirror.api.iframe_token import router as iframe_router
 from ha_mirror.api.onboarding import router as onboarding_router
 from ha_mirror.api.preferences import router as preferences_router
+from ha_mirror.api.costumbres import router as costumbres_router
 from ha_mirror.api.pronostico import router as pronostico_router
 from ha_mirror.api.scenes import router as scenes_router
 from ha_mirror.api.service import router as service_router
@@ -491,6 +492,9 @@ def create_app() -> FastAPI:
     # Pronóstico: solo lectura y con caché propia. Endpoint dedicado a propósito,
     # NO un flag en el proxy de servicios — ver la cabecera de pronostico.py.
     app.include_router(pronostico_router)
+    # Costumbres: crea automatizaciones a partir de RECETAS, nunca de JSON del
+    # cliente, y con la barrera "solo ambiente" del lado del servidor.
+    app.include_router(costumbres_router)
     app.include_router(preferences_router)
     app.include_router(onboarding_router)
     # Emisor de tickets de WebSocket (0.21.0). Lo llama el frontend desde el
