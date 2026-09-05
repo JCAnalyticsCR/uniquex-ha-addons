@@ -88,6 +88,21 @@ def _slug(name: str) -> str:
     return slug[:48]
 
 
+def _matter_cargado(entries: list[dict[str, Any]]) -> bool:
+    """
+    ¿Esta casa puede comisionar aparatos Matter?
+
+    Se exige `state == "loaded"` y no solo que la entrada exista: una
+    integracion en `setup_error` sigue apareciendo en la lista, pero su
+    comando `matter/commission` no contesta. Ofrecer el escaner en ese caso
+    seria prometer algo que falla recien despues de que la persona ya saco la
+    caja del aparato y apunto la camara.
+    """
+    return any(
+        e.get("domain") == "matter" and e.get("state") == "loaded" for e in entries
+    )
+
+
 # ---------------------------------------------------------------------------
 # Servicio de onboarding
 # ---------------------------------------------------------------------------
@@ -201,6 +216,13 @@ class OnboardingService:
                     # add-on tenga la URL y el token. Sin eso el asistente no se
                     # ofrece, aunque el WebSocket admin funcione.
                     "alta": self._flow_client() is not None,
+                    # Matter: el codigo impreso del aparato alcanza para
+                    # sumarlo, sin formulario ni cuenta de fabricante. Se
+                    # deriva de las MISMAS entries que ya pedimos — no cuesta
+                    # una llamada extra — y solo cuenta si la integracion esta
+                    # `loaded`: si esta en error, `matter/commission` no
+                    # responde y ofrecerlo seria prometer lo que no hay.
+                    "matter": _matter_cargado(entries),
                 },
                 "systems": systems,
             }
@@ -228,6 +250,7 @@ class OnboardingService:
                 "rescan": False,
                 "encontrados": False,
                 "alta": False,
+                "matter": False,
             },
             "systems": [],
         }

@@ -4,7 +4,7 @@ name = "ha-mirror"
 # Estuvo congelada en 0.3.1 mientras el add-on iba en 0.20.0 — corregido en 0.21.0.
 # Desde 0.22.0 esta es la version que /api/health reporta hacia afuera
 # (main.py la lee con importlib.metadata del paquete instalado).
-version = "0.32.0"
+version = "0.33.0"
 description = "FastAPI mirror para Home Assistant — single-tenant, WebSocket fan-out, Fernet at-rest"
 requires-python = ">=3.11"
 dependencies = [
