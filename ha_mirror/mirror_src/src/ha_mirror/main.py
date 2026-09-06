@@ -43,6 +43,7 @@ from ha_mirror.api.iframe_token import router as iframe_router
 from ha_mirror.api.matter import router as matter_router
 from ha_mirror.api.onboarding import router as onboarding_router
 from ha_mirror.api.preferences import router as preferences_router
+from ha_mirror.api.mantenimiento import router as mantenimiento_router
 from ha_mirror.api.pronostico import router as pronostico_router
 from ha_mirror.api.scenes import router as scenes_router
 from ha_mirror.api.service import router as service_router
@@ -546,6 +547,11 @@ def create_app() -> FastAPI:
     # Pronóstico: solo lectura y con caché propia. Endpoint dedicado a propósito,
     # NO un flag en el proxy de servicios — ver la cabecera de pronostico.py.
     app.include_router(pronostico_router)
+
+    # Actualizaciones y respaldos. Endpoint PROPIO, con su politica adentro:
+    # el proxy de /api/service sigue prohibiendo update/hassio/backup y esa
+    # lista negra no se toca. Ver la cabecera de mantenimiento.py.
+    app.include_router(mantenimiento_router)
     # Costumbres: crea automatizaciones a partir de RECETAS, nunca de JSON del
     # cliente, y con la barrera "solo ambiente" del lado del servidor.
     app.include_router(costumbres_router)
