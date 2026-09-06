@@ -26,6 +26,11 @@ CAMERA_STREAM_MAP="$(opt camera_stream_map)"
 if [ -z "${CAMERA_STREAM_MAP}" ] || [ "${CAMERA_STREAM_MAP}" = "null" ]; then
   CAMERA_STREAM_MAP='{}'
 fi
+CRESTRON_ENABLED="$(opt crestron_enabled)"
+CRESTRON_BASE_URL="$(opt crestron_base_url)"
+CRESTRON_TOKEN="$(opt crestron_token)"
+CRESTRON_VERIFY_SSL="$(opt crestron_verify_ssl)"
+CRESTRON_POLL_INTERVAL="$(opt crestron_poll_interval)"
 CAMERA_LABELS="$(opt camera_labels)"
 if [ -z "${CAMERA_LABELS}" ] || [ "${CAMERA_LABELS}" = "null" ]; then
   CAMERA_LABELS='{}'
@@ -124,6 +129,23 @@ if [ -n "${GO2RTC_PASSWORD}" ] && [ "${GO2RTC_PASSWORD}" != "null" ]; then
 fi
 export CAMERA_STREAM_MAP="${CAMERA_STREAM_MAP}"
 export CAMERA_LABELS="${CAMERA_LABELS}"
+
+# --- Crestron Home ---------------------------------------------------------
+# Solo se exporta si esta encendido Y hay direccion. Un `crestron_enabled: true`
+# sin URL hace que el Mirror falle al validar la configuracion y el add-on no
+# arranca: mejor ignorarlo y decirlo en el log que dejar la casa sin servidor.
+if [ "${CRESTRON_ENABLED}" = "True" ] || [ "${CRESTRON_ENABLED}" = "true" ]; then
+  if [ -n "${CRESTRON_BASE_URL}" ] && [ "${CRESTRON_BASE_URL}" != "null" ]; then
+    export CRESTRON_ENABLED="true"
+    export CRESTRON_BASE_URL="${CRESTRON_BASE_URL}"
+    [ -n "${CRESTRON_TOKEN}" ] && [ "${CRESTRON_TOKEN}" != "null" ] && export CRESTRON_TOKEN="${CRESTRON_TOKEN}"
+    [ -n "${CRESTRON_VERIFY_SSL}" ] && [ "${CRESTRON_VERIFY_SSL}" != "null" ] && export CRESTRON_VERIFY_SSL="${CRESTRON_VERIFY_SSL}"
+    [ -n "${CRESTRON_POLL_INTERVAL}" ] && [ "${CRESTRON_POLL_INTERVAL}" != "null" ] && export CRESTRON_POLL_INTERVAL="${CRESTRON_POLL_INTERVAL}"
+    echo "[mirror] Crestron Home: conectando a ${CRESTRON_BASE_URL}"
+  else
+    echo "[mirror] Crestron Home encendido SIN direccion: se ignora."
+  fi
+fi
 
 NIVEL="$(printf '%s' "${LOG_LEVEL}" | tr '[:upper:]' '[:lower:]')"
 

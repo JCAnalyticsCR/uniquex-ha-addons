@@ -3,7 +3,7 @@ name: UniquexCR Mirror
 # Si esto no sube, la casa no recibe nada aunque el código cambie.
 # Mantener sincronizado con mirror_src/pyproject.toml (de ahí sale la versión
 # que reporta /api/health).
-version: "0.38.0"
+version: "0.39.0"
 slug: ha_mirror
 # La caja BAJA esta imagen en vez de construirla.
 #
@@ -93,6 +93,20 @@ options:
   go2rtc_password: ""
   camera_stream_map: "{}"
   camera_labels: "{}"
+  # --- Crestron Home (opcional) --------------------------------------------
+  # El conector existe desde la 0.28 y hasta ahora no habia forma de decirle
+  # donde esta el procesador: las opciones no llegaban a la configuracion del
+  # add-on. Vacio = apagado, y la casa se comporta exactamente igual que antes.
+  #
+  # `crestron_token` NO es la contrasena de la app de Crestron Home. Es el
+  # token de la Web API, que se genera en la app de INSTALADOR (Crestron Home
+  # Setup -> System Control Options -> Web API). Con la contrasena de la
+  # interfaz el login devuelve 401.
+  crestron_enabled: false
+  crestron_base_url: ""
+  crestron_token: ""
+  crestron_verify_ssl: false
+  crestron_poll_interval: 10
 schema:
   mirror_api_key: "password?"
   platform_base_url: "str?"
@@ -103,3 +117,8 @@ schema:
   go2rtc_password: "password?"
   camera_stream_map: "str?"
   camera_labels: "str?"
+  crestron_enabled: "bool?"
+  crestron_base_url: "str?"
+  crestron_token: "password?"
+  crestron_verify_ssl: "bool?"
+  crestron_poll_interval: "float(2,300)?"
