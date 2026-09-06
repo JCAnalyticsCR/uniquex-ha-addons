@@ -3,7 +3,7 @@ name: UniquexCR Mirror
 # Si esto no sube, la casa no recibe nada aunque el código cambie.
 # Mantener sincronizado con mirror_src/pyproject.toml (de ahí sale la versión
 # que reporta /api/health).
-version: "0.36.0"
+version: "0.37.0"
 slug: ha_mirror
 # La caja BAJA esta imagen en vez de construirla.
 #
@@ -38,7 +38,19 @@ init: false
 # local (http://supervisor/core y ws://supervisor/core/websocket). Con esto el
 # Mirror NO necesita el LLAT de 10 años.
 homeassistant_api: true
-hassio_api: false
+# El Mirror enciende su propio `auto_update` al arrancar, para que una caja
+# instalada hace un anio tenga las funciones de hoy sin que nadie viaje.
+#
+# `hassio_role: default` es EL PERMISO MAS BAJO QUE EXISTE: solo permite leer
+# `/.+/info`. Lo que habilita la escritura es un bypass del Supervisor para que
+# un add-on toque LO SUYO:  /addons/self/(?!security|update)[^/]+
+#
+# Con esto el Mirror NO puede: forzarse una actualizacion (`update` esta
+# excluido), tocar su seguridad, ni ver o modificar otros add-ons -- eso exige
+# el rol `manager`, que a proposito no se pide. Importa porque el Mirror esta
+# expuesto a internet por el tunel.
+hassio_api: true
+hassio_role: default
 host_network: false
 # Ingress: coloca el add-on en la barra lateral de HA y sirve `/` — la
 # calcomanía de activación. El técnico que prepara la caja hace clic y ve el QR

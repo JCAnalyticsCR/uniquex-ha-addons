@@ -35,6 +35,11 @@ _SENSITIVE_KEYS: frozenset[str] = frozenset({
     "passphrase",
     "api_key",
     "apikey",
+    # 🔪 La comparacion de arriba es EXACTA (`key.lower() in _SENSITIVE_KEYS`),
+    # no por subcadena: tener "token" NO cubre "supervisor_token", ni "api_key"
+    # cubre "mirror_api_key". Los nombres completos que usamos van listados.
+    "supervisor_token",
+    "mirror_api_key",
 })
 
 # ---------------------------------------------------------------------------

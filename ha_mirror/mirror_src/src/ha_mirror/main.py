@@ -31,6 +31,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
+from ha_mirror.autoactualizacion import asegurar_auto_update
 from ha_mirror.api.areas import router as areas_router
 from ha_mirror.api.camera_media import router as camera_media_router
 from ha_mirror.api.camera_ws import router as camera_ws_router
@@ -183,6 +184,25 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         events_retention_days=settings.events_log_retention_days,
     )
     await db.connect()
+
+    # ---------------------------------------------------------------------
+    # LA CAJA SE MANTIENE SOLA.
+    #
+    # `auto_update` vive en la INSTALACION, no en el config.yaml: una caja
+    # recien quemada nace con el apagado y encenderlo a mano es un paso que se
+    # olvida. Se enciende aca, en cada arranque, para que cualquiera que
+    # instale el Mirror reciba lo que se construya de ahora en adelante sin
+    # que nadie vaya a la casa.
+    #
+    # Nunca es fatal y nunca demora el arranque de forma perceptible: ver
+    # `autoactualizacion.py` para por que alcanza con el permiso mas bajo.
+    # ---------------------------------------------------------------------
+    # EN SEGUNDO PLANO, no bloqueando: si el Supervisor esta lento, esperarlo
+    # aca retrasa hasta 10 s el momento en que la casa queda disponible — y las
+    # camaras del cliente no tienen por que pagar por un interruptor interno.
+    auto_update_task = asyncio.create_task(
+        asegurar_auto_update(), name="auto_update"
+    )
 
     # ---------------------------------------------------------------------
     # MODO FABRICA vs MODO ARTESANAL — el interruptor es `platform_base_url`.
@@ -469,7 +489,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if crestron_client is not None:
             with suppress(Exception):
                 await crestron_client.close()
-        for tarea in (announce_task, tunnel_task):
+        for tarea in (announce_task, tunnel_task, auto_update_task):
             if tarea is not None:
                 tarea.cancel()
                 with suppress(asyncio.CancelledError, Exception):
