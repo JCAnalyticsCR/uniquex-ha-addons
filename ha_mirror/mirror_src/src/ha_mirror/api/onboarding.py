@@ -23,7 +23,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ha_mirror.auth import require_api_key
-from ha_mirror.errors import UpstreamNotReadyError
+from ha_mirror.errors import HaProtocolError, UpstreamNotReadyError
 from ha_mirror.onboarding import (
     OnboardingAdminRequiredError,
     OnboardingEntryNotFoundError,
@@ -325,6 +325,30 @@ async def put_override(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Entidad {entity_id!r} no encontrada en el store",
         ) from None
+    # 🔪 Los dos errores de abajo existen porque este endpoint ESCRIBE EN HA
+    # antes de guardar nada local (ver `_escribir_registro_ha`). Se traducen a
+    # 503 y no a 500: no es que algo se rompió, es que ahora no se puede — y el
+    # cliente puede volver a intentarlo en un minuto.
+    #
+    # Lo que NO puede pasar es contestar 200 sin haber escrito en HA: eso deja
+    # a la app diciendo "guardado" con la casa intacta, que es exactamente el
+    # defecto que se midió el 2026-09-06 (0 renombradas sobre 429 entidades).
+    except UpstreamNotReadyError:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="La casa no está respondiendo. Probá de nuevo en un momento.",
+        ) from None
+    except HaProtocolError as exc:
+        # `unauthorized` = el token del Supervisor no tiene permiso de admin.
+        # Es un problema de instalación, no del cliente, y hay que poder
+        # distinguirlo en los registros de "la casa está caída".
+        logger.warning(
+            "onboarding.registro_ha_rechazado", entity_id=entity_id, detalle=str(exc)
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="La casa rechazó el cambio. Escribinos y lo revisamos.",
+        ) from None
 
 
 @router.delete(
@@ -337,9 +361,23 @@ async def delete_override(
     request: Request,
     _: None = Depends(require_api_key),
 ) -> Response:
-    """Borra el override. Idempotente: si no existía también retorna 204."""
+    """
+    Borra el override. Idempotente: si no existía también retorna 204.
+
+    Ahora esto TAMBIÉN escribe en HA —devuelve la entidad a su nombre de
+    fábrica— así que puede fallar por la casa y no solo por la base local.
+    """
     svc = _svc(request)
-    await svc.delete_override(entity_id, _tenant_id(request))
+    try:
+        await svc.delete_override(entity_id, _tenant_id(request))
+    except (UpstreamNotReadyError, HaProtocolError) as exc:
+        logger.warning(
+            "onboarding.borrado_no_llego_a_ha", entity_id=entity_id, detalle=str(exc)
+        )
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="La casa no está respondiendo. Probá de nuevo en un momento.",
+        ) from None
     return Response(status_code=status.HTTP_204_NO_CONTENT)
 
 
@@ -367,7 +405,18 @@ async def batch_overrides(
         item_dict.update(provided)
         items_dicts.append(item_dict)
 
-    return await svc.batch_overrides(items_dicts, _tenant_id(request))
+    try:
+        return await svc.batch_overrides(items_dicts, _tenant_id(request))
+    except (UpstreamNotReadyError, HaProtocolError) as exc:
+        # 🔪 Se corta el lote entero en vez de seguir. Cada item que ya se
+        # aplicó quedó CONSISTENTE (primero HA, después la base), así que
+        # cortar deja un estado sano a medio camino, no uno corrupto. Seguir
+        # sería escribir en la base cosas que la casa nunca aceptó.
+        logger.warning("onboarding.lote_cortado", detalle=str(exc))
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="La casa dejó de responder a mitad del cambio. Volvé a intentarlo.",
+        ) from None
 
 
 # ---------------------------------------------------------------------------

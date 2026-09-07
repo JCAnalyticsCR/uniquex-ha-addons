@@ -311,6 +311,74 @@ class OnboardingService:
             "rooms": rooms_list,
         }
 
+    async def _escribir_registro_ha(
+        self,
+        entity_id: str,
+        provided_fields: dict[str, Any],
+    ) -> None:
+        """
+        Escribe en el REGISTRO de Home Assistant. La verdad vive ahí.
+
+        ── POR QUÉ ESTO EXISTE ─────────────────────────────────────────────
+        Principio de Jeyrell (2026-09-06), en
+        `_produccion/PRINCIPIO_UNIQUEXCR_ES_LA_VERDAD.md`: *"todas las
+        funciones de UniquexCR tienen que ser reales y que sí modifiquen HA
+        para bien... pero a su vez que se ordene HA"*.
+
+        🔪 Hasta hoy esto guardaba SOLO un `display_name` en la base del
+        propio Mirror. Se comprobó con datos: se renombró un aparato desde la
+        app y el diff contra HA dio **0 renombradas sobre 429 entidades**. No
+        fallaba nada —el override se guardaba donde debía— pero la casa del
+        cliente nunca cambiaba. Dos verdades conviviendo, y la fea era la que
+        quedaba en HA: las persianas Somfy siguen guardadas ahí como
+        `HabitaciÃ³n 1`, con el nombre doble-codificado.
+
+        Ahora renombrar desde la app **arregla la casa**.
+
+        ── EL NOMBRE DE FÁBRICA NUNCA SE PIERDE ───────────────────────────
+        HA guarda `original_name` aparte de `name`. Mandar `name: None` no
+        borra nada: le devuelve a la entidad su nombre de origen. Por eso el
+        camino de "limpiar el override" es seguro.
+
+        ── QUÉ PASA SI FALLA ──────────────────────────────────────────────
+        Lanza. A propósito: el llamador NO debe guardar en la base local si
+        HA no aceptó. Un "guardado" en la app sin cambio en la casa es
+        exactamente el defecto que este método viene a eliminar.
+        """
+        cambios: dict[str, Any] = {}
+
+        # Solo se manda lo que el cliente tocó. Un update parcial en HA deja
+        # intacto lo que no viaja; mandar todo pisaría campos que nadie pidió
+        # cambiar.
+        if "display_name" in provided_fields:
+            cambios["name"] = provided_fields["display_name"]
+
+        if "hidden" in provided_fields:
+            # HA no guarda un booleano: guarda QUIÉN lo ocultó. "user" es el
+            # valor que usa su propia interfaz, así que lo que esconde la app
+            # se ve igual de escondido en HA, y se puede deshacer desde los dos
+            # lados.
+            cambios["hidden_by"] = "user" if provided_fields["hidden"] else None
+
+        if not cambios:
+            # Solo cambió algo que vive únicamente en la app (`icon`,
+            # `sort_order`). No hay nada que escribir en HA.
+            return
+
+        await self._upstream.send_command(
+            {
+                "type": "config/entity_registry/update",
+                "entity_id": entity_id,
+                **cambios,
+            },
+            timeout=10.0,
+        )
+        logger.info(
+            "onboarding.registro_ha_escrito",
+            entity_id=entity_id,
+            campos=sorted(cambios.keys()),
+        )
+
     async def upsert_override(
         self,
         entity_id: str,
@@ -325,10 +393,18 @@ class OnboardingService:
         None explícito en provided_fields limpia el campo.
 
         Si al final todos los campos quedan null/False → borra la fila.
+
+        🔪 EL ORDEN NO ES NEGOCIABLE: primero HA, después la base local. Si HA
+        rechaza, no se guarda nada y el cliente ve el error. La fila local pasó
+        de ser la verdad a ser una caché de lo que HA ya sabe — ver
+        `_escribir_registro_ha`.
         """
         # Verificar que la entidad existe en el store
         if self._store.get_state(entity_id) is None:
             raise KeyError(f"Entidad {entity_id!r} no encontrada en el store")
+
+        # HA primero. Si lanza, no se guarda nada.
+        await self._escribir_registro_ha(entity_id, provided_fields)
 
         # Leer estado actual
         actual = await self._db.get_override(entity_id, tenant_id)
@@ -376,7 +452,24 @@ class OnboardingService:
         )
 
     async def delete_override(self, entity_id: str, tenant_id: int = 1) -> None:
-        """Borra el override de una entidad (idempotente)."""
+        """
+        Borra el override de una entidad (idempotente).
+
+        🔪 Y LO DEVUELVE A SU NOMBRE DE FÁBRICA EN HA. Sin esto, borrar el
+        override dejaba el nombre puesto en la casa: la app volvía a mostrar
+        "Luz 3" y Home Assistant seguía diciendo "Luz del Comedor". Justo la
+        clase de desincronización que el principio viene a eliminar.
+
+        `name: None` y `hidden_by: None` no borran nada en HA: le devuelven a la
+        entidad su `original_name` y la vuelven visible. El nombre del
+        fabricante lo guarda HA aparte y nunca se pierde.
+
+        Si HA no responde, esto lanza y la fila local NO se borra — que es lo
+        correcto: mejor dejar todo como estaba que borrar la mitad.
+        """
+        await self._escribir_registro_ha(
+            entity_id, {"display_name": None, "hidden": False}
+        )
         await self._db.delete_override(entity_id, tenant_id)
 
     async def batch_overrides(
