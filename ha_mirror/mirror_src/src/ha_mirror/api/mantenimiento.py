@@ -289,12 +289,17 @@ async def respaldar(
     """
     Dispara `hassio.backup_full`.
 
-    🔪 SE DISPARA Y NO SE PUEDE VERIFICAR POR API. Esta versión de Home
-    Assistant no expone entidades de respaldo, y el proxy `/api/hassio/*`
-    contesta 401 a cualquier token que no sea la sesión del navegador. O sea que
-    esta ruta puede decir "empezó" y NO puede decir "salió bien". El mensaje lo
-    dice con esas palabras a propósito: prometer un respaldo verificado que
-    nadie verificó es peor que no ofrecer el botón.
+    🔪 ESTA RUTA SIGUE SIN PODER CONFIRMAR NADA: `hassio.backup_full` no
+    devuelve resultado. Lo que cambió es que ya no hace falta que lo confirme
+    ella — `GET /api/sistema/respaldos` lee `backup/info` del Core y ahí está la
+    lista con fechas. Antes se creía que eso exigía la API de respaldos del
+    Supervisor, que el add-on no puede tocar (`hassio_role: default`, a propósito,
+    porque está expuesto por el túnel). Medido el 2026-09-07: el Core lo publica
+    por el mismo WebSocket que ya usamos.
+
+    Se deja `hassio.backup_full` para CREAR y no `backup/generate`: el servicio
+    ya está probado en producción y el comando nuevo pide elegir agentes y
+    contraseña, decisiones que nadie tomó todavía.
 
     Y hay algo más grave que conviene recordar acá: el destino del respaldo
     diario de esta casa es la propia cajita. Un respaldo que vive en el mismo
@@ -309,7 +314,122 @@ async def respaldar(
     return Resultado(
         ok=True,
         mensaje=(
-            "La casa empezó a guardar un respaldo. Tarda varios minutos y no hay "
-            "forma de avisarte cuando termine: se confirma desde Home Assistant."
+            "La casa empezó a guardar un respaldo. Tarda varios minutos; cuando "
+            "termine va a aparecer acá arriba como el más reciente."
         ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Estado de los respaldos
+# ---------------------------------------------------------------------------
+#
+# 🔪 ESTO EXISTE PORQUE `POST /api/sistema/respaldo` NO PUEDE CONFIRMAR NADA.
+# Dispara `hassio.backup_full` y ahí se acaba su historia: el servicio no
+# devuelve resultado. La pantalla lo decía con todas las letras —"no hay forma
+# de avisarte cuando termine: se confirma desde Home Assistant"— que es
+# exactamente la frase que este proyecto existe para no tener que escribir.
+#
+# La creencia era que para saberlo hacía falta la API de respaldos del
+# Supervisor, y el add-on pide `hassio_role: default` a propósito (está expuesto
+# a internet por el túnel), así que se dio por imposible.
+#
+# Medido contra la casa el 2026-09-07: **el Core lo publica por su cuenta**. El
+# comando `backup/info` del WebSocket devuelve la lista completa con fechas y
+# cuál fue el último automático que terminó bien. No hace falta ningún permiso
+# nuevo: es el mismo canal por el que ya viaja todo lo demás.
+#
+# ── LO QUE ESTA CASA CONTESTÓ, Y POR QUÉ SE REPORTA ─────────────────────────
+# Los 11 respaldos tienen UN solo destino: `hassio.local`, la propia cajita. Un
+# respaldo que vive en el mismo aparato que protege no es un respaldo, y esa es
+# una respuesta que el dueño merece ver en su pantalla y no en una auditoría.
+# Por eso `solo_en_la_caja` es un campo y no una nota al pie.
+
+
+class Respaldo(BaseModel):
+    nombre: str
+    fecha: str | None = None
+    #: `true` cuando lo hizo la casa sola, `false` cuando alguien lo pidió.
+    automatico: bool = False
+
+
+class EstadoRespaldos(BaseModel):
+    disponible: bool
+    total: int = 0
+    #: `true` mientras la casa está guardando uno ahora mismo.
+    generando: bool = False
+    ultimo: Respaldo | None = None
+    #: Cuándo terminó bien el último automático. Es LA respuesta a "¿y funciona?".
+    ultimo_automatico_ok: str | None = None
+    #: Cuándo se intentó por última vez. Si es más nuevo que el de arriba, el
+    #: último intento FALLÓ — y eso es justo lo que nadie se enteraba.
+    ultimo_automatico_intento: str | None = None
+    #: Todos los respaldos viven únicamente en la cajita.
+    solo_en_la_caja: bool = False
+
+
+@router.get(
+    "/api/sistema/respaldos",
+    response_model=EstadoRespaldos,
+    summary="Qué respaldos tiene la casa y si el último salió bien",
+)
+async def estado_respaldos(
+    request: Request,
+    _: None = Depends(require_api_key),
+) -> EstadoRespaldos:
+    """
+    SIEMPRE 200. Una casa que no puede contestar devuelve `disponible:false` y
+    la pantalla no muestra la sección — igual que `capabilities` y que la
+    bandeja de encontrados. Esto se pinta en Ajustes, que el cliente abre todos
+    los días: no puede reventar porque la casa esté durmiendo.
+    """
+    upstream = getattr(request.app.state, "upstream", None)
+    if upstream is None:
+        return EstadoRespaldos(disponible=False)
+
+    try:
+        resp = await upstream.send_command({"type": "backup/info"}, timeout=15.0)
+    except UpstreamNotReadyError:
+        logger.debug("respaldos.upstream_caido")
+        return EstadoRespaldos(disponible=False)
+    except Exception:
+        # Un Core viejo no tiene `backup/*` (llegó con la integración de
+        # respaldos nueva). No es un error: es una casa que no sabe contestar.
+        logger.info("respaldos.no_soportado")
+        return EstadoRespaldos(disponible=False)
+
+    datos = resp.get("result") or {}
+    crudos = datos.get("backups") or []
+
+    lista: list[Respaldo] = []
+    for b in crudos:
+        if not isinstance(b, dict):
+            continue
+        lista.append(
+            Respaldo(
+                nombre=_texto(b.get("name")) or "Respaldo sin nombre",
+                fecha=_texto(b.get("date")),
+                automatico=bool(b.get("with_automatic_settings")),
+            )
+        )
+
+    # El más nuevo por fecha. Se ordena acá y no se confía en el orden de HA:
+    # viene ordenado por slug, no por cuándo se hizo.
+    lista.sort(key=lambda r: r.fecha or "", reverse=True)
+
+    # Un respaldo cuyo único agente es `hassio.local` está guardado en la propia
+    # cajita. Si TODOS lo están, la casa no tiene copia afuera.
+    destinos: set[str] = set()
+    for b in crudos:
+        if isinstance(b, dict):
+            destinos.update((b.get("agents") or {}).keys())
+
+    return EstadoRespaldos(
+        disponible=True,
+        total=len(lista),
+        generando=bool(datos.get("generating")),
+        ultimo=lista[0] if lista else None,
+        ultimo_automatico_ok=_texto(datos.get("last_completed_automatic_backup")),
+        ultimo_automatico_intento=_texto(datos.get("last_attempted_automatic_backup")),
+        solo_en_la_caja=bool(destinos) and destinos <= {"hassio.local"},
     )

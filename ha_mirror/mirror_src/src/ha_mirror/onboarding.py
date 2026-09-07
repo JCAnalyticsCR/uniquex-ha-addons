@@ -845,6 +845,47 @@ class OnboardingService:
         logger.info("onboarding.alta_iniciada", handler=handler, tipo=crudo.get("type"))
         return self._paso_limpio(crudo)
 
+    async def retomar_alta(self, flow_id: str) -> dict[str, Any]:
+        """
+        Mira en qué paso quedó un formulario que ya existe, SIN contestarlo.
+
+        Es la mitad que faltaba de la bandeja de "Encontrados". Esa bandeja lista
+        formularios que abrió Home Assistant por su cuenta —una reautenticación
+        que se cayó, un aparato que apareció en la red— y la app los podía ver
+        pero no los podía leer: para saber qué pedían tenía que mandarles un
+        cuerpo vacío, que no es mirar, es contestar en blanco.
+
+        El caso real que lo obliga: la reautenticación de Overkiz de esta casa
+        pide elegir entre API local y API de la nube. Un `{}` ahí devuelve el
+        error de validación de HA, no el formulario — o sea que justo el aviso
+        que existe para destrabar las persianas Somfy era el que no se podía
+        abrir ([[persianas]]).
+
+        Misma lista blanca que avanzar y cancelar: se comprueba de qué marca es
+        el formulario antes de tocarlo.
+        """
+        await self._exigir_flow_permitido(flow_id)
+        cliente = self._flow_client()
+        if cliente is None:
+            raise OnboardingAdminRequiredError("Sin token admin para el asistente")
+
+        # El permiso se comprobó contra la lista de formularios en curso, y entre
+        # esa lista y esta lectura el formulario puede haber terminado —otra
+        # persona en HA, o el propio HA al conseguir reconectar. Es una carrera
+        # real y corta, pero termina en 500 si no se atiende. Import local igual
+        # que `HaFlowClient`: este módulo no arrastra el cliente REST cuando la
+        # casa no tiene admin.
+        from ha_mirror.ha_flow_client import FlowNoEncontrado
+
+        try:
+            crudo = await cliente.leer(flow_id)
+        except FlowNoEncontrado as exc:
+            raise OnboardingFlowNoEncontradoError(
+                f"Formulario {flow_id!r} desconocido"
+            ) from exc
+        logger.info("onboarding.alta_retomada", tipo=crudo.get("type"))
+        return self._paso_limpio(crudo)
+
     async def avanzar_alta(self, flow_id: str, datos: dict[str, Any]) -> dict[str, Any]:
         """
         Contesta un paso del formulario.

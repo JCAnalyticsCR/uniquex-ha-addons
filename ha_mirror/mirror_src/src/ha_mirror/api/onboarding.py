@@ -680,6 +680,35 @@ async def post_alta(
         return await svc.iniciar_alta(body.handler)
 
 
+@router.get(
+    "/alta/{flow_id}",
+    summary="En que paso quedo un formulario que ya existe",
+)
+async def get_alta_paso(
+    flow_id: str,
+    request: Request,
+    _: None = Depends(require_api_key),
+) -> dict[str, Any]:
+    """
+    Lee un formulario sin contestarlo.
+
+    Es lo que hace utilizable la bandeja de "Encontrados": ahi viven formularios
+    que abrio Home Assistant solo —una reautenticacion caida, un aparato que
+    aparecio en la red— y hasta ahora la app los podia listar pero no leer.
+    Para saber que pedian les mandaba un cuerpo vacio, y eso no es mirar: es
+    contestar el formulario en blanco.
+
+    Devuelve la MISMA forma que `POST /alta/{flow_id}`, asi que la pantalla del
+    asistente no distingue si el formulario lo empezo el cliente o lo abrio HA.
+
+    - 403: el formulario pertenece a una marca que no se maneja desde la app.
+    - 404: el formulario no existe o ya termino.
+    """
+    svc = _svc(request)
+    async with _errores_http():
+        return await svc.retomar_alta(flow_id)
+
+
 @router.post(
     "/alta/{flow_id}",
     summary="Contesta un paso del formulario",

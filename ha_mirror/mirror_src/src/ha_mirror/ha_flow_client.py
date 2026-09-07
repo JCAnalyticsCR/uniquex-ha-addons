@@ -118,6 +118,28 @@ class HaFlowClient:
         )
         return dict(res or {})
 
+    async def leer(self, flow_id: str) -> dict[str, Any]:
+        """
+        El paso en el que está AHORA un formulario que ya existe, sin tocarlo.
+
+        🔪 ESTO NO ES UN LUJO: sin esto, retomar un formulario que abrió HA por
+        su cuenta —un `reauth`, un aparato descubierto en la red— obligaba a
+        mandarle un cuerpo vacío para "ver qué pide". Y mandar `{}` no es mirar:
+        es CONTESTAR el formulario en blanco.
+
+        En un paso de confirmación sin campos eso funciona de casualidad. En uno
+        con campos obligatorios —la reautenticación de Overkiz pide elegir entre
+        API local y API de la nube— es enviar una respuesta vacía a algo que
+        nadie llenó, y lo que vuelve es un error de validación de HA presentado
+        al cliente como si la casa hubiera fallado.
+
+        `GET` devuelve exactamente la misma forma que `POST` (`type`, `step_id`,
+        `data_schema`…), así que quien lo consume no distingue si el formulario
+        lo empezó la app o lo abrió HA solo.
+        """
+        res = await self._pedir("GET", f"/api/config/config_entries/flow/{flow_id}")
+        return dict(res or {})
+
     async def avanzar(self, flow_id: str, datos: dict[str, Any]) -> dict[str, Any]:
         """Contesta un paso. `datos` es lo que escribió la persona: pasa de largo."""
         res = await self._pedir(
