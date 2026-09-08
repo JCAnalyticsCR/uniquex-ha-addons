@@ -147,6 +147,11 @@ CREATE TABLE IF NOT EXISTS custom_rooms (
     sort_order  INTEGER NOT NULL DEFAULT 0,
     created_at  TEXT NOT NULL,
     updated_at  TEXT NOT NULL,
+    -- El area_id que HA le dio a esta habitacion. Es lo que la vuelve REAL:
+    -- sin esto la habitacion vive solo en la app y el tecnico que entra a HA
+    -- ve una casa sin cuartos. NULL = todavia no se pudo crear alla (casa
+    -- caida al crearla); la reconciliacion la crea despues.
+    ha_area_id  TEXT,
     PRIMARY KEY (tenant_id, room_id)
 );
 
@@ -232,6 +237,41 @@ class Database:
         self._retention_days = events_retention_days
         self._conn: aiosqlite.Connection | None = None
 
+    #: Columnas agregadas despues de que la tabla ya existia, en orden.
+    #: (tabla, columna, definicion). Ver `_migrar_columnas`.
+    _COLUMNAS_NUEVAS: tuple[tuple[str, str, str], ...] = (
+        ("custom_rooms", "ha_area_id", "TEXT"),
+    )
+
+    async def _migrar_columnas(self) -> None:
+        """
+        Agrega columnas a tablas que YA existen.
+
+        🔪 ESTO FALTABA, Y EL PROPIO SCHEMA LO ADVERTIA SIN RESOLVERLO:
+        `CREATE TABLE IF NOT EXISTS` no agrega columnas a una tabla creada. La
+        estrategia hasta hoy fue "poner todas las columnas de antemano, aunque
+        el codigo que las llena sea del paso siguiente" — funciona mientras uno
+        adivine el futuro, y deja de funcionar la primera vez que no.
+
+        Sin esto, `ha_area_id` existiria solo en cajas nuevas y toda caja ya
+        instalada arrastraria un schema incompleto para siempre: las
+        habitaciones nunca llegarian a ser areas de HA justo en las casas que
+        ya tienen habitaciones.
+
+        `ADD COLUMN` en SQLite es barato (no reescribe la tabla) y la columna
+        entra como NULL en las filas viejas, que es exactamente lo que la
+        reconciliacion espera encontrar.
+        """
+        conn = self._require_conn()
+        for tabla, columna, definicion in self._COLUMNAS_NUEVAS:
+            async with conn.execute(f"PRAGMA table_info({tabla})") as cur:
+                existentes = {fila["name"] for fila in await cur.fetchall()}
+            if columna in existentes:
+                continue
+            await conn.execute(f"ALTER TABLE {tabla} ADD COLUMN {columna} {definicion}")
+            logger.info("db.columna_agregada", tabla=tabla, columna=columna)
+        await conn.commit()
+
     async def connect(self) -> None:
         """Abre la conexión y crea el schema si no existe."""
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -239,6 +279,7 @@ class Database:
         self._conn.row_factory = aiosqlite.Row
         await self._conn.executescript(_CREATE_TABLES_SQL)
         await self._conn.commit()
+        await self._migrar_columnas()
         logger.info("db.connected", path=str(self._db_path))
 
     async def close(self) -> None:
@@ -733,6 +774,9 @@ class Database:
             "icon": row["icon"],
             "sort_order": row["sort_order"],
             "source": "custom",
+            # El area de HA que le corresponde. `None` = la habitacion todavia
+            # no existe alla; la reconciliacion la crea.
+            "ha_area_id": row["ha_area_id"] if "ha_area_id" in row.keys() else None,
             "created_at": row["created_at"],
             "updated_at": row["updated_at"],
         }
@@ -769,6 +813,24 @@ class Database:
             row = await cur.fetchone()
             return int(row["mx"]) if row and row["mx"] is not None else -1
 
+    async def set_room_area(
+        self, room_id: str, ha_area_id: str | None, tenant_id: int = 1
+    ) -> None:
+        """
+        Ata una habitación de la app a un área de Home Assistant.
+
+        Se usa cuando el área se crea DESPUES de la habitación: la casa estaba
+        caída al crearla, o la habitación es anterior a que las habitaciones
+        fueran áreas de verdad. La reconciliación llama esto.
+        """
+        conn = self._require_conn()
+        await conn.execute(
+            "UPDATE custom_rooms SET ha_area_id = ?, updated_at = ? "
+            "WHERE tenant_id = ? AND room_id = ?",
+            (ha_area_id, utc_now_iso(), tenant_id, room_id),
+        )
+        await conn.commit()
+
     async def create_room(
         self,
         *,
@@ -776,6 +838,7 @@ class Database:
         name: str,
         icon: str | None,
         sort_order: int,
+        ha_area_id: str | None = None,
         tenant_id: int = 1,
     ) -> dict[str, Any]:
         """Inserta una habitación custom nueva. Lanza IntegrityError si room_id duplicado."""
@@ -784,10 +847,10 @@ class Database:
         await conn.execute(
             """
             INSERT INTO custom_rooms
-                (tenant_id, room_id, name, icon, sort_order, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (tenant_id, room_id, name, icon, sort_order, ha_area_id, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (tenant_id, room_id, name, icon, sort_order, ahora, ahora),
+            (tenant_id, room_id, name, icon, sort_order, ha_area_id, ahora, ahora),
         )
         await conn.commit()
         creada = await self.get_room(room_id, tenant_id)

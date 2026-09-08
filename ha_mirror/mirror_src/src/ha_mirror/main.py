@@ -206,6 +206,35 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
 
     # ---------------------------------------------------------------------
+    # LA CASA SE PONE AL DIA CON LA APP, SOLA.
+    #
+    # 🔪 Los nombres y habitaciones que el cliente guardo ANTES de que el Mirror
+    # supiera escribir en el registro de Home Assistant se quedaban en la app
+    # para siempre: nada los volvia a mirar. El sintoma es de los peores —la app
+    # muestra el nombre nuevo, la casa el viejo, y nadie se entera hasta que un
+    # tecnico entra a HA meses despues.
+    #
+    # Correrlo en cada arranque hace que una caja que se actualiza desde una
+    # version vieja se reconcilie sola. Es idempotente: en una casa ya al dia no
+    # escribe nada.
+    #
+    # EN SEGUNDO PLANO y DESPUES de que el upstream este listo — la funcion
+    # degrada sola si la casa todavia no contesta, y el proximo arranque
+    # reintenta. Nunca bloquea: el cliente no espera por esto.
+    async def _reconciliar_al_arrancar() -> None:
+        try:
+            resultado = await app.state.onboarding.reconciliar()
+            logger.info("arranque.reconciliado", **resultado)
+        except Exception:
+            # Nunca fatal. Reconciliar es una mejora oportunista, no un
+            # requisito para que la casa funcione.
+            logger.warning("arranque.reconciliacion_fallo", exc_info=True)
+
+    reconciliar_task = asyncio.create_task(
+        _reconciliar_al_arrancar(), name="reconciliar"
+    )
+
+    # ---------------------------------------------------------------------
     # MODO FABRICA vs MODO ARTESANAL — el interruptor es `platform_base_url`.
     #
     # Artesanal (default, vacio): no se genera identidad, no se reporta a
@@ -490,7 +519,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if crestron_client is not None:
             with suppress(Exception):
                 await crestron_client.close()
-        for tarea in (announce_task, tunnel_task, auto_update_task):
+        for tarea in (announce_task, tunnel_task, auto_update_task, reconciliar_task):
             if tarea is not None:
                 tarea.cancel()
                 with suppress(asyncio.CancelledError, Exception):

@@ -274,6 +274,54 @@ async def get_capabilities(
 
 
 @router.get(
+    "/cotejo",
+    summary="Que dice la app, que dice la casa, y en que difieren",
+)
+async def get_cotejo(
+    request: Request,
+    _: None = Depends(require_api_key),
+) -> dict[str, Any]:
+    """
+    La prueba de que las dos verdades coinciden — o la lista de las que no.
+
+    🔪 EXISTE POR UNA CACERIA DE DOS HORAS QUE DEBIO DURAR DIEZ SEGUNDOS. Un
+    aparato renombrado desde la app no habia cambiado en HA, y no habia UNA sola
+    pantalla ni UN solo endpoint capaz de decirlo: hubo que descifrar el token
+    de administracion, abrir el WebSocket del Core a mano y comparar registros
+    para descubrir algo que el sistema deberia poder contestar solo.
+
+    Un sistema que promete que dos lados dicen lo mismo tiene que poder
+    demostrarlo. Esta ruta es esa demostracion.
+
+    SIEMPRE 200. Con la casa caida contesta `disponible:false` — no saber no es
+    lo mismo que estar de acuerdo.
+    """
+    svc = _svc(request)
+    return await svc.cotejar(_tenant_id(request))
+
+
+@router.post(
+    "/reconciliar",
+    summary="Empuja a Home Assistant todo lo que la app ya tenia guardado",
+)
+async def post_reconciliar(
+    request: Request,
+    _: None = Depends(require_api_key),
+) -> dict[str, Any]:
+    """
+    Pone la casa al dia con la app. Idempotente.
+
+    Es el arreglo del agujero que dejo la version anterior: los nombres y
+    habitaciones guardados ANTES de que esto escribiera en HA se quedaban en la
+    app para siempre, porque nada los volvia a mirar. Tambien corre solo al
+    arrancar el add-on, asi que una caja que se actualiza desde una version
+    vieja se pone al dia sin que nadie apriete nada.
+    """
+    svc = _svc(request)
+    return await svc.reconciliar(_tenant_id(request))
+
+
+@router.get(
     "/overrides",
     summary="Lee todos los overrides y habitaciones custom",
 )

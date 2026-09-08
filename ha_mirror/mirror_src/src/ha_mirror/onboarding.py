@@ -315,6 +315,7 @@ class OnboardingService:
         self,
         entity_id: str,
         provided_fields: dict[str, Any],
+        tenant_id: int = 1,
     ) -> None:
         """
         Escribe en el REGISTRO de Home Assistant. La verdad vive ahí.
@@ -360,6 +361,21 @@ class OnboardingService:
             # lados.
             cambios["hidden_by"] = "user" if provided_fields["hidden"] else None
 
+        if "room_id" in provided_fields:
+            # 🔪 EL CUARTO TAMBIÉN ES REAL. Mover un aparato de habitación en la
+            # app tiene que moverlo en la casa: es la mitad de "nombres o
+            # sitios" que faltaba. `area_id: None` lo saca del cuarto, igual que
+            # hace la interfaz de HA.
+            #
+            # Va con `.get`, no dentro de un try: si la habitación de la app
+            # todavía no tiene área en HA (se creó con la casa caída), esto
+            # manda `None` y el aparato queda sin cuarto en HA hasta que la
+            # reconciliación lo arregle. Es preferible a reventar el guardado
+            # entero por una habitación a medio crear.
+            cambios["area_id"] = await self._area_de_habitacion(
+                provided_fields["room_id"], tenant_id
+            )
+
         if not cambios:
             # Solo cambió algo que vive únicamente en la app (`icon`,
             # `sort_order`). No hay nada que escribir en HA.
@@ -404,7 +420,7 @@ class OnboardingService:
             raise KeyError(f"Entidad {entity_id!r} no encontrada en el store")
 
         # HA primero. Si lanza, no se guarda nada.
-        await self._escribir_registro_ha(entity_id, provided_fields)
+        await self._escribir_registro_ha(entity_id, provided_fields, tenant_id)
 
         # Leer estado actual
         actual = await self._db.get_override(entity_id, tenant_id)
@@ -467,8 +483,13 @@ class OnboardingService:
         Si HA no responde, esto lanza y la fila local NO se borra — que es lo
         correcto: mejor dejar todo como estaba que borrar la mitad.
         """
+        # `room_id: None` va incluido a propósito: borrar el override tiene que
+        # devolver el aparato a como estaba en TODO, y eso incluye sacarlo del
+        # cuarto que le puso la app. Sin esto, el nombre volvía al de fábrica y
+        # el cuarto quedaba puesto — media vuelta atrás es su propia
+        # desincronización.
         await self._escribir_registro_ha(
-            entity_id, {"display_name": None, "hidden": False}
+            entity_id, {"display_name": None, "hidden": False, "room_id": None}, tenant_id
         )
         await self._db.delete_override(entity_id, tenant_id)
 
@@ -506,6 +527,117 @@ class OnboardingService:
         rooms = await self._db.list_rooms(tenant_id)
         return {"rooms": rooms}
 
+    # -------------------------------------------------------------------------
+    # Habitaciones = ÁREAS de Home Assistant
+    # -------------------------------------------------------------------------
+    #
+    # 🔪 HASTA ACÁ UNA HABITACIÓN NO EXISTÍA FUERA DE LA APP. Se guardaba en
+    # `custom_rooms` con un `room_id` inventado (`custom:<slug>`) y Home
+    # Assistant no se enteraba nunca. El resultado medido en la casa de
+    # referencia: 5 áreas, **0 de 252 entidades con área propia**, y 9 de los 10
+    # aparatos asignados metidos en un cajón llamado `all_house`. Un técnico que
+    # entra a HA ve una casa sin cuartos, y `habitaciones.ts` tiene casi mil
+    # líneas adivinando el cuarto desde el nombre del aparato porque no hay otra
+    # forma de saberlo.
+    #
+    # Es la misma decisión que se tomó para los nombres (`_escribir_registro_ha`)
+    # aplicada al otro campo que el cliente toca: si lo hace en la app, tiene que
+    # haber pasado en la casa.
+    #
+    # ── LOS FALLOS NO SE TRATAN IGUAL, Y ESO ES A PROPÓSITO ────────────────
+    # Renombrar un aparato SIN escribir en HA es una mentira, así que revienta.
+    # Crear una habitación es distinto: si la casa no contesta, la habitación se
+    # crea igual en la app con `ha_area_id = None` y la reconciliación la crea
+    # en HA después. El cliente no puede quedarse sin poder ordenar su casa
+    # porque el túnel se cayó diez segundos — y a diferencia de un nombre, acá
+    # no hay dos verdades: hay una verdad y una tarea pendiente, anotada.
+
+    async def _crear_area_ha(self, nombre: str) -> str | None:
+        """
+        Crea el área en HA y devuelve su `area_id`. `None` si no se pudo.
+
+        HA genera el id a partir del nombre; no se elige desde acá. Si ya existe
+        un área con ese nombre, HA contesta un error y se devuelve `None`: la
+        reconciliación después la ata por nombre en vez de crear una gemela.
+        """
+        try:
+            resp = await self._upstream.send_command(
+                {"type": "config/area_registry/create", "name": nombre}, timeout=10.0
+            )
+        except (UpstreamNotReadyError, HaProtocolError) as exc:
+            logger.warning("onboarding.area_no_creada", nombre=nombre, detalle=str(exc))
+            return None
+        area_id = (resp.get("result") or {}).get("area_id")
+        if isinstance(area_id, str) and area_id:
+            logger.info("onboarding.area_creada", nombre=nombre, area_id=area_id)
+            return area_id
+        return None
+
+    async def _renombrar_area_ha(self, area_id: str, nombre: str) -> None:
+        """Renombra el área en HA. No revienta: ver la cabecera de la sección."""
+        try:
+            await self._upstream.send_command(
+                {"type": "config/area_registry/update", "area_id": area_id, "name": nombre},
+                timeout=10.0,
+            )
+            logger.info("onboarding.area_renombrada", area_id=area_id, nombre=nombre)
+        except (UpstreamNotReadyError, HaProtocolError) as exc:
+            logger.warning("onboarding.area_no_renombrada", area_id=area_id, detalle=str(exc))
+
+    async def _borrar_area_ha(self, area_id: str) -> None:
+        """
+        Borra el área en HA.
+
+        ⚠️ Borrar un área puede romper automatizaciones que apunten a ella —
+        crear es inofensivo, borrar no. Se hace igual porque la alternativa es
+        peor: dejar en HA un cuarto que el cliente ya borró de su app es
+        exactamente la desincronización que esto viene a eliminar. Los aparatos
+        NO se borran: HA los deja sin área, que es lo mismo que pasa cuando se
+        borra un área desde su propia interfaz.
+        """
+        try:
+            await self._upstream.send_command(
+                {"type": "config/area_registry/delete", "area_id": area_id}, timeout=10.0
+            )
+            logger.info("onboarding.area_borrada", area_id=area_id)
+        except (UpstreamNotReadyError, HaProtocolError) as exc:
+            logger.warning("onboarding.area_no_borrada", area_id=area_id, detalle=str(exc))
+
+    async def _areas_de_ha(self) -> dict[str, str]:
+        """Áreas que ya existen en HA: nombre normalizado → area_id."""
+        try:
+            resp = await self._upstream.send_command(
+                {"type": "config/area_registry/list"}, timeout=10.0
+            )
+        except (UpstreamNotReadyError, HaProtocolError):
+            return {}
+        fuera: dict[str, str] = {}
+        for a in resp.get("result") or []:
+            nombre = a.get("name")
+            aid = a.get("area_id")
+            if isinstance(nombre, str) and isinstance(aid, str):
+                fuera[nombre.strip().casefold()] = aid
+        return fuera
+
+    async def _area_de_habitacion(self, room_id: str | None, tenant_id: int) -> str | None:
+        """
+        El `area_id` de HA que le toca a un `room_id` de la app.
+
+        `None` significa "sin área" y viaja igual a HA: es como se saca un
+        aparato de un cuarto.
+        """
+        if not room_id:
+            return None
+        # Un room_id sin el prefijo `custom:` YA es un área de HA: la app
+        # también deja elegir entre las áreas que la casa ya tenía.
+        if not room_id.startswith("custom:"):
+            return room_id
+        fila = await self._db.get_room(room_id, tenant_id)
+        if fila is None:
+            return None
+        area = fila.get("ha_area_id")
+        return area if isinstance(area, str) and area else None
+
     async def create_room(
         self,
         name: str,
@@ -529,12 +661,22 @@ class OnboardingService:
         max_order = await self._db.get_rooms_max_sort_order(tenant_id)
         sort_order = max_order + 1
 
+        # El área en HA primero, para guardar su id junto con la habitación. Si
+        # ya existe un área con ese mismo nombre se reutiliza en vez de crear
+        # una gemela: el cliente que escribe "Cocina" en la app se refiere a la
+        # Cocina que la casa ya tiene, no a una segunda.
+        existentes = await self._areas_de_ha()
+        area_id = existentes.get(name.strip().casefold())
+        if area_id is None:
+            area_id = await self._crear_area_ha(name)
+
         try:
             return await self._db.create_room(
                 room_id=room_id,
                 name=name,
                 icon=icon,
                 sort_order=sort_order,
+                ha_area_id=area_id,
                 tenant_id=tenant_id,
             )
         except aiosqlite.IntegrityError:
@@ -560,11 +702,214 @@ class OnboardingService:
         )
         if resultado is None:
             raise KeyError(f"Habitación {room_id!r} no encontrada")
+
+        # Renombrar acá tiene que renombrar el cuarto en la casa. `icon` y
+        # `sort_order` no viajan: no existen en el registro de áreas de HA.
+        nombre = provided_fields.get("name")
+        if isinstance(nombre, str) and nombre.strip():
+            area_id = resultado.get("ha_area_id")
+            if isinstance(area_id, str) and area_id:
+                await self._renombrar_area_ha(area_id, nombre)
+            else:
+                # La habitación nunca llegó a existir en HA (se creó con la casa
+                # caída, o es anterior a que esto existiera). Se crea ahora.
+                nuevo = await self._crear_area_ha(nombre)
+                if nuevo is not None:
+                    await self._db.set_room_area(room_id, nuevo, tenant_id)
+                    resultado["ha_area_id"] = nuevo
         return resultado
 
     async def delete_room(self, room_id: str, tenant_id: int = 1) -> None:
-        """Borra una habitación custom y limpia overrides que la referencian."""
+        """
+        Borra una habitación custom, su área en HA, y limpia los overrides que
+        la referencian.
+
+        El orden es al revés que en los nombres: primero se lee de la base
+        (hace falta el `ha_area_id`), después se borra allá, y al final acá. Si
+        HA no contesta, el área queda huérfana en la casa y la habitación
+        igual se borra de la app — es un cuarto vacío en HA, no una mentira.
+        """
+        fila = await self._db.get_room(room_id, tenant_id)
+        area_id = (fila or {}).get("ha_area_id")
+        if isinstance(area_id, str) and area_id:
+            await self._borrar_area_ha(area_id)
         await self._db.delete_room(room_id, tenant_id)
+
+    # -------------------------------------------------------------------------
+    # Cotejo y reconciliación — que las dos verdades se puedan comparar
+    # -------------------------------------------------------------------------
+    #
+    # 🔪 ESTO SALE DE UNA CACERÍA DE DOS HORAS QUE DEBIÓ DURAR DIEZ SEGUNDOS.
+    #
+    # El 2026-09-07 un aire se renombró desde la app y no cambió en HA. Se
+    # revisó el código (correcto), la versión instalada (correcta), el CI
+    # (correcto), los permisos (correctos), el log de HA (limpio). Cada eslabón
+    # estaba bien y la cadena no funcionaba.
+    #
+    # La causa: el override se había guardado horas antes, con la caja todavía
+    # en una versión que NO escribía en HA, y **nada re-empuja lo que ya está
+    # guardado**. La app mostraba el nombre nuevo, la casa el viejo, y no había
+    # una sola pantalla ni un solo endpoint capaz de decir que discrepaban.
+    #
+    # La lección no es "faltaba una llamada". Es que un sistema que promete que
+    # dos lados dicen lo mismo tiene que poder DEMOSTRARLO, y este no podía. De
+    # ahí salen los dos métodos de acá:
+    #
+    #   · `cotejar()`   — qué dice la app, qué dice la casa, y en qué difieren.
+    #   · `reconciliar()` — empuja a HA todo lo que la app ya tenía guardado.
+    #
+    # `cotejar` es el que importa a largo plazo: mientras exista, un desacuerdo
+    # se ve en una pantalla en vez de descubrirse por casualidad meses después.
+
+    async def cotejar(self, tenant_id: int = 1) -> dict[str, Any]:
+        """
+        Compara lo que dice la app contra lo que dice Home Assistant.
+
+        SIEMPRE 200. Con la casa caída devuelve `disponible: False` y ninguna
+        diferencia — no saber no es lo mismo que estar de acuerdo, y por eso el
+        campo se llama `disponible` y no `ok`.
+        """
+        try:
+            resp = await self._upstream.send_command(
+                {"type": "config/entity_registry/list"}, timeout=15.0
+            )
+        except (UpstreamNotReadyError, HaProtocolError) as exc:
+            logger.info("onboarding.cotejo_no_disponible", detalle=str(exc))
+            return {"disponible": False, "diferencias": [], "total_revisado": 0}
+
+        registro = {
+            e.get("entity_id"): e for e in (resp.get("result") or []) if e.get("entity_id")
+        }
+        areas_por_id = {r["room_id"]: r for r in await self._db.list_rooms(tenant_id)}
+        overrides = await self._db.list_overrides(tenant_id)
+
+        diferencias: list[dict[str, Any]] = []
+        for ov in overrides:
+            entity_id = ov["entity_id"]
+            fila = registro.get(entity_id)
+            if fila is None:
+                # La entidad no está en el registro de HA. Pasa con las que HA
+                # no registra (plantillas, grupos). No es un desacuerdo.
+                continue
+
+            # --- Nombre ---
+            quiere = ov.get("display_name")
+            tiene = fila.get("name")
+            if quiere is not None and quiere != tiene:
+                diferencias.append({
+                    "entity_id": entity_id,
+                    "campo": "nombre",
+                    "en_la_app": quiere,
+                    "en_la_casa": tiene,
+                })
+
+            # --- Oculto ---
+            quiere_oculto = bool(ov.get("hidden"))
+            tiene_oculto = fila.get("hidden_by") is not None
+            if quiere_oculto != tiene_oculto:
+                diferencias.append({
+                    "entity_id": entity_id,
+                    "campo": "oculto",
+                    "en_la_app": quiere_oculto,
+                    "en_la_casa": tiene_oculto,
+                })
+
+            # --- Habitación ---
+            room_id = ov.get("room_id")
+            if room_id:
+                esperada = await self._area_de_habitacion(room_id, tenant_id)
+                actual = fila.get("area_id")
+                if esperada != actual:
+                    hab = areas_por_id.get(room_id)
+                    diferencias.append({
+                        "entity_id": entity_id,
+                        "campo": "habitacion",
+                        "en_la_app": (hab or {}).get("name") or room_id,
+                        "en_la_casa": actual,
+                    })
+
+        # --- Habitaciones que no existen en HA ---
+        for hab in areas_por_id.values():
+            if not hab.get("ha_area_id"):
+                diferencias.append({
+                    "entity_id": hab["room_id"],
+                    "campo": "habitacion_sin_area",
+                    "en_la_app": hab["name"],
+                    "en_la_casa": None,
+                })
+
+        logger.info(
+            "onboarding.cotejo",
+            revisados=len(overrides),
+            diferencias=len(diferencias),
+        )
+        return {
+            "disponible": True,
+            "total_revisado": len(overrides) + len(areas_por_id),
+            "diferencias": diferencias,
+        }
+
+    async def reconciliar(self, tenant_id: int = 1) -> dict[str, Any]:
+        """
+        Empuja a Home Assistant todo lo que la app ya tenía guardado.
+
+        Idempotente: volver a correrlo sobre una casa ya reconciliada no cambia
+        nada. Por eso puede correr al arrancar el add-on sin pensarlo dos veces
+        — que es justo lo que hace que una caja actualizada desde una versión
+        vieja se ponga al día sola, sin que nadie se acuerde de apretar nada.
+
+        No revienta por un item: si uno falla se anota y sigue. Es lo contrario
+        del lote de `batch_overrides`, y a propósito: allá el cliente está
+        mirando y un fallo a mitad deja un resultado que no pidió; acá esto
+        corre solo, y frenar todo porque una entidad ya no existe sería peor.
+        """
+        creadas = 0
+        escritas = 0
+        fallos: list[dict[str, str]] = []
+
+        # 1. Las habitaciones primero: los aparatos necesitan que su área exista.
+        existentes = await self._areas_de_ha()
+        for hab in await self._db.list_rooms(tenant_id):
+            if hab.get("ha_area_id"):
+                continue
+            nombre = hab["name"]
+            area_id = existentes.get(nombre.strip().casefold())
+            if area_id is None:
+                area_id = await self._crear_area_ha(nombre)
+            if area_id is None:
+                fallos.append({"id": hab["room_id"], "motivo": "no se pudo crear el área"})
+                continue
+            await self._db.set_room_area(hab["room_id"], area_id, tenant_id)
+            creadas += 1
+
+        # 2. Los aparatos.
+        for ov in await self._db.list_overrides(tenant_id):
+            entity_id = ov["entity_id"]
+            if self._store.get_state(entity_id) is None:
+                # Ya no existe en la casa. No es un fallo: es un override viejo.
+                continue
+            campos: dict[str, Any] = {"hidden": bool(ov.get("hidden"))}
+            if ov.get("display_name") is not None:
+                campos["display_name"] = ov["display_name"]
+            if ov.get("room_id"):
+                campos["room_id"] = ov["room_id"]
+            try:
+                await self._escribir_registro_ha(entity_id, campos, tenant_id)
+                escritas += 1
+            except (UpstreamNotReadyError, HaProtocolError) as exc:
+                fallos.append({"id": entity_id, "motivo": str(exc)[:120]})
+
+        logger.info(
+            "onboarding.reconciliado",
+            areas_creadas=creadas,
+            entidades_escritas=escritas,
+            fallos=len(fallos),
+        )
+        return {
+            "areas_creadas": creadas,
+            "entidades_escritas": escritas,
+            "fallos": fallos,
+        }
 
     # -------------------------------------------------------------------------
     # Pending (detección de dispositivos nuevos)
