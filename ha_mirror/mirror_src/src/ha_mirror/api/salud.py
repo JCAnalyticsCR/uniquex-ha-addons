@@ -52,6 +52,7 @@ from pydantic import BaseModel, Field
 from ha_mirror.auth import require_api_key
 from ha_mirror.errors import HaProtocolError, UpstreamNotReadyError
 from ha_mirror.models import leer_atributo
+from ha_mirror.onboarding_familias import familia_de
 
 logger = structlog.get_logger(__name__)
 
@@ -117,6 +118,27 @@ class SaludResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+def _nombre_legible(e: dict[str, Any]) -> str:
+    """
+    Un nombre que una persona reconozca, o la familia.
+
+    🔪 HOME ASSISTANT NO SIEMPRE TIENE UN NOMBRE. Overkiz solo publica el número
+    de serie de su central, así que la primera corrida contra una casa real
+    avisó *"1610-1941-3231 dejó de responder"* — cierto, inútil, y el dueño no
+    tiene forma de saber que eso son sus persianas.
+
+    Cuando lo que vino no tiene ni una letra, se usa la familia ("Persianas
+    Somfy"), que dice QUÉ es. Vale más que el identificador exacto: quien va a
+    apretar el botón no necesita el número de serie, y quien lo necesite lo ve
+    adentro del formulario.
+    """
+    nombre = str(e.get("nombre") or "").strip()
+    familia = str(e.get("family_label") or "").strip()
+    if nombre and any(c.isalpha() for c in nombre):
+        return nombre
+    return familia or nombre or "un aparato"
+
+
 async def _formularios(svc: Any) -> list[Hallazgo]:
     """
     Lo que Home Assistant preguntó y nadie contestó.
@@ -130,7 +152,7 @@ async def _formularios(svc: Any) -> list[Hallazgo]:
     fuera: list[Hallazgo] = []
     for e in datos.get("encontrados") or []:
         falla = bool(e.get("es_falla"))
-        nombre = e.get("nombre") or e.get("family_label") or "un aparato"
+        nombre = _nombre_legible(e)
         if falla:
             fuera.append(
                 Hallazgo(
@@ -177,7 +199,17 @@ async def _integraciones(upstream: Any) -> list[Hallazgo]:
         estado = e.get("state")
         if estado in (None, "loaded", "not_loaded"):
             continue
-        titulo = e.get("title") or e.get("domain") or "una integración"
+        # 🔪 EL TITULO DE UNA CONFIG ENTRY NO SE MUESTRA. Home Assistant lo
+        # rellena con lo que identifique a la cuenta, y muy seguido eso es un
+        # CORREO: la primera corrida de esto contra una casa real puso
+        # "sc3698889@gmail.com no está funcionando" en la pantalla del dueño —
+        # la dirección del instalador, que es un tercero.
+        #
+        # Este proyecto ya se había quemado por esta vía (ver
+        # `_nombre_del_flow`, que enmascara por la misma razón). Se usa la
+        # familia del dominio, que dice qué es sin decir de quién.
+        dominio = str(e.get("domain") or "")
+        _, titulo = familia_de(dominio, dominio or "una integración")
         fuera.append(
             Hallazgo(
                 id=f"entry:{e.get('entry_id')}",
@@ -211,7 +243,16 @@ def _dominios_caidos(store: Any) -> list[Hallazgo]:
     for eid, st in estados.items():
         dom = eid.split(".", 1)[0]
         por_dominio.setdefault(dom, []).append(eid)
-        if getattr(st, "state", None) in ("unavailable", "unknown"):
+        # 🔪 SOLO `unavailable`, NUNCA `unknown`.
+        #
+        # Un `button` de Home Assistant vive en `unknown` hasta que alguien lo
+        # aprieta: ese es su estado NORMAL. Contando `unknown` como caído, la
+        # primera corrida contra una casa real avisó "24 de 24 aparatos del
+        # grupo «button» no responden" — los 24 botones estaban perfectos.
+        #
+        # `unavailable` significa que la casa intentó hablarle y no pudo. Eso sí
+        # es una falla, y es lo único que se cuenta.
+        if getattr(st, "state", None) == "unavailable":
             caidos[dom] = caidos.get(dom, 0) + 1
 
     fuera: list[Hallazgo] = []
@@ -244,7 +285,8 @@ def _abandonados(store: Any) -> list[Hallazgo]:
     ahora = datetime.now(UTC)
     viejos: list[tuple[str, float, str]] = []
     for eid, st in store.get_all_states().items():
-        if getattr(st, "state", None) not in ("unavailable", "unknown"):
+        # Misma razón que en `_dominios_caidos`: `unknown` no es una falla.
+        if getattr(st, "state", None) != "unavailable":
             continue
         crudo = getattr(st, "last_changed", None) or getattr(st, "last_updated", None)
         if crudo is None:
