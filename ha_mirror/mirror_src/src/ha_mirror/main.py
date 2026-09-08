@@ -44,6 +44,7 @@ from ha_mirror.api.matter import router as matter_router
 from ha_mirror.api.onboarding import router as onboarding_router
 from ha_mirror.api.preferences import router as preferences_router
 from ha_mirror.api.mantenimiento import router as mantenimiento_router
+from ha_mirror.api.uso import router as uso_router
 from ha_mirror.api.pronostico import router as pronostico_router
 from ha_mirror.api.scenes import router as scenes_router
 from ha_mirror.api.service import router as service_router
@@ -597,6 +598,10 @@ def create_app() -> FastAPI:
     # el proxy de /api/service sigue prohibiendo update/hassio/backup y esa
     # lista negra no se toca. Ver la cabecera de mantenimiento.py.
     app.include_router(mantenimiento_router)
+    # Horas de uso MEDIDAS. Es lo que le falta a la pantalla de Consumo para
+    # dejar de multiplicar por horas supuestas: HA graba cada encendido, asi que
+    # el tiempo es dato duro y solo el vataje sigue siendo estimacion.
+    app.include_router(uso_router)
     # Costumbres: crea automatizaciones a partir de RECETAS, nunca de JSON del
     # cliente, y con la barrera "solo ambiente" del lado del servidor.
     app.include_router(costumbres_router)
