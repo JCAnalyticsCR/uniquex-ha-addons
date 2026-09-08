@@ -31,9 +31,19 @@ por estar rotos — son peligrosos porque si uno falla, **la casa queda
 incomunicada o ciega y el dueño no tiene cómo recuperarla desde el teléfono**.
 Esos los instala quien pueda llegar a la cajita.
 
-── EL RESPALDO VA ANTES, SIEMPRE ─────────────────────────────────────────────
+── EL RESPALDO VA ANTES, DONDE SE PUEDE ──────────────────────────────────────
 `update.install` acepta `backup: true` y acá no es opcional. Una actualización
 sin respaldo previo es una apuesta, y el que la paga no es quien la programó.
+
+🔪 PERO NO TODAS LAS ENTIDADES SABEN RESPALDAR, y mandárselo igual no es
+inofensivo: Home Assistant RECHAZA la llamada entera y la actualización no se
+hace. `BACKUP` es el bit 8 de `supported_features`; los add-ons lo traen (29) y
+las integraciones de HACS no (23). En la casa de referencia son **7 de 16**.
+
+La primera versión lo mandaba siempre, y el cliente que apretaba Instalar en una
+de esas siete se llevaba un 500 pelado: sin respaldo, sin actualización y sin
+explicación. Ahora se manda solo donde existe, y el mensaje dice cuál de los dos
+casos fue — que es lo único honesto cuando no se pudo respaldar.
 """
 
 from __future__ import annotations
@@ -42,11 +52,11 @@ import re
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field
 
 from ha_mirror.auth import require_api_key
-from ha_mirror.errors import UpstreamNotReadyError
+from ha_mirror.errors import HaProtocolError, UpstreamNotReadyError
 from ha_mirror.models import leer_atributo
 
 logger = structlog.get_logger(__name__)
@@ -258,21 +268,63 @@ async def instalar(
     if upstream is None:
         raise UpstreamNotReadyError("Sin conexión con la casa.")
 
-    logger.info("instalando_actualizacion", entity_id=entity_id, nombre=nombre)
-    await upstream.send_service_call(
-        "update",
-        "install",
-        {
-            # El respaldo NO es opcional. Ver la cabecera.
-            "service_data": {"backup": True},
-            "target": {"entity_id": entity_id},
-        },
+    # 🔪 NO TODAS LAS ACTUALIZACIONES SABEN RESPALDAR, Y MANDARLES `backup`
+    # REVIENTA. Home Assistant declara por entidad qué soporta; `BACKUP` es el
+    # bit 8 de `supported_features`. Los add-ons lo traen (29); las
+    # integraciones de HACS, no (23).
+    #
+    # Mandarlo igual no lo ignora: HA rechaza la llamada entera y la
+    # actualización NO se hace. En la casa de referencia eso es **7 de 16**
+    # actualizaciones, y el cliente veía un 500 pelado al apretar Instalar —
+    # sin respaldo, sin actualización y sin explicación.
+    #
+    # La cabecera dice que el respaldo no es opcional, y sigue siendo cierto
+    # donde SE PUEDE. Donde HA no lo ofrece, la alternativa no es "instalar sin
+    # avisar": es instalar y DECIRLO, que es lo que hace el mensaje de abajo.
+    puede_respaldar = bool(int(leer_atributo(estado, "supported_features") or 0) & 8)
+
+    datos: dict[str, Any] = {"backup": True} if puede_respaldar else {}
+
+    logger.info(
+        "instalando_actualizacion",
+        entity_id=entity_id,
+        nombre=nombre,
+        con_respaldo=puede_respaldar,
     )
+    try:
+        await upstream.send_service_call(
+            "update",
+            "install",
+            {"service_data": datos, "target": {"entity_id": entity_id}},
+        )
+    except UpstreamNotReadyError:
+        raise
+    except HaProtocolError as exc:
+        # 🔪 SIN ESTE `except` SALÍA UN 500. Un error de HA subía sin atrapar,
+        # FastAPI lo convertía en "Internal Server Error", el cuerpo no era JSON
+        # y la app mostraba su mensaje más genérico — "No se pudo hablar con la
+        # casa"— cuando la casa había contestado perfectamente que NO.
+        logger.warning(
+            "instalacion_rechazada", entity_id=entity_id, detalle=str(exc)[:160]
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=(
+                "La casa no aceptó instalar esta actualización. Puede que el "
+                "aparato no esté disponible en este momento."
+            ),
+        ) from None
+
     return Resultado(
         ok=True,
         mensaje=(
-            f"{nombre} se está actualizando. La casa guardó un respaldo antes de "
-            "empezar. Puede tardar unos minutos."
+            f"{nombre} se está actualizando. "
+            + (
+                "La casa guardó un respaldo antes de empezar. "
+                if puede_respaldar
+                else "Esta actualización no admite respaldo previo, así que no se hizo uno. "
+            )
+            + "Puede tardar unos minutos."
         ),
     )
 
