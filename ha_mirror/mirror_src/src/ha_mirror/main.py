@@ -44,6 +44,7 @@ from ha_mirror.api.matter import router as matter_router
 from ha_mirror.api.onboarding import router as onboarding_router
 from ha_mirror.api.preferences import router as preferences_router
 from ha_mirror.api.mantenimiento import router as mantenimiento_router
+from ha_mirror.api.salud import router as salud_router
 from ha_mirror.api.uso import router as uso_router
 from ha_mirror.api.pronostico import router as pronostico_router
 from ha_mirror.api.scenes import router as scenes_router
@@ -602,6 +603,10 @@ def create_app() -> FastAPI:
     # dejar de multiplicar por horas supuestas: HA graba cada encendido, asi que
     # el tiempo es dato duro y solo el vataje sigue siendo estimacion.
     app.include_router(uso_router)
+    # Salud: que esta rota la casa, desde cuando, y que se puede hacer. NO abre
+    # ninguna puerta nueva — las acciones que ofrece son rutas que ya existen
+    # con su politica adentro. Solo lee y decide que mostrar.
+    app.include_router(salud_router)
     # Costumbres: crea automatizaciones a partir de RECETAS, nunca de JSON del
     # cliente, y con la barrera "solo ambiente" del lado del servidor.
     app.include_router(costumbres_router)
