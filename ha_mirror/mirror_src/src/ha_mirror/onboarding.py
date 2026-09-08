@@ -151,6 +151,10 @@ class OnboardingService:
         self._rescan_lock = asyncio.Lock()
         # Caché de capabilities: tenant_id → (monotonic_timestamp, result_dict)
         self._caps_cache: dict[int, tuple[float, dict[str, Any]]] = {}
+        # Caché de los textos de HA por integración. No expira: las traducciones
+        # de una versión instalada no cambian hasta que se actualiza el Core, y
+        # entonces el add-on reinicia igual.
+        self._textos_cache: dict[str, dict[str, str]] = {}
 
     # -------------------------------------------------------------------------
     # Capabilities
@@ -1188,7 +1192,7 @@ class OnboardingService:
 
         crudo = await cliente.iniciar(handler)
         logger.info("onboarding.alta_iniciada", handler=handler, tipo=crudo.get("type"))
-        return self._paso_limpio(crudo)
+        return await self._paso_traducido(crudo)
 
     async def retomar_alta(self, flow_id: str) -> dict[str, Any]:
         """
@@ -1229,7 +1233,7 @@ class OnboardingService:
                 f"Formulario {flow_id!r} desconocido"
             ) from exc
         logger.info("onboarding.alta_retomada", tipo=crudo.get("type"))
-        return self._paso_limpio(crudo)
+        return await self._paso_traducido(crudo)
 
     async def avanzar_alta(self, flow_id: str, datos: dict[str, Any]) -> dict[str, Any]:
         """
@@ -1259,7 +1263,7 @@ class OnboardingService:
         crudo = await cliente.avanzar(flow_id, datos)
         # Se loguea el TIPO de resultado, nunca el contenido.
         logger.info("onboarding.alta_avanzada", tipo=crudo.get("type"))
-        return self._paso_limpio(crudo)
+        return await self._paso_traducido(crudo)
 
     async def cancelar_alta(self, flow_id: str) -> None:
         """Abandona un formulario. Misma comprobación que avanzar."""
@@ -1318,6 +1322,75 @@ class OnboardingService:
                     )
                 return
         raise OnboardingFlowNoEncontradoError(f"Formulario {flow_id!r} desconocido")
+
+    async def _textos_de(self, handler: str) -> dict[str, str]:
+        """
+        Los textos que Home Assistant tiene para esta integración, en español.
+
+        🔪 ESTO REEMPLAZA UNA TABLA ESCRITA A MANO. La app traía cinco motivos
+        traducidos (`already_configured`, `cannot_connect`, `invalid_auth`,
+        `no_devices_found`, `single_instance_allowed`) y cualquier otro salía
+        crudo en la pantalla del cliente. Pasó de verdad: al intentar sumar un
+        aparato que anuncia AirPlay sin ser un Apple TV, el diálogo mostró
+        `inconsistent_device` — el nombre interno de una variable, en inglés,
+        en la cara del dueño de la casa.
+
+        Y esa tabla no se podía completar: esta casa ofrece **921** handlers de
+        alta, cada uno con sus propios motivos. Escribirlos a mano es una carrera
+        que se pierde en la primera integración que alguien instale.
+
+        Home Assistant ya los tiene traducidos, todos, y los sirve por el mismo
+        WebSocket que ya usamos. La frase real para el caso de arriba es *"No se
+        encontraron los protocolos esperados durante el descubrimiento. Esto
+        normalmente indica un problema con multicast DNS"* — que además explica
+        QUÉ pasó, cosa que ninguna tabla nuestra iba a lograr.
+
+        Devuelve `{}` si no se puede: traducir es un lujo, nunca un requisito.
+        """
+        cacheado = self._textos_cache.get(handler)
+        if cacheado is not None:
+            return cacheado
+        try:
+            resp = await self._upstream.send_command(
+                {
+                    "type": "frontend/get_translations",
+                    "language": "es",
+                    "category": "config",
+                    "integration": [handler],
+                },
+                timeout=10.0,
+            )
+        except (UpstreamNotReadyError, HaProtocolError):
+            return {}
+        except Exception:
+            logger.warning("onboarding.textos_error", handler=handler)
+            return {}
+        crudo = (resp.get("result") or {}).get("resources") or {}
+        textos = {str(k): str(v) for k, v in crudo.items() if isinstance(v, str)}
+        self._textos_cache[handler] = textos
+        return textos
+
+    async def _paso_traducido(self, crudo: dict[str, Any]) -> dict[str, Any]:
+        """
+        `_paso_limpio` + la frase que Home Assistant usaría para este aborto.
+
+        Se agrega como campo APARTE (`mensaje`) y no se pisa `razon`: el código
+        crudo sigue viajando porque es lo único estable para registrar y para
+        que la app decida algo distinto en un caso puntual. Lo que cambia es que
+        ahora hay una frase que se le puede mostrar a una persona.
+        """
+        paso = self._paso_limpio(crudo)
+        if paso.get("tipo") != "abort":
+            return paso
+        razon = paso.get("razon")
+        handler = crudo.get("handler")
+        if not razon or not isinstance(handler, str) or not handler:
+            return paso
+        textos = await self._textos_de(handler)
+        frase = textos.get(f"component.{handler}.config.abort.{razon}")
+        if frase:
+            paso["mensaje"] = frase
+        return paso
 
     def _paso_limpio(self, crudo: dict[str, Any]) -> dict[str, Any]:
         """
