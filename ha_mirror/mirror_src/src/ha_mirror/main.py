@@ -205,34 +205,6 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         asegurar_auto_update(), name="auto_update"
     )
 
-    # ---------------------------------------------------------------------
-    # LA CASA SE PONE AL DIA CON LA APP, SOLA.
-    #
-    # 🔪 Los nombres y habitaciones que el cliente guardo ANTES de que el Mirror
-    # supiera escribir en el registro de Home Assistant se quedaban en la app
-    # para siempre: nada los volvia a mirar. El sintoma es de los peores —la app
-    # muestra el nombre nuevo, la casa el viejo, y nadie se entera hasta que un
-    # tecnico entra a HA meses despues.
-    #
-    # Correrlo en cada arranque hace que una caja que se actualiza desde una
-    # version vieja se reconcilie sola. Es idempotente: en una casa ya al dia no
-    # escribe nada.
-    #
-    # EN SEGUNDO PLANO y DESPUES de que el upstream este listo — la funcion
-    # degrada sola si la casa todavia no contesta, y el proximo arranque
-    # reintenta. Nunca bloquea: el cliente no espera por esto.
-    async def _reconciliar_al_arrancar() -> None:
-        try:
-            resultado = await app.state.onboarding.reconciliar()
-            logger.info("arranque.reconciliado", **resultado)
-        except Exception:
-            # Nunca fatal. Reconciliar es una mejora oportunista, no un
-            # requisito para que la casa funcione.
-            logger.warning("arranque.reconciliacion_fallo", exc_info=True)
-
-    reconciliar_task = asyncio.create_task(
-        _reconciliar_al_arrancar(), name="reconciliar"
-    )
 
     # ---------------------------------------------------------------------
     # MODO FABRICA vs MODO ARTESANAL — el interruptor es `platform_base_url`.
@@ -405,6 +377,50 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # 6. Lanzar el upstream como task supervisado
     upstream_task = asyncio.create_task(upstream.run_forever(), name="ha_upstream")
+
+    # ---------------------------------------------------------------------
+    # LA CASA SE PONE AL DIA CON LA APP, SOLA.
+    #
+    # 🔪 Los nombres y habitaciones que el cliente guardo ANTES de que el Mirror
+    # supiera escribir en el registro de Home Assistant se quedaban en la app
+    # para siempre: nada los volvia a mirar. El sintoma es de los peores —la app
+    # muestra el nombre nuevo, la casa el viejo, y nadie se entera hasta que un
+    # tecnico entra a HA meses despues.
+    #
+    # Correrlo en cada arranque hace que una caja que se actualiza desde una
+    # version vieja se reconcilie sola. Es idempotente: en una casa ya al dia no
+    # escribe nada.
+    #
+    # 🔪 VA DESPUES DE `upstream_task` Y ESPERA A QUE LA CASA CONTESTE. El primer
+    # intento creaba esta tarea doscientas lineas mas arriba, ANTES de que el
+    # upstream siquiera arrancara: `send_command` lanza UpstreamNotReadyError si
+    # no hay WebSocket, asi que la reconciliacion se rendia con todos los items
+    # y no escribia nada. Salio en verde, no rompio ninguna prueba y el log
+    # decia "reconciliado" con cero escrituras — o sea que el propio arreglo
+    # tenia la forma del defecto que venia a arreglar.
+    #
+    # Lo delato el cotejo, que para eso existe.
+    async def _reconciliar_al_arrancar() -> None:
+        try:
+            # Hidratar la casa entera tarda; 90 s es de sobra y no cuesta nada
+            # esperar porque esto corre en segundo plano.
+            for _ in range(180):
+                if store.connected:
+                    break
+                await asyncio.sleep(0.5)
+            else:
+                logger.info("arranque.reconciliacion_sin_casa")
+                return
+            resultado = await app.state.onboarding.reconciliar()
+            logger.info("arranque.reconciliado", **resultado)
+        except Exception:
+            # Nunca fatal. Reconciliar es una mejora oportunista, no un
+            # requisito para que la casa funcione.
+            logger.warning("arranque.reconciliacion_fallo", exc_info=True)
+
+    reconciliar_task = asyncio.create_task(
+        _reconciliar_al_arrancar(), name="reconciliar"
+    )
 
     def _on_upstream_done(task: asyncio.Task) -> None:
         """Callback para loguear si el upstream terminó inesperadamente."""
