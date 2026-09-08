@@ -72,6 +72,21 @@ FRACCION_DOMINIO_CAIDO = 0.6
 #: es 75% y no significa nada.
 MINIMO_DOMINIO = 8
 
+#: 🔪 DOMINIOS DONDE `unavailable` ES UN ESTADO NORMAL, NO UNA FALLA.
+#:
+#: Un Chromecast se declara `unavailable` cuando el televisor está apagado; un
+#: reproductor DLNA, cuando el equipo no está enchufado. Eso no es que la casa
+#: se haya roto: es una familia que apagó la tele.
+#:
+#: Medido contra una casa real el 2026-09-08: cinco `cast` cayeron juntos hace
+#: 63 horas —la misma hora exacta— y la pantalla avisaba en ROJO "6 de 8
+#: aparatos no responden". Estaban apagados.
+#:
+#: La regla de "familia caída" existe para el caso contrario: 245 apagadores que
+#: se van de golpe porque murió el puente. Eso son aparatos que NADIE apaga a
+#: mano, y por eso su caída sí significa algo.
+_SE_APAGAN_SOLOS = frozenset({"media_player", "remote", "vacuum"})
+
 
 class Accion(BaseModel):
     """
@@ -191,13 +206,49 @@ async def _formularios(svc: Any) -> list[Hallazgo]:
     return fuera
 
 
+async def _con_reauth_pendiente(upstream: Any) -> set[str]:
+    """
+    Las integraciones que YA tienen un formulario de reconexión esperando.
+
+    🔪 SIN ESTO LA MISMA COSA SE DECÍA DOS VECES. Una integración que perdió la
+    sesión aparece por dos lados: como entrada que no cargó, y como formulario
+    de `reauth` en curso. Las dos son ciertas —son la causa y el síntoma— pero
+    en la pantalla salían como dos problemas distintos:
+
+        [critico] Persianas Somfy dejó de responder y pide reconectarse
+        [critico] Persianas Somfy no está funcionando
+
+    Y de los dos, el único con arreglo desde el teléfono era el primero. El
+    segundo solo agregaba ruido y mandaba a llamar al técnico por algo que el
+    dueño podía resolver tocando un botón.
+    """
+    try:
+        resp = await upstream.send_command(
+            {"type": "config_entries/flow/progress"}, timeout=10.0
+        )
+    except (UpstreamNotReadyError, HaProtocolError):
+        # Sin la lista se prefiere repetir un aviso antes que callar uno.
+        return set()
+    fuera: set[str] = set()
+    for f in resp.get("result") or []:
+        ctx = f.get("context") or {}
+        entry = ctx.get("entry_id")
+        if ctx.get("source") in ("reauth", "reconfigure") and isinstance(entry, str):
+            fuera.add(entry)
+    return fuera
+
+
 async def _integraciones(upstream: Any) -> list[Hallazgo]:
     """Integraciones que no cargaron. Una caída se lleva TODOS sus aparatos."""
     resp = await upstream.send_command({"type": "config_entries/get"}, timeout=10.0)
+    ya_avisadas = await _con_reauth_pendiente(upstream)
     fuera: list[Hallazgo] = []
     for e in resp.get("result") or []:
         estado = e.get("state")
         if estado in (None, "loaded", "not_loaded"):
+            continue
+        # Ya lo dice el formulario, con mejor texto y con botón. Ver arriba.
+        if e.get("entry_id") in ya_avisadas:
             continue
         # 🔪 EL TITULO DE UNA CONFIG ENTRY NO SE MUESTRA. Home Assistant lo
         # rellena con lo que identifique a la cuenta, y muy seguido eso es un
@@ -257,6 +308,8 @@ def _dominios_caidos(store: Any) -> list[Hallazgo]:
 
     fuera: list[Hallazgo] = []
     for dom, todos in por_dominio.items():
+        if dom in _SE_APAGAN_SOLOS:
+            continue
         n = len(todos)
         mal = caidos.get(dom, 0)
         if n < MINIMO_DOMINIO or mal / n < FRACCION_DOMINIO_CAIDO:
@@ -287,6 +340,9 @@ def _abandonados(store: Any) -> list[Hallazgo]:
     for eid, st in store.get_all_states().items():
         # Misma razón que en `_dominios_caidos`: `unknown` no es una falla.
         if getattr(st, "state", None) != "unavailable":
+            continue
+        # Y un televisor apagado hace cuatro días tampoco. Ver `_SE_APAGAN_SOLOS`.
+        if eid.split(".", 1)[0] in _SE_APAGAN_SOLOS:
             continue
         crudo = getattr(st, "last_changed", None) or getattr(st, "last_updated", None)
         if crudo is None:
