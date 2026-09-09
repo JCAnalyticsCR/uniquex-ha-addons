@@ -419,7 +419,32 @@ async def sticker(request: Request) -> HTMLResponse:
 
     # SVG en línea: se imprime nítido a cualquier tamaño y no depende de que la
     # caja tenga internet para renderizar la imagen.
-    qr = segno.make(url, error="m").svg_inline(scale=5, dark="#2a1d14")
+    #
+    # 🔪 EL `viewBox` NO ES COSMETICO: SIN EL, EL QR SE RECORTA Y NO SE LEE.
+    #
+    # `svg_inline` emite `<svg width="245" height="245">` y NINGUN `viewBox`. Un
+    # SVG sin `viewBox` no escala cuando se le cambia el tamaño: su sistema de
+    # coordenadas queda fijo y lo que sobra se RECORTA. La hoja de estilos de
+    # esta misma página lo fuerza a 200x200, asi que se perdian 45 unidades
+    # —un 18%— del lado derecho y de abajo, zona quieta incluida.
+    #
+    # El resultado es una calcomanía que se ve bien y no escanea nunca. Se
+    # descubrió el 2026-09-09 con el socio intentando leer la etiqueta de la
+    # caja de casa 2, que ya estaba impresa.
+    #
+    # Con `viewBox`, cambiarle el tamaño lo ESCALA, que es lo que siempre se
+    # quiso.
+    #
+    # 🔪 Y LA CORRECCION SUBE DE M A Q (15% -> 25%). Esto no es un QR de
+    # pantalla: es una etiqueta pegada a un equipo que va a vivir años en una
+    # casa. El propio instructivo contempla "cámara sucia, poca luz, etiqueta
+    # rayada" como el motivo de imprimir el código en texto. Un cuarto de
+    # tolerancia al daño cuesta unos módulos más y compra justamente eso.
+    simbolo = segno.make(url, error="q")
+    lado = simbolo.symbol_size(border=4)[0] * 5
+    qr = simbolo.svg_inline(scale=5, dark="#2a1d14").replace(
+        "<svg ", f'<svg viewBox="0 0 {lado} {lado}" ', 1
+    )
 
     return _pagina(
         "Calcomanía de activación",
