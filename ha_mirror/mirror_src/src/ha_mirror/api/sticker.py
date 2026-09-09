@@ -85,10 +85,11 @@ from typing import Any
 
 import segno
 import structlog
-from fastapi import APIRouter, Request
-from fastapi.responses import HTMLResponse
+from fastapi import APIRouter, Request, Response
+from fastapi.responses import HTMLResponse, RedirectResponse
 
 from ha_mirror.device_identity import (
+    DeviceIdentity,
     DeviceIdentityError,
     cargar_llave_privada,
     construir_url_qr,
@@ -202,6 +203,10 @@ def _pagina(titulo: str, cuerpo: str) -> HTMLResponse:
                     border: 1px solid #e6c84a; border-radius: 8px;
                     font-size: 12px; color: #5a4a10; }}
   /* Al imprimir: solo la etiqueta, sin fondos ni instrucciones. */
+  .boton-rotar {{ margin-top: 10px; padding: 10px 18px; border-radius: 10px;
+                  border: 1px solid #c4593a; background: #c4593a; color: #fff;
+                  font: inherit; font-weight: 700; cursor: pointer; }}
+  .boton-rotar:hover {{ background: #a94830; }}
   @media print {{
     body {{ background: #fff; padding: 0; }}
     .nota, .no-imprimir {{ display: none; }}
@@ -274,6 +279,120 @@ def _cuerpo_bloqueo(
     )
 
 
+def _rechazo_no_ingress(request: Request) -> HTMLResponse | None:
+    """
+    La guarda de ingress. `None` cuando la petición es legítima.
+
+    🔪 SE EXTRAJO PORQUE AHORA HAY DOS RUTAS, Y LA SEGUNDA ESCRIBE. Estaba
+    incrustada en el handler de la calcomanía, que solo lee. Copiarla y pegarla
+    en la ruta que rota el código es cómo se termina arreglando un día una sola
+    de las dos copias — y la que quedaría sin arreglar es justamente la que muta
+    estado.
+
+    Ver el docstring del módulo para por qué hacen falta las dos capas y cuál es
+    su límite conocido.
+    """
+    tiene_header = _INGRESS_HEADER in request.headers
+    ip_origen = request.client.host if request.client else ""
+    desde_red_interna = (
+        ip_origen.startswith(_SUPERVISOR_NET_PREFIX)
+        or ip_origen in ("127.0.0.1", "::1", "")  # loopback y tests ASGI
+    )
+    if tiene_header and desde_red_interna:
+        return None
+
+    logger.warning(
+        "sticker.acceso_no_ingress",
+        tiene_header=tiene_header,
+        ip_origen=ip_origen,
+    )
+    return HTMLResponse(
+        '<!doctype html><html lang="es"><head><meta charset="utf-8">'
+        "<title>Acceso no permitido</title></head><body>"
+        "<p><b>Esta p&#225;gina solo se puede abrir desde la barra lateral "
+        "de Home Assistant.</b></p>"
+        "<p>Abrila desde el men&#250; del complemento en HA, no ingresando "
+        "directamente a la IP de la caja.</p>"
+        "</body></html>",
+        status_code=403,
+    )
+
+
+@router.post("/rotar-codigo", include_in_schema=False)
+async def rotar_codigo(request: Request) -> Response:
+    """
+    Emite un código de activación nuevo. La misma caja, otra calcomanía.
+
+    ── CUÁNDO SE USA ──────────────────────────────────────────────────────
+    Cuando el código ya impreso se vio: una foto de la etiqueta que viajó por
+    WhatsApp, una calcomanía que se pegó y después se despegó, un equipo que
+    volvió del taller. Quien tenga ese código puede reclamar la caja.
+
+    Antes de esto la única salida era re-aprovisionar el equipo entero.
+
+    ── LAS TRES COPIAS DE LA IDENTIDAD ────────────────────────────────────
+    🔪 Rotar el código toca TRES lugares, y olvidarse de uno rompe distinto:
+
+      1. **La base** — la que sobrevive al reinicio.
+      2. **`app.state.device_identity`** — de donde lee esta misma página. Sin
+         actualizarla, la calcomanía sigue mostrando el código viejo y en el
+         taller se reimprime la misma etiqueta creyendo que se rotó.
+      3. **`AnnounceClient._identity`** — la peligrosa. De ahí sale el
+         `claim_code_hash` de cada anuncio. Sin avisarle, la plataforma sigue
+         esperando el hash anterior y **rechaza el código recién impreso**. Todo
+         se ve bien y nada en el registro lo explica.
+
+    ── POST-REDIRECT-GET ──────────────────────────────────────────────────
+    Contesta 303 hacia la calcomanía. Sin eso, un F5 después de rotar vuelve a
+    rotar, y cada recarga invalida la etiqueta que se acaba de imprimir.
+
+    El código —viejo o nuevo— NUNCA entra en un registro. La versión sí: es lo
+    único que hace falta para leer el historial de una caja.
+    """
+    rechazo = _rechazo_no_ingress(request)
+    if rechazo is not None:
+        return rechazo
+
+    db = getattr(request.app.state, "db", None)
+    if db is None:
+        return _pagina(
+            "No se pudo emitir",
+            '<div class="aviso"><b>La caja no está lista todavía.</b></div>',
+        )
+
+    fila = await db.rotar_claim_code()
+    if fila is None:
+        # Ya tiene dueño. Ver `rotar_claim_code` para por qué se rechaza.
+        return _pagina(
+            "Esta caja ya está activada",
+            '<div class="aviso"><b>No se puede emitir un código nuevo.</b><br>'
+            "Esta caja ya fue reclamada por una cuenta, así que su código de "
+            "activación no sirve para nada y cambiarlo solo haría que la "
+            "plataforma dejara de reconocerla.<br><br>"
+            "Si hay que devolverla al estado inicial, eso se hace desde la "
+            "plataforma.</div>",
+        )
+
+    identidad = DeviceIdentity(**fila)
+    # Copia 2: la que lee esta página.
+    request.app.state.device_identity = identidad
+    # Copia 3: la del bucle de anuncio. Ver arriba.
+    anuncio = getattr(request.app.state, "announce_client", None)
+    if anuncio is not None:
+        await anuncio.rotar_identidad(identidad)
+
+    logger.info(
+        "sticker.codigo_rotado",
+        device_id=identidad.device_id,
+        claim_code_version=identidad.claim_code_version,
+    )
+
+    # El destino se arma con la cabecera del proxy: una URL absoluta se saldría
+    # del ingress y daría 404.
+    base = request.headers.get(_INGRESS_HEADER, "")
+    return RedirectResponse(url=f"{base}/", status_code=303)
+
+
 @router.get("/", include_in_schema=False, response_class=HTMLResponse)
 async def sticker(request: Request) -> HTMLResponse:
     """
@@ -300,29 +419,9 @@ async def sticker(request: Request) -> HTMLResponse:
     # 172.30.x.x), haciendo ambas capas INSUFICIENTES juntas. Ver docstring del
     # módulo y el bloque DECISIÓN ABIERTA. La protección real requiere no exponer
     # el puerto en el host (run.sh / config.yaml).
-    tiene_header = _INGRESS_HEADER in request.headers
-    ip_origen = request.client.host if request.client else ""
-    desde_red_interna = (
-        ip_origen.startswith(_SUPERVISOR_NET_PREFIX)
-        or ip_origen in ("127.0.0.1", "::1", "")  # loopback y tests ASGI
-    )
-
-    if not tiene_header or not desde_red_interna:
-        logger.warning(
-            "sticker.acceso_no_ingress",
-            tiene_header=tiene_header,
-            ip_origen=ip_origen,
-        )
-        return HTMLResponse(
-            '<!doctype html><html lang="es"><head><meta charset="utf-8">'
-            "<title>Acceso no permitido</title></head><body>"
-            "<p><b>Esta p&#225;gina solo se puede abrir desde la barra lateral "
-            "de Home Assistant.</b></p>"
-            "<p>Abrila desde el men&#250; del complemento en HA, no ingresando "
-            "directamente a la IP de la caja.</p>"
-            "</body></html>",
-            status_code=403,
-        )
+    rechazo = _rechazo_no_ingress(request)
+    if rechazo is not None:
+        return rechazo
 
     # ── 1. Identidad de la caja ───────────────────────────────────────────────
     identidad = getattr(request.app.state, "device_identity", None)
@@ -446,6 +545,10 @@ async def sticker(request: Request) -> HTMLResponse:
         "<svg ", f'<svg viewBox="0 0 {lado} {lado}" ', 1
     )
 
+    # El destino se arma con la cabecera del proxy: una URL absoluta se saldría
+    # del ingress y daría 404.
+    accion = html.escape(request.headers.get(_INGRESS_HEADER, "")) + "/rotar-codigo"
+
     return _pagina(
         "Calcomanía de activación",
         f"""
@@ -469,6 +572,20 @@ async def sticker(request: Request) -> HTMLResponse:
       la calcomanía rayada— el cliente puede escribir el número de equipo y el código
       a mano. Con solo uno de los dos no se puede activar.</p>
       <p>Esta página deja de mostrar el código apenas alguien active el equipo.</p>
+    </div>
+
+    <div class="nota no-imprimir">
+      <p><b>¿Este código quedó expuesto?</b></p>
+      <p>Si le sacaste una foto a la etiqueta y la mandaste por mensaje, si la
+      calcomanía se pegó y se despegó, o si el equipo volvió del taller, cualquiera
+      con ese código puede activar esta caja.</p>
+      <p>Podés emitir uno nuevo. <b>Es la misma caja</b> —el número de equipo no
+      cambia— pero hay que <b>reimprimir y pegar la etiqueta nueva</b>: la anterior
+      deja de servir en ese momento.</p>
+      <form method="post" action="{accion}"
+            onsubmit="return confirm('El código actual va a dejar de servir y hay que reimprimir la etiqueta. ¿Seguimos?');">
+        <button type="submit" class="boton-rotar">Emitir un código nuevo</button>
+      </form>
     </div>
     """,
     )

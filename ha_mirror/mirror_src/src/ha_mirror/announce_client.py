@@ -394,6 +394,18 @@ class AnnounceClient:
             Segundos entre anuncios una vez emparejada. Default: 600s.
         """
         self._identity = identity
+        # 🔪 LA TERCERA COPIA DE LA IDENTIDAD, Y LA PELIGROSA.
+        #
+        # De `self._identity` sale el `claim_code_hash` de CADA anuncio. Si el
+        # código se rota y a este bucle no se le avisa, la plataforma sigue
+        # esperando el hash anterior y RECHAZA el código recién impreso. Todo se
+        # ve bien —la página muestra el código nuevo, la base lo tiene— y no hay
+        # una sola línea en el registro que lo explique.
+        #
+        # Por eso existe `rotar_identidad()`, y por eso despierta el bucle: sin
+        # eso, el código nuevo no llega hasta el próximo ciclo y esos dos minutos
+        # son exactamente tiempo en el que la etiqueta recién pegada no activa.
+        self._despertar = asyncio.Event()
         self._privada = private_key
         self._db = db
         self._platform_base_url = platform_base_url.rstrip("/")
@@ -407,6 +419,36 @@ class AnnounceClient:
         # Cuántas respuestas seguidas dijeron "no la conozco" mientras esta caja
         # se cree emparejada. Ver _DESEMPAREJOS_PARA_CONFIRMAR.
         self._desemparejos_seguidos = 0
+
+    async def _dormir(self, segundos: float) -> None:
+        """
+        Espera, pero se despierta si alguien rota el código.
+
+        Solo se usa en el camino feliz. **El sleep del backoff NO se toca**: esa
+        espera existe para no martillar una plataforma que está fallando, y
+        acortarla sería justamente lo contrario de lo que se quiso.
+        """
+        try:
+            await asyncio.wait_for(self._despertar.wait(), timeout=segundos)
+        except TimeoutError:
+            return
+        finally:
+            self._despertar.clear()
+
+    async def rotar_identidad(self, identidad: DeviceIdentity) -> None:
+        """
+        Le avisa al bucle que el código cambió, y lo despierta.
+
+        No registra el código —ni el viejo ni el nuevo—. Sí la versión, que es
+        lo único que hace falta para leer el historial de una caja.
+        """
+        self._identity = identidad
+        self._despertar.set()
+        logger.info(
+            "announce.identidad_rotada",
+            device_id=identidad.device_id,
+            claim_code_version=identidad.claim_code_version,
+        )
 
     async def run_forever(self) -> None:
         """
@@ -489,7 +531,7 @@ class AnnounceClient:
                             msg="Caja emparejada. Sigue el latido lento.",
                         )
                     backoff = _BACKOFF_BASE
-                    await asyncio.sleep(self._heartbeat_interval)
+                    await self._dormir(self._heartbeat_interval)
                     continue
 
                 # Anuncio exitoso, caja todavía disponible para reclamar.
@@ -508,7 +550,7 @@ class AnnounceClient:
 
                 # Reiniciar el backoff a su base: el request salió bien.
                 backoff = _BACKOFF_BASE
-                await asyncio.sleep(self._announce_interval)
+                await self._dormir(self._announce_interval)
 
     async def _announce_once(self, session: aiohttp.ClientSession, endpoint: str) -> bool:
         """

@@ -1129,6 +1129,44 @@ class Database:
             return None
         return await self.get_device_identity()
 
+    async def rotar_claim_code(self) -> dict[str, Any] | None:
+        """
+        Emite un código de activación nuevo sin tocar el par de llaves.
+
+        ── PARA QUÉ ────────────────────────────────────────────────────────
+        El código se DERIVA de la llave privada y de esta versión. Subir la
+        versión da un código distinto sin re-aprovisionar la caja: la identidad
+        sigue siendo la misma, el `device_id` no cambia, y la calcomanía se
+        reimprime y ya.
+
+        El caso real: la etiqueta se fotografió antes de instalar y la foto
+        viajó por WhatsApp. Quien tenga esa foto puede reclamar la caja. Sin
+        esto, la única salida era re-aprovisionar el equipo entero.
+
+        🔪 EL `WHERE paired_at IS NULL` NO ES UNA COMPROBACIÓN, ES LA GARANTÍA.
+        Vive en la base y no en un `if` de Python — mismo criterio que
+        `mark_device_paired`. Dos clics simultáneos llegan los dos al UPDATE y
+        el estado lo decide la base, no dos pasadas de una condición que ambas
+        leyeron "todavía no". Devuelve None si la caja ya tiene dueño.
+
+        Rotar una caja emparejada se rechaza a propósito: el código ya no sirve
+        para reclamarla, pero su hash SÍ viaja en cada anuncio, así que cambiarlo
+        solo lograría que la plataforma dejara de reconocer los anuncios.
+        """
+        conn = self._require_conn()
+        async with conn.execute(
+            """
+            UPDATE device_identity
+            SET claim_code_version = claim_code_version + 1
+            WHERE id = 1 AND paired_at IS NULL
+            """,
+        ) as cur:
+            actualizadas = cur.rowcount
+        await conn.commit()
+        if not actualizadas:
+            return None
+        return await self.get_device_identity()
+
     async def unmark_device_paired(self) -> dict[str, Any] | None:
         """
         Deshace el emparejamiento local: la caja vuelve a estar disponible.

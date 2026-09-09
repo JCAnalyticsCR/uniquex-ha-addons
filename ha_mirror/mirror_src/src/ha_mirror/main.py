@@ -490,6 +490,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
             tunnel_task.add_done_callback(_on_tunnel_done)
 
+            # 🔪 EL CLIENTE DE ANUNCIO SE EXPONE, NO SOLO SU TAREA.
+            #
+            # La calcomanía necesita poder avisarle que el código se rotó. De su
+            # `_identity` sale el `claim_code_hash` de cada anuncio: sin ese
+            # aviso, la plataforma sigue esperando el hash viejo y rechaza el
+            # código recién impreso — sin un solo error en el registro.
+            app.state.announce_client = announce_client
+
             announce_task = asyncio.create_task(
                 announce_client.run_forever(), name="announce_client"
             )
