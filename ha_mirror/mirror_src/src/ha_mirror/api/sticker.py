@@ -393,6 +393,64 @@ async def rotar_codigo(request: Request) -> Response:
     return RedirectResponse(url=f"{base}/", status_code=303)
 
 
+@router.post("/revalidar", include_in_schema=False)
+async def revalidar(request: Request) -> Response:
+    """
+    "Volver a preguntar a la plataforma": destraba una caja que ya fue liberada.
+
+    ── EL CASO REAL ────────────────────────────────────────────────────────
+    El 2026-09-10 se liberó una caja desde la plataforma —casa dada de baja,
+    túnel borrado, DNS caído— y **diez horas después seguía diciendo "Este
+    equipo ya está activado"**. La caja se entera sola en su próximo latido,
+    pero cuando eso no ocurre no había NADA que hacer desde el taller salvo
+    esperar. Esperar frente a un cliente no es un plan, y el QR no vuelve hasta
+    que la caja se entera.
+
+    ── NO SUELTA LA CASA POR SU CUENTA ─────────────────────────────────────
+    Este botón no habla con la plataforma: le pide al bucle de anuncio que
+    pregunte YA, y adelanta su contador de confirmaciones. La decisión la sigue
+    tomando el mismo camino de siempre, con la firma de la respuesta verificada.
+    Ver `AnnounceClient.revalidar_ahora` para por qué se hizo así y no con una
+    consulta propia.
+
+    Si la plataforma contesta que la caja sí tiene dueño, no pasa nada.
+    """
+    rechazo = _rechazo_no_ingress(request)
+    if rechazo is not None:
+        return rechazo
+
+    anuncio = getattr(request.app.state, "announce_client", None)
+    if anuncio is None:
+        # Caja artesanal (sin plataforma) o el bucle todavía no arrancó.
+        return _pagina(
+            "No se puede revalidar",
+            '<div class="aviso"><b>Esta caja no está conectada a la plataforma.</b><br>'
+            "No hay a quién preguntarle si sigue activada.</div>",
+        )
+
+    if not await anuncio.revalidar_ahora():
+        return _pagina(
+            "No hacía falta",
+            '<div class="aviso"><b>Esta caja ya se considera libre.</b><br>'
+            "Volvé a la página de activación y actualizá: el código debería estar ahí."
+            "</div>",
+        )
+
+    # 🔪 NO se espera el resultado. La ronda de anuncio tarda lo que tarde la
+    # red, y dejar el navegador colgado esperándola convierte un botón en una
+    # pantalla trabada. Se contesta enseguida diciendo qué va a pasar y en
+    # cuánto — que es lo que la persona necesita para decidir si esperar.
+    base = request.headers.get(_INGRESS_HEADER, "")
+    return _pagina(
+        "Preguntando a la plataforma",
+        '<div class="aviso"><b>Le preguntamos a la plataforma.</b><br><br>'
+        "Si esta caja ya fue liberada, en menos de un minuto vuelve a mostrar su "
+        "código de activación. Si sigue teniendo dueño, esta página no va a "
+        "cambiar — y eso también es una respuesta.<br><br>"
+        f'<a href="{html.escape(base)}/">Volver a la activación</a></div>',
+    )
+
+
 @router.get("/", include_in_schema=False, response_class=HTMLResponse)
 async def sticker(request: Request) -> HTMLResponse:
     """
@@ -439,13 +497,28 @@ async def sticker(request: Request) -> HTMLResponse:
     # fue exitoso. Garantiza que una caja activa nunca queda atrapada detrás
     # del aviso de dispositivos, sin importar lo que devuelva el upstream.
     if identidad.paired:
+        # 🔪 EL BOTÓN NO ES UN EXTRA. Sin él, una caja que la plataforma ya
+        # liberó y que —por lo que sea— no se enteró, se queda acá para siempre:
+        # sin QR, sin explicación y sin nada que hacer desde el taller. Pasó el
+        # 2026-09-10 y costó diez horas de una entrega.
+        revalidar_url = html.escape(request.headers.get(_INGRESS_HEADER, "")) + "/revalidar"
         return _pagina(
             "Equipo ya activado",
             '<div class="aviso"><b>Este equipo ya está activado.</b><br>'
             f"Casa: <code>{html.escape(str(identidad.paired_house_id))}</code><br><br>"
             "No se genera una calcomanía nueva: la activación es de un solo uso, y "
             "mostrar el código de un equipo en servicio no tendría ningún propósito."
-            "</div>",
+            "</div>"
+            '<div class="nota no-imprimir">'
+            "<p><b>¿Esta caja ya se liberó y sigue diciendo que está activada?</b></p>"
+            "<p>Pasa cuando la cuenta se dio de baja desde la plataforma y la caja "
+            "todavía no se enteró. Normalmente se entera sola en un par de minutos; "
+            "si no, preguntale ahora.</p>"
+            "<p>Es seguro: si la plataforma dice que la caja sigue teniendo dueño, "
+            "no cambia nada.</p>"
+            f'<form method="post" action="{revalidar_url}">'
+            '<button type="submit" class="boton-rotar">Volver a preguntar a la plataforma</button>'
+            "</form></div>",
         )
 
     # ── 3. Verificar dispositivos del taller — consulta FRESCA ───────────────

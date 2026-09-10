@@ -450,6 +450,54 @@ class AnnounceClient:
             claim_code_version=identidad.claim_code_version,
         )
 
+    async def revalidar_ahora(self) -> bool:
+        """
+        "Volver a preguntar": el humano dice que esta caja ya no tiene dueño.
+
+        ── POR QUÉ EXISTE ──────────────────────────────────────────────────────
+        El 2026-09-10 se liberó una caja desde la plataforma —casa dada de baja,
+        túnel borrado, DNS caído— y **diez horas después la caja seguía
+        mostrando "Este equipo ya está activado"**. Del lado del taller no hay
+        nada que hacer salvo esperar, y esperar frente a un cliente no es un
+        plan. El QR no vuelve hasta que la caja se entera.
+
+        ── LO QUE ESTO HACE, Y LO QUE DELIBERADAMENTE NO HACE ──────────────────
+        NO consulta la plataforma por su cuenta. Adelanta el contador de
+        confirmaciones y despierta al bucle, que hace su ronda normal: firma,
+        verifica la firma de la respuesta, y solo entonces decide.
+
+        🔪 ESA ES LA PARTE IMPORTANTE. Un botón que hablara con la plataforma por
+        su cuenta sería una SEGUNDA implementación del anuncio —con su propia
+        verificación de firma, su propio manejo de errores— y el día que una de
+        las dos se arregle, la otra queda vieja. Peor: soltar la casa es
+        irreversible desde acá, y hacerlo por un camino menos probado es
+        exactamente donde no conviene ahorrar.
+
+        Por eso `_desemparejos_seguidos` queda a UNA confirmación del umbral en
+        vez de soltar directo: el humano reemplaza a la espera, no a la
+        comprobación. Si la plataforma contesta que la caja SÍ tiene dueño,
+        `_handle_ok` pone el contador en cero y no pasa nada — que es la
+        respuesta correcta. Si la red falla, no se llega a decidir nada.
+
+        Devuelve False si la caja ya se creía libre: no hay nada que revalidar y
+        decírselo al usuario es mejor que un "listo" que no hizo nada.
+        """
+        if not self._identity.paired:
+            return False
+
+        self._desemparejos_seguidos = max(
+            self._desemparejos_seguidos, _DESEMPAREJOS_PARA_CONFIRMAR - 1
+        )
+        self._despertar.set()
+        logger.info(
+            "announce.revalidacion_pedida",
+            device_id=self._identity.device_id,
+            house_id=self._identity.paired_house_id,
+            confirmaciones=self._desemparejos_seguidos,
+            msg="Alguien pidió revalidar desde la página de activación.",
+        )
+        return True
+
     async def run_forever(self) -> None:
         """
         Loop principal de anuncio con backoff exponencial.
