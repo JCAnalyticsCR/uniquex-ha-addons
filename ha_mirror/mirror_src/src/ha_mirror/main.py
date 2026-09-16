@@ -18,6 +18,7 @@ corriendo (health endpoint muestra AUTH_FAILED, servicio disponible para diagnó
 from __future__ import annotations
 
 import asyncio
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager, suppress
 from importlib.metadata import PackageNotFoundError
@@ -31,7 +32,6 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
-from ha_mirror.autoactualizacion import asegurar_auto_update
 from ha_mirror.api.areas import router as areas_router
 from ha_mirror.api.camera_media import router as camera_media_router
 from ha_mirror.api.camera_ws import router as camera_ws_router
@@ -40,23 +40,25 @@ from ha_mirror.api.costumbres import router as costumbres_router
 from ha_mirror.api.entities import router as entities_router
 from ha_mirror.api.health import router as health_router
 from ha_mirror.api.iframe_token import router as iframe_router
+from ha_mirror.api.mantenimiento import router as mantenimiento_router
 from ha_mirror.api.matter import router as matter_router
 from ha_mirror.api.onboarding import router as onboarding_router
 from ha_mirror.api.preferences import router as preferences_router
-from ha_mirror.api.mantenimiento import router as mantenimiento_router
-from ha_mirror.api.salud import router as salud_router
-from ha_mirror.api.uso import router as uso_router
 from ha_mirror.api.pronostico import router as pronostico_router
+from ha_mirror.api.salud import router as salud_router
 from ha_mirror.api.scenes import router as scenes_router
 from ha_mirror.api.service import router as service_router
+from ha_mirror.api.uso import router as uso_router
 from ha_mirror.api.ws_state import router as ws_router
 from ha_mirror.api.ws_ticket import router as ws_ticket_router
 from ha_mirror.auth import require_api_key
+from ha_mirror.autoactualizacion import asegurar_auto_update
 from ha_mirror.camera_media import CameraMediaClient
 from ha_mirror.config import get_settings
 from ha_mirror.correlations import CorrelationTracker
 from ha_mirror.db import Database
 from ha_mirror.errors import HaAuthError
+from ha_mirror.go2rtc_integrado import Go2rtcIntegrado, debe_integrarse, redactar
 from ha_mirror.ha_upstream import HAUpstream
 from ha_mirror.logging_setup import configure_logging
 from ha_mirror.onboarding import OnboardingService
@@ -265,19 +267,65 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         service_call_timeout=settings.service_call_timeout,
     )
 
+    # ── go2rtc: externo (como siempre) o integrado ──────────────────────────
+    # Ver `go2rtc_integrado.py`. Con `go2rtc_base_url` puesta —Fortunatta— todo
+    # sigue EXACTAMENTE igual: `debe_integrarse` devuelve False y no se levanta
+    # nada.
+    go2rtc_integrado: Go2rtcIntegrado | None = None
+    go2rtc_task: asyncio.Task[None] | None = None
+    go2rtc_base_url = settings.go2rtc_base_url
+    go2rtc_username = settings.go2rtc_username
+    go2rtc_password = (
+        settings.go2rtc_password.get_secret_value()
+        if settings.go2rtc_password is not None
+        else None
+    )
+    camera_streams = settings.camera_streams
+    streams_integrados = settings.go2rtc_stream_sources
+
+    if debe_integrarse(go2rtc_base_url=go2rtc_base_url, streams=streams_integrados):
+        candidato = Go2rtcIntegrado(
+            ruta_config=settings.mirror_db_path.parent / "go2rtc" / "go2rtc.yaml",
+            streams=streams_integrados,
+        )
+        if candidato.binario_disponible():
+            go2rtc_integrado = candidato
+            go2rtc_base_url = candidato.base_url
+            go2rtc_username = candidato.credenciales.usuario
+            go2rtc_password = candidato.credenciales.clave
+
+            if not camera_streams:
+                # Sin mapa explícito, cada stream aparece como una cámara con su
+                # propio nombre. Es lo que hace que una casa nueva configure UNA
+                # sola opción en vez de dos que tienen que coincidir.
+                camera_streams = {
+                    "camera." + re.sub(r"[^a-z0-9_]+", "_", nombre.lower()).strip("_"): nombre
+                    for nombre in streams_integrados
+                }
+            huerfanos = sorted(set(camera_streams.values()) - set(streams_integrados))
+            if huerfanos:
+                # Solo nombres: las fuentes llevan contraseñas.
+                logger.warning(
+                    "go2rtc.mapa_apunta_a_streams_inexistentes",
+                    streams=huerfanos,
+                    msg="camera_stream_map nombra streams que go2rtc_streams no define.",
+                )
+            logger.info("go2rtc.modo_integrado", streams=len(streams_integrados))
+        else:
+            logger.error(
+                "go2rtc.integrado_sin_binario",
+                msg="Hay go2rtc_streams pero la imagen no trae go2rtc. Cámaras apagadas.",
+            )
+
     # Cliente HTTP interno para snapshots HA y señalizacion go2rtc. Las
     # credenciales viven solo en memoria dentro del add-on Mirror.
     camera_media = CameraMediaClient(
         ha_base_url=settings.ha_http_url,
         ha_token=ha_token,
-        go2rtc_base_url=settings.go2rtc_base_url,
-        go2rtc_username=settings.go2rtc_username,
-        go2rtc_password=(
-            settings.go2rtc_password.get_secret_value()
-            if settings.go2rtc_password is not None
-            else None
-        ),
-        camera_streams=settings.camera_streams,
+        go2rtc_base_url=go2rtc_base_url,
+        go2rtc_username=go2rtc_username,
+        go2rtc_password=go2rtc_password,
+        camera_streams=camera_streams,
     )
     await camera_media.start()
 
@@ -285,27 +333,38 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     #
     # Se registran por su API, asi que un reinicio de go2rtc —o de la cajita—
     # se las lleva. La base del Mirror es la fuente de verdad; esto las vuelve a
-    # poner cada vez que arranca. Sin este bloque, una camara agregada desde la
-    # app desapareceria sola en el proximo corte de luz, y nadie sabria por que.
+    # poner.
+    #
+    # Con go2rtc EXTERNO se corre una vez, al arrancar. Con go2rtc INTEGRADO la
+    # corre el supervisor CADA VEZ que go2rtc vuelve a levantar: si se cae y se
+    # recupera solo, el Mirror no se reinició y nadie mas las pondria de vuelta.
     #
     # Si go2rtc no contesta, se sigue igual: es preferible arrancar sin las
-    # camaras propias que no arrancar. Vuelven al proximo reinicio.
-    try:
+    # camaras propias que no arrancar.
+    async def restaurar_camaras_propias() -> None:
         from ha_mirror.sondeo_canales import SondeoCanales
 
         propias = await db.listar_camaras_propias(getattr(settings, "tenant_id", 1))
-        if propias and settings.go2rtc_base_url:
-            registrador = SondeoCanales(
-                base_url=camera_media._go2rtc_base_url,  # noqa: SLF001
-                auth=camera_media._go2rtc_auth,  # noqa: SLF001
-                session=camera_media._require_session(),  # noqa: SLF001
-            )
-            for c in propias:
-                camera_media.agregar_stream(c["entity_id"], c["stream_name"])
-                await registrador.registrar_permanente(c["stream_name"], c["canal"])
-            logger.info("camaras.propias_restauradas", cuantas=len(propias))
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("camaras.propias_no_restauradas", error=str(exc)[:160])
+        if not propias or not camera_media.webrtc_enabled:
+            return
+        registrador = SondeoCanales(
+            base_url=camera_media._go2rtc_base_url,  # noqa: SLF001
+            auth=camera_media._go2rtc_auth,  # noqa: SLF001
+            session=camera_media._require_session(),  # noqa: SLF001
+        )
+        for c in propias:
+            camera_media.agregar_stream(c["entity_id"], c["stream_name"])
+            await registrador.registrar_permanente(c["stream_name"], c["canal"])
+        logger.info("camaras.propias_restauradas", cuantas=len(propias))
+
+    if go2rtc_integrado is not None:
+        go2rtc_integrado.al_estar_listo = restaurar_camaras_propias
+        go2rtc_task = asyncio.create_task(go2rtc_integrado.run_forever(), name="go2rtc_integrado")
+    else:
+        try:
+            await restaurar_camaras_propias()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("camaras.propias_no_restauradas", error=redactar(str(exc))[:160])
 
     # Borrar el token de la variable local lo antes posible
     # (Python no garantiza wipe de memoria, pero reducimos ventana de exposición)
@@ -551,6 +610,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 with suppress(asyncio.CancelledError, Exception):
                     await tarea
         await camera_media.close()
+        # go2rtc DESPUÉS de camera_media: si cae antes, el precalentamiento de
+        # cámaras llena el registro de errores durante el apagado.
+        if go2rtc_task is not None:
+            go2rtc_task.cancel()
+            with suppress(asyncio.CancelledError, Exception):
+                await go2rtc_task
+        if go2rtc_integrado is not None:
+            with suppress(Exception):
+                await go2rtc_integrado.close()
         await db.close()
         logger.info("mirror.stopped")
 

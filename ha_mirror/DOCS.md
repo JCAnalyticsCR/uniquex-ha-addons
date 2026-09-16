@@ -19,6 +19,7 @@ Usa el **token del Supervisor** (el add-on tiene `homeassistant_api: true`), con
 | `go2rtc_base_url` | Opcional | URL interna del API go2rtc, nunca una URL pública. |
 | `go2rtc_username` | Opcional | Usuario HTTP Basic configurado en go2rtc. |
 | `go2rtc_password` | Opcional | Password HTTP Basic configurado en go2rtc. |
+| `go2rtc_streams` | Opcional | **go2rtc integrado.** JSON nombre → fuente de cada cámara, ej. `{"NVR_CH01":"rtsp://usuario:clave@IP_NVR:554/cam/realmonitor?channel=1&subtype=1"}`. Solo se usa si `go2rtc_base_url` está **vacía**. Es secreta: las fuentes llevan la clave de las cámaras. No acepta fuentes `exec:`, `echo:` ni `expr:`. |
 | `camera_stream_map` | Opcional | JSON que relaciona cada `camera.entity_id` con su stream go2rtc. |
 | `camera_labels` | Opcional | JSON con el nombre visible de cada cámara, ej. `{"camera.nvr_c21_gimnasio":"C21 GIMNASIO"}`. Si falta, se usa el nombre de HA o se deriva del `entity_id`. |
 
@@ -27,6 +28,35 @@ La app la consume tal cual: **agregar una cámara = agregarla a go2rtc y a `came
 sin volver a desplegar el frontend.
 
 Sin las opciones go2rtc, snapshots funciona normalmente y WebRTC queda deshabilitado.
+
+### go2rtc integrado (sin segundo complemento)
+
+Desde esta versión el Mirror trae go2rtc adentro. Para una casa nueva **no hace falta
+instalar el complemento go2rtc**:
+
+1. Dejá `go2rtc_base_url` **vacía**.
+2. En `go2rtc_streams` cargá las cámaras (o una sola cámara del NVR, la "semilla": las
+   demás se suman después desde la app con **Cámaras → Agregar cámara**).
+3. `camera_stream_map` es opcional: si queda vacío, cada stream aparece como una cámara
+   con su propio nombre.
+
+Cómo elige el Mirror:
+
+| `go2rtc_base_url` | `go2rtc_streams` | Qué pasa |
+|---|---|---|
+| con valor | (se ignora) | go2rtc **externo**, como siempre. Una casa que ya lo usa no cambia en nada. |
+| vacía | vacía | No corre ningún go2rtc. Una casa sin cámaras no paga ni un proceso. |
+| vacía | con cámaras | go2rtc **integrado**: el Mirror lo arranca, lo vigila y lo reinicia si se cae. |
+
+Seguridad del modo integrado: la API de go2rtc queda atada a `127.0.0.1` con usuario y
+clave aleatorios nuevos en cada arranque y **`local_auth` activado** (sin eso, go2rtc no
+le pide clave a nada que llegue desde localhost, y el túnel de Cloudflare corre al lado).
+Los servidores RTSP, RTMP, SRTP y WebRTC de go2rtc quedan **apagados**. Las contraseñas
+de las cámaras se borran de todo lo que go2rtc escribe en el registro.
+
+**Raspberry Pi:** el video en vivo es barato (go2rtc solo retransmite). Lo que pesa son
+las fotos de la cuadrícula: el Mirror mantiene una foto fresca de cada cámara y cada una
+obliga a FFmpeg a decodificar video. Con muchas cámaras, medir la CPU antes de entregar.
 
 ## Escenas custom (desde 0.5.0)
 

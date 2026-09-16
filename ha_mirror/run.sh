@@ -22,6 +22,7 @@ LOG_LEVEL="$(opt log_level)"; LOG_LEVEL="${LOG_LEVEL:-INFO}"
 GO2RTC_BASE_URL="$(opt go2rtc_base_url)"
 GO2RTC_USERNAME="$(opt go2rtc_username)"
 GO2RTC_PASSWORD="$(opt go2rtc_password)"
+GO2RTC_STREAMS="$(opt go2rtc_streams)"
 CAMERA_STREAM_MAP="$(opt camera_stream_map)"
 if [ -z "${CAMERA_STREAM_MAP}" ] || [ "${CAMERA_STREAM_MAP}" = "null" ]; then
   CAMERA_STREAM_MAP='{}'
@@ -126,6 +127,12 @@ if [ -n "${GO2RTC_USERNAME}" ] && [ "${GO2RTC_USERNAME}" != "null" ]; then
 fi
 if [ -n "${GO2RTC_PASSWORD}" ] && [ "${GO2RTC_PASSWORD}" != "null" ]; then
   export GO2RTC_PASSWORD="${GO2RTC_PASSWORD}"
+fi
+# go2rtc integrado. NO se imprime ninguna parte del valor: las fuentes
+# llevan la clave de las camaras, y este registro lo lee cualquiera con
+# acceso a Home Assistant.
+if [ -n "${GO2RTC_STREAMS}" ] && [ "${GO2RTC_STREAMS}" != "null" ]; then
+  export GO2RTC_STREAMS="${GO2RTC_STREAMS}"
 fi
 export CAMERA_STREAM_MAP="${CAMERA_STREAM_MAP}"
 export CAMERA_LABELS="${CAMERA_LABELS}"

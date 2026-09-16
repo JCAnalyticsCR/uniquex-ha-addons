@@ -13,8 +13,12 @@
 FROM python:3.12-slim-bookworm@sha256:d50fb7611f86d04a3b0471b46d7557818d88983fc3136726336b2a4c657aa30b
 
 # tini para manejo correcto de señales (init: false en config.yaml)
+# ffmpeg: lo usa go2rtc INTEGRADO para sacar fotos JPEG de camaras H.264.
+# Sin el, el video en vivo funciona pero las miniaturas de la app no.
+# Agranda la imagen; es el precio de no pedirle a cada casa un segundo
+# complemento. Ver go2rtc_integrado.py.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends tini curl ca-certificates \
+ && apt-get install -y --no-install-recommends tini curl ca-certificates ffmpeg \
  && rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
@@ -58,7 +62,43 @@ RUN set -eu; \
       "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-${arch}"; \
     echo "${sha}  /usr/local/bin/cloudflared" | sha256sum -c -; \
     chmod +x /usr/local/bin/cloudflared; \
-    cloudflared --version; \
+    cloudflared --version
+
+# ---------------------------------------------------------------------------
+# go2rtc — el motor de video de las camaras, INTEGRADO al Mirror.
+#
+# SOLO se ejecuta si `go2rtc_base_url` esta vacia y `go2rtc_streams` trae
+# camaras (ver go2rtc_integrado.py). Una casa con go2rtc como complemento
+# aparte —Fortunatta— nunca lo levanta: sigue usando el suyo.
+#
+# VERSION 1.9.14 A PROPOSITO: es exactamente la que ya corre en produccion en
+# Fortunatta con 20 camaras. Subirla es una decision aparte, no un efecto de
+# integrarla.
+#
+# Mismo criterio que cloudflared: version FIJADA + checksum VERIFICADO. Los
+# sha256 salen del campo `digest` que GitHub publica para cada archivo del
+# release (gh api repos/AlexxIT/go2rtc/releases/tags/v1.9.14).
+#
+# Este bloque tambien es el que quita curl: tiene que ir DESPUES de todas las
+# descargas. Antes lo quitaba el de cloudflared.
+# ---------------------------------------------------------------------------
+ARG GO2RTC_VERSION=v1.9.14
+ARG GO2RTC_SHA256_AMD64=32d616af226bd731678ffde328b94cfb94e30339bfefc469cfb76323144615a6
+ARG GO2RTC_SHA256_ARM64=359fabade8a7a51e81a55fe6df6b0ef81764a5e1d63179577534eaaa71904b50
+
+RUN set -eu; \
+    arch="$(dpkg --print-architecture)"; \
+    case "${arch}" in \
+      amd64) sha="${GO2RTC_SHA256_AMD64}" ;; \
+      arm64) sha="${GO2RTC_SHA256_ARM64}" ;; \
+      *) echo "go2rtc: arquitectura no soportada: ${arch}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL --retry 3 -o /usr/local/bin/go2rtc \
+      "https://github.com/AlexxIT/go2rtc/releases/download/${GO2RTC_VERSION}/go2rtc_linux_${arch}"; \
+    echo "${sha}  /usr/local/bin/go2rtc" | sha256sum -c -; \
+    chmod +x /usr/local/bin/go2rtc; \
+    go2rtc -version; \
+    ffmpeg -version | head -n 1; \
     apt-get purge -y --auto-remove curl; \
     rm -rf /var/lib/apt/lists/*
 

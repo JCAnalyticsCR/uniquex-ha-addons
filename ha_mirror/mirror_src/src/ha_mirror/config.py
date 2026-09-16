@@ -114,6 +114,14 @@ class Settings(BaseSettings):
         default=None,
         description="Password HTTP Basic de go2rtc, si esta habilitado.",
     )
+    go2rtc_streams: SecretStr | None = Field(
+        default=None,
+        description=(
+            "Solo para go2rtc INTEGRADO (go2rtc_base_url vacia). JSON nombre -> "
+            'fuente, ej. {"NVR_CH01":"rtsp://usuario:clave@192.168.1.50:554/..."}. '
+            "Es secreto: las direcciones llevan la clave de las camaras."
+        ),
+    )
     camera_stream_map: str = Field(
         default="{}",
         description=(
@@ -376,6 +384,69 @@ class Settings(BaseSettings):
                 raise ValueError(f"Nombre de stream go2rtc invalido para {entity_id}")
         return json.dumps(parsed, separators=(",", ":"), sort_keys=True)
 
+    @field_validator("go2rtc_streams")
+    @classmethod
+    def validate_go2rtc_streams(cls, v: SecretStr | None) -> SecretStr | None:
+        """
+        Valida los streams del go2rtc integrado. Ver `go2rtc_integrado.py`.
+
+        🔪 NINGÚN MENSAJE DE ERROR INCLUYE EL TEXTO RECIBIDO. Estas direcciones
+        llevan usuario y contraseña de las cámaras, y un error de validación
+        termina en el registro del complemento — que cualquiera con acceso a
+        Home Assistant puede leer. Se nombra el stream, nunca su fuente.
+
+        🔪 SE PERMITEN ESQUEMAS, NO SE PROHÍBEN. La primera versión rechazaba
+        `exec:`, `echo:` y `expr:` y dejaba pasar todo lo demás. Una auditoría lo
+        rompió en una línea: en go2rtc v1.9.14 `ffmpeg:` se REESCRIBE a `exec:`
+        (`internal/ffmpeg/ffmpeg.go`, l.49: `return "exec:" + args.String()`), y
+        con `#input=file` o `#raw=` lee cualquier archivo del contenedor — el
+        token del túnel, la llave de la caja — y lo manda por el video a quien
+        mire esa cámara.
+
+        Una lista de prohibidos exige conocer TODAS las formas peligrosas de un
+        programa ajeno, incluidas las que agregue la próxima versión. Una lista
+        de permitidos solo exige conocer las que usamos. Si mañana hace falta
+        otra marca, se agrega acá a propósito, leyendo qué hace su fuente.
+
+        Tampoco se aceptan espacios: go2rtc parte los argumentos por espacios, y
+        cuando crea streams por su API ya los rechaza. Por el archivo de
+        configuración, que es por donde entran estos, no los chequea.
+        """
+        if v is None:
+            return None
+        crudo = v.get_secret_value().strip()
+        if not crudo or crudo in ("null", "{}"):
+            return None
+        try:
+            parsed = json.loads(crudo)
+        except json.JSONDecodeError:
+            raise ValueError("go2rtc_streams debe ser JSON valido") from None
+        if not isinstance(parsed, dict):
+            raise ValueError("go2rtc_streams debe ser un objeto JSON")
+
+        nombre_valido = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+        # rtsp/rtsps/rtspx: cámaras y NVR. http(s): MJPEG/JPEG por HTTP.
+        # onvif: descubre la dirección RTSP. dvrip: NVR chinos (XMeye).
+        # Ninguno ejecuta procesos ni lee archivos locales.
+        permitidos = ("rtsp://", "rtsps://", "rtspx://", "http://", "https://", "onvif://", "dvrip://")
+        for nombre, fuente in parsed.items():
+            if not isinstance(nombre, str) or not nombre_valido.fullmatch(nombre):
+                raise ValueError("go2rtc_streams tiene un nombre de stream invalido")
+            fuentes = fuente if isinstance(fuente, list) else [fuente]
+            if not fuentes:
+                raise ValueError(f"go2rtc_streams: el stream {nombre} no tiene fuente")
+            for f in fuentes:
+                if not isinstance(f, str) or not f.strip():
+                    raise ValueError(f"go2rtc_streams: el stream {nombre} tiene una fuente invalida")
+                if any(c.isspace() for c in f.strip()):
+                    raise ValueError(f"go2rtc_streams: la fuente del stream {nombre} tiene espacios")
+                if not f.strip().lower().startswith(permitidos):
+                    raise ValueError(
+                        f"go2rtc_streams: el stream {nombre} usa un tipo de fuente no permitido. "
+                        "Se aceptan rtsp, rtsps, rtspx, http, https, onvif y dvrip."
+                    )
+        return SecretStr(json.dumps(parsed, separators=(",", ":"), sort_keys=True))
+
     @field_validator("camera_labels")
     @classmethod
     def validate_camera_labels(cls, v: str) -> str:
@@ -493,6 +564,14 @@ class Settings(BaseSettings):
         """Mapa validado de entidades HA a nombres internos de go2rtc."""
         parsed = json.loads(self.camera_stream_map)
         return {str(key): str(value) for key, value in parsed.items()}
+
+    @property
+    def go2rtc_stream_sources(self) -> dict[str, object]:
+        """Streams validados del go2rtc integrado. Vacío si no hay."""
+        if self.go2rtc_streams is None:
+            return {}
+        parsed = json.loads(self.go2rtc_streams.get_secret_value())
+        return dict(parsed)
 
     @property
     def camera_label_map(self) -> dict[str, str]:

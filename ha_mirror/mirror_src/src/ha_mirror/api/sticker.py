@@ -294,10 +294,20 @@ def _rechazo_no_ingress(request: Request) -> HTMLResponse | None:
     """
     tiene_header = _INGRESS_HEADER in request.headers
     ip_origen = request.client.host if request.client else ""
-    desde_red_interna = (
-        ip_origen.startswith(_SUPERVISOR_NET_PREFIX)
-        or ip_origen in ("127.0.0.1", "::1", "")  # loopback y tests ASGI
-    )
+    # 🔪 LOCALHOST YA NO CUENTA COMO RED INTERNA. Se aceptaba "para las pruebas y
+    # el acceso local", de cuando esta página corría en un puerto publicado y
+    # nada vivía al lado. Hoy el 8001 no sale a la red de la casa, así que el
+    # ÚNICO camino por localhost es desde adentro del contenedor — y ahí corre
+    # cloudflared.
+    #
+    # Las reglas del túnel viven en Cloudflare, no en la caja: quien controle esa
+    # cuenta puede agregar una ruta hacia `localhost:8001`, mandar la cabecera
+    # de ingress a mano (la capa 1 es falsificable, ver arriba) y leer o rotar el
+    # código de activación de una caja que todavía no tiene dueño. Lo encontró
+    # la auditoría de go2rtc integrado, que tiene exactamente el mismo problema.
+    #
+    # El ingress de verdad llega desde el Supervisor (172.30.32.2).
+    desde_red_interna = ip_origen.startswith(_SUPERVISOR_NET_PREFIX)
     if tiene_header and desde_red_interna:
         return None
 
