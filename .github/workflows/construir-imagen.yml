@@ -22,6 +22,14 @@ on:
     branches: [main]
     paths:
       - "ha_mirror/**"
+      # El CONTROL tambien dispara el build. Hasta la 0.49.0 solo lo hacia
+      # ha_mirror/, asi que un cambio a la prueba de seguridad —o a este
+      # mismo archivo— se subia sin correr nunca: la verificacion podia
+      # quedar rota sin que nadie se enterara hasta la version siguiente.
+      - ".github/workflows/construir-imagen.yml"
+      - "verificar_paquete.py"
+      - "verificar_imagen.py"
+      - "prueba_calcomania.py"
   workflow_dispatch:
 
 permissions:
