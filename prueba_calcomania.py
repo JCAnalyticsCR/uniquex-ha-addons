@@ -59,8 +59,8 @@ async def _lifespan(app):
     return tarea, recibidos
 
 
-async def _pedir(app, camino: str) -> tuple[int, str]:
-    """Un GET por ASGI. Devuelve (status, cuerpo)."""
+async def _pedir(app, camino: str, cliente=("172.30.32.2", 50000)) -> tuple[int, str]:
+    """Un GET por ASGI. Devuelve (status, cuerpo). Por defecto, desde el Supervisor."""
     scope = {
         "type": "http",
         "asgi": {"version": "3.0", "spec_version": "2.1"},
@@ -72,8 +72,11 @@ async def _pedir(app, camino: str) -> tuple[int, str]:
         "query_string": b"",
         "root_path": "",
         "headers": [(b"host", b"localhost"), CABECERA_INGRESS],
-        # La calcomanía exige venir de la red del Supervisor o de loopback.
-        "client": ("127.0.0.1", 50000),
+        # El ingress de Home Assistant llega desde 172.30.32.2 ("Only connections
+        # from 172.30.32.2 must be allowed", developers.home-assistant.io).
+        # 🔪 Era 127.0.0.1: desde la 0.49.0 localhost se RECHAZA, porque es la
+        # entrada de cloudflared, que corre en el mismo contenedor.
+        "client": cliente,
         "server": ("localhost", 8001),
     }
     estado = {"status": 0, "cuerpo": b""}
@@ -136,6 +139,18 @@ async def main() -> int:
             return 1
 
         print(f"OK  la calcomania renderiza el QR ({len(cuerpo)} bytes, sin el aviso de 'sin identidad')")
+
+        # Pata de SEGURIDAD, dentro de la imagen que baja cada caja. Con la
+        # cabecera de ingress puesta (se falsifica con un curl) y desde
+        # localhost, que es por donde entra cloudflared: tiene que dar 403. Si
+        # alguien vuelve a aceptar loopback, quien controle la cuenta de
+        # Cloudflare puede leer el codigo de activacion de una caja sin dueno.
+        status_lo, _ = await _pedir(sticker_app, "/", cliente=("127.0.0.1", 50000))
+        if status_lo != 403:
+            print(f"ROTO: desde localhost la calcomania devolvio {status_lo}, se esperaba 403.")
+            print("      localhost es la entrada del tunel: el codigo de activacion queda expuesto.")
+            return 1
+        print("OK  desde localhost (la entrada del tunel) la calcomania da 403")
         return 0
     finally:
         tarea.cancel()

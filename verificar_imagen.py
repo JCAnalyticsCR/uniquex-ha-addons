@@ -89,8 +89,15 @@ def _en_la_imagen(imagen: str, plataforma: str, entrypoint: str, *args: str,
 def verificar(imagen: str, plataforma: str) -> list[str]:
     ok: list[str] = []
 
-    print(f"Bajando {imagen} ({plataforma})...", flush=True)
-    _correr(["docker", "pull", "--platform", plataforma, imagen])
+    # Desde la 0.49.0 el CI prueba la imagen ANTES de publicarla, asi que la
+    # imagen ya esta en el Docker local y todavia no existe en el registro:
+    # bajarla fallaria. Solo se baja si no esta.
+    local = subprocess.run(["docker", "image", "inspect", imagen], capture_output=True)
+    if local.returncode == 0:
+        print(f"Usando {imagen} ({plataforma}) recien construida, sin publicar...", flush=True)
+    else:
+        print(f"Bajando {imagen} ({plataforma})...", flush=True)
+        _correr(["docker", "pull", "--platform", plataforma, imagen])
 
     # --- 1. run.sh, leido como bytes crudos desde adentro de la imagen ---
     print("Revisando /run.sh...", flush=True)

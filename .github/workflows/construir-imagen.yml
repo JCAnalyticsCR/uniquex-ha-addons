@@ -78,15 +78,26 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Construir y publicar
+      - name: Construir (sin publicar todavia)
+        # 🔪 ANTES SE PUBLICABA Y DESPUES SE PROBABA. El paso de prueba decia
+        # "NO publicar esta version", pero la imagen ya estaba subida con su
+        # version y con `latest`. Se descubrio con la 0.49.0: la prueba fallo y la
+        # imagen quedo igual en el registro, instalable por cualquier caja.
+        #
+        # Desde las cajas de la 0.27.0 no construyen: BAJAN esta imagen. Un
+        # control que corre despues de publicar no protege a la flota.
+        #
+        # Ahora: se construye y se carga al Docker local, se prueba, y SOLO si
+        # pasa se sube. Y se sube EXACTAMENTE la imagen probada (docker push de
+        # la misma), no un segundo build que podria salir distinto.
         uses: docker/build-push-action@v6
         with:
           context: ha_mirror
           file: ha_mirror/Dockerfile
           platforms: ${{ matrix.plataforma }}
-          push: true
-          # Dos etiquetas: la version exacta (que es la que usa config.yaml) y
-          # `latest` para poder mirar a mano cual fue la ultima.
+          load: true
+          push: false
+          provenance: false
           tags: |
             ghcr.io/jcanalyticscr/uniquex-mirror-${{ matrix.arch }}:${{ steps.version.outputs.valor }}
             ghcr.io/jcanalyticscr/uniquex-mirror-${{ matrix.arch }}:latest
@@ -103,12 +114,14 @@ jobs:
         # el Dockerfile— producian imagenes que se CONSTRUIAN BIEN y morian al
         # arrancar. Un build verde no prueba que el contenedor viva.
         #
-        # Y ahora importa mas que antes: desde la 0.27.0 las cajas no construyen
-        # nada, bajan esta imagen. Si sale rota, sale rota para toda la flota.
-        #
         # La imagen arm64 corre emulada por QEMU. Es lenta pero corre.
         run: |
           python3 verificar_imagen.py             "ghcr.io/jcanalyticscr/uniquex-mirror-${{ matrix.arch }}:${{ steps.version.outputs.valor }}"             "${{ matrix.plataforma }}"
+
+      - name: Publicar (solo si la prueba paso)
+        run: |
+          docker push "ghcr.io/jcanalyticscr/uniquex-mirror-${{ matrix.arch }}:${{ steps.version.outputs.valor }}"
+          docker push "ghcr.io/jcanalyticscr/uniquex-mirror-${{ matrix.arch }}:latest"
 
       - name: Resumen
         run: |
