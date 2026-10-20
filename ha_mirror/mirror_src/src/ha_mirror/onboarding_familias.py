@@ -119,6 +119,7 @@ FAMILIAS: dict[str, tuple[str, str]] = {
     "reolink": ("camaras", "Cámaras"),
     "generic": ("camaras", "Cámaras"),
     "crestron_home": ("crestron", "Crestron Home"),
+    "met": ("pronostico", "Pronóstico del tiempo"),
     "sonos": ("audio", "Sonos"),
     "samsungtv": ("tv", "Televisores"),
     "apple_tv": ("tv", "Televisores"),
@@ -173,11 +174,22 @@ _FAMILIA_DEFAULT = "otros"
 # ---------------------------------------------------------------------------
 
 
+#: Dominios que NO se recargan desde la app pero SÍ se pueden dar de alta.
+#:
+#: 🔪 La deny-list es de RECARGAS y se usaba también para las altas. `met`
+#: estaba ahí con razón —recargar el pronóstico no le sirve a nadie— y eso
+#: dejaba a cualquier casa nueva sin forma de agregar el pronóstico sin entrar
+#: a Home Assistant: la segunda casa no tenía clima en la app por esto.
+ALTA_AUNQUE_NO_SE_RECARGUE: frozenset[str] = frozenset({"met"})
+
+
 def puede_darse_de_alta(domain: str) -> bool:
     """True si la app puede ofrecer dar de alta este dominio."""
     d = domain.lower().strip()
     if not d:
         return False
+    if d in ALTA_AUNQUE_NO_SE_RECARGUE:
+        return True
     return d not in DENY_LIST
 
 

@@ -81,6 +81,10 @@ RUN set -eu; \
 #
 # Este bloque tambien es el que quita curl: tiene que ir DESPUES de todas las
 # descargas. Antes lo quitaba el de cloudflared.
+#
+# 0.50.0: el bloque tambien comprueba ffprobe (viene en el paquete ffmpeg). Las
+# camaras sumadas por su direccion se PRUEBAN con ffprobe antes de guardarse;
+# sin el, toda prueba da "error" y no entra ninguna. Mejor que falle el build.
 # ---------------------------------------------------------------------------
 ARG GO2RTC_VERSION=v1.9.14
 ARG GO2RTC_SHA256_AMD64=32d616af226bd731678ffde328b94cfb94e30339bfefc469cfb76323144615a6
@@ -99,6 +103,7 @@ RUN set -eu; \
     chmod +x /usr/local/bin/go2rtc; \
     go2rtc -version; \
     ffmpeg -version | head -n 1; \
+    ffprobe -version | head -n 1; \
     apt-get purge -y --auto-remove curl; \
     rm -rf /var/lib/apt/lists/*
 

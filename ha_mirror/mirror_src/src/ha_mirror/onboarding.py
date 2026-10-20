@@ -36,6 +36,19 @@ from ha_mirror.onboarding_familias import (
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
 
 
+def _qr_como_imagen(datos: str) -> str:
+    """
+    El QR que pide escanear un formulario, como imagen lista para un <img>.
+
+    `data:` y SVG generado acá: la app no tiene que armar QRs ni pedir nada a
+    un servicio de afuera, y lo que dibuja no puede ser otra cosa que una imagen.
+    """
+    import segno
+
+    return segno.make(datos, error="q").svg_data_uri(scale=5, border=2)
+
+
+
 # ---------------------------------------------------------------------------
 # Excepciones de dominio del módulo de onboarding
 # ---------------------------------------------------------------------------
@@ -1466,6 +1479,19 @@ class OnboardingService:
                 campo["valor_inicial"] = bruto["default"]
             if bruto.get("options"):
                 campo["opciones"] = bruto["options"]
+            # 🔪 UN CAMPO QUE NO SE ESCRIBE: SE ESCANEA. Smart Life (Tuya) pide
+            # escanear un QR con su app, y Home Assistant lo manda como un campo
+            # con selector `qr_code` y el texto a codificar. Se pasaba como un
+            # campo de texto vacío y el alta de los 15 aparatos Tuya de la
+            # segunda casa no se podía terminar desde la app. Se dibuja acá, con
+            # el mismo `segno` de la calcomanía, y viaja como imagen.
+            selector = bruto.get("selector")
+            if isinstance(selector, dict) and isinstance(selector.get("qr_code"), dict):
+                datos_qr = selector["qr_code"].get("data")
+                if isinstance(datos_qr, str) and datos_qr:
+                    campo["tipo"] = "qr"
+                    campo["obligatorio"] = False
+                    campo["qr"] = _qr_como_imagen(datos_qr)
             # HA marca asi los campos de contraseña. La app tiene que pintarlos
             # ocultos: en una tablet en la cocina, una clave en claro se lee
             # desde el otro lado de la mesa.

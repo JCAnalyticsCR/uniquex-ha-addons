@@ -83,6 +83,9 @@ async def list_cameras(
         if summary.domain == "camera"
     }
 
+    # El nombre que el cliente le puso al sumarla desde la app.
+    propias: dict[str, str] = getattr(request.app.state, "etiquetas_camaras", None) or {}
+
     mapped = media.list_stream_entities()
     entity_ids = sorted(mapped) if mapped else sorted(ha_cameras)
     cameras: list[CameraInfo] = []
@@ -92,7 +95,7 @@ async def list_cameras(
         cameras.append(
             CameraInfo(
                 entity_id=entity_id,
-                name=labels.get(entity_id) or friendly or _derive_name(entity_id),
+                name=labels.get(entity_id) or propias.get(entity_id) or friendly or _derive_name(entity_id),
                 source="go2rtc" if media.has_stream(entity_id) else "homeassistant",
                 snapshot=True,
                 webrtc=media.has_stream(entity_id),

@@ -349,6 +349,7 @@ class AnnounceClient:
         on_paired: Callable[[DeviceIdentity], None] | None = None,
         on_unpaired: Callable[[DeviceIdentity], Awaitable[None]] | None = None,
         heartbeat_interval: float = _HEARTBEAT_INTERVAL,
+        on_tunnel_token: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         """
         Parámetros
@@ -416,6 +417,9 @@ class AnnounceClient:
         self._heartbeat_interval = heartbeat_interval
         self._on_paired = on_paired
         self._on_unpaired = on_unpaired
+        # Se llama cuando llega un token de túnel DISTINTO al que había en disco.
+        # Ver el bloque de `tunnel_token` en `_procesar_respuesta`.
+        self._on_tunnel_token = on_tunnel_token
         # Cuántas respuestas seguidas dijeron "no la conozco" mientras esta caja
         # se cree emparejada. Ver _DESEMPAREJOS_PARA_CONFIRMAR.
         self._desemparejos_seguidos = 0
@@ -884,6 +888,14 @@ class AnnounceClient:
                 )
 
         if tunnel_token:
+            # 🔪 SI EL TOKEN CAMBIÓ, cloudflared HAY QUE REINICIARLO. Solo lee su
+            # token al arrancar, y guardar el nuevo en disco no lo toca. Pasó en
+            # la segunda casa (2026-10-07): la plataforma desactivó y volvió a
+            # activar la caja dentro del mismo latido, la caja nunca vio el
+            # "no emparejada", y cloudflared siguió días con el token de un túnel
+            # BORRADO — túnel nuevo sin una sola conexión, casa inalcanzable,
+            # hasta que alguien reinició el complemento a mano.
+            anterior = cargar_token_tunel(self._tunnel_token_path)
             try:
                 guardar_token_tunel(self._tunnel_token_path, tunnel_token)
             except OSError as exc:
@@ -906,6 +918,11 @@ class AnnounceClient:
                     hostname=tunnel_hostname,
                     msg="Token persistido. Falta que cloudflared lo use.",
                 )
+                if anterior is not None and anterior != tunnel_token and self._on_tunnel_token:
+                    try:
+                        await self._on_tunnel_token()
+                    except Exception as exc:  # noqa: BLE001 — avisar no puede tumbar el anuncio
+                        logger.warning("announce.reinicio_tunel_fallo", exc=str(exc)[:160])
 
         logger.debug(
             "announce.response",

@@ -179,6 +179,20 @@ CREATE TABLE IF NOT EXISTS custom_cameras (
     PRIMARY KEY (tenant_id, entity_id)
 );
 
+-- Cámaras sumadas POR SU DIRECCIÓN desde la app (ver camaras_directas.py).
+-- `fuente` lleva usuario y clave de la cámara: NUNCA se devuelve por la API.
+CREATE TABLE IF NOT EXISTS camaras_directas (
+    tenant_id   INTEGER NOT NULL DEFAULT 1 REFERENCES tenants(id),
+    entity_id   TEXT NOT NULL,       -- "camera.porton_principal"
+    stream_name TEXT NOT NULL,       -- nombre del stream en go2rtc
+    label       TEXT NOT NULL,       -- "Portón principal"
+    ip          TEXT NOT NULL,
+    marca       TEXT NOT NULL,
+    fuente      TEXT NOT NULL,
+    created_at  TEXT NOT NULL,
+    PRIMARY KEY (tenant_id, entity_id)
+);
+
 -- Registro de entidades conocidas para detección de dispositivos nuevos.
 -- acknowledged_at NULL = pendiente de revisión por el cliente.
 -- Alembic y CREATE TABLE IF NOT EXISTS NO agrega columnas a una tabla que ya
@@ -760,6 +774,77 @@ class Database:
         )
         await conn.commit()
         return bool(cur.rowcount)
+
+    # -------------------------------------------------------------------------
+    # Cámaras sumadas por su dirección (camaras_directas.py)
+    # -------------------------------------------------------------------------
+
+    async def listar_camaras_directas(
+        self, tenant_id: int = 1, *, con_fuente: bool = False
+    ) -> list[dict[str, Any]]:
+        """
+        Las cámaras sumadas por dirección.
+
+        🔪 `con_fuente` es False por defecto y así se queda. La fuente lleva la
+        clave de la cámara: solo la pide quien la registra en go2rtc al arrancar.
+        Cualquier listado que termine en una respuesta HTTP se arma sin ella.
+        """
+        columnas = "entity_id, stream_name, label, ip, marca, created_at"
+        if con_fuente:
+            columnas += ", fuente"
+        conn = self._require_conn()
+        async with conn.execute(
+            f"SELECT {columnas} FROM camaras_directas WHERE tenant_id = ? ORDER BY created_at",  # noqa: S608
+            (tenant_id,),
+        ) as cur:
+            filas = await cur.fetchall()
+        return [dict(f) for f in filas]
+
+    async def guardar_camara_directa(
+        self,
+        *,
+        entity_id: str,
+        stream_name: str,
+        label: str,
+        ip: str,
+        marca: str,
+        fuente: str,
+        tenant_id: int = 1,
+    ) -> None:
+        conn = self._require_conn()
+        await conn.execute(
+            "INSERT OR REPLACE INTO camaras_directas "
+            "(tenant_id, entity_id, stream_name, label, ip, marca, fuente, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                tenant_id,
+                entity_id,
+                stream_name,
+                label,
+                ip,
+                marca,
+                fuente,
+                datetime.now(UTC).isoformat(),
+            ),
+        )
+        await conn.commit()
+
+    async def borrar_camara_directa(self, entity_id: str, tenant_id: int = 1) -> dict[str, Any] | None:
+        """Borra y devuelve lo borrado (sin la fuente), o None si no existía."""
+        conn = self._require_conn()
+        async with conn.execute(
+            "SELECT entity_id, stream_name FROM camaras_directas WHERE tenant_id = ? AND entity_id = ?",
+            (tenant_id, entity_id),
+        ) as cur:
+            fila = await cur.fetchone()
+        if fila is None:
+            return None
+        await conn.execute(
+            "DELETE FROM camaras_directas WHERE tenant_id = ? AND entity_id = ?",
+            (tenant_id, entity_id),
+        )
+        await conn.commit()
+        return dict(fila)
 
     # -------------------------------------------------------------------------
     # Custom rooms (onboarding: habitaciones propias del cliente)

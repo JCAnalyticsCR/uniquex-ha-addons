@@ -262,6 +262,21 @@ class SondeoCanales:
         logger.info("camara.stream_registrado", stream=nombre, canal=canal)
         return True
 
+    async def registrar_fuente(self, nombre: str, url: str) -> None:
+        """
+        Registra un stream con una dirección YA ARMADA por el servidor.
+
+        Lo usan las cámaras sumadas por dirección (`camaras_directas.py`), que
+        no tienen un canal del que derivarse. La dirección la arma y la valida
+        `armar_fuente` del lado de la caja; acá solo se entrega a go2rtc.
+        """
+        await self._registrar(nombre, url)
+        logger.info("camara.stream_registrado", stream=nombre)
+
+    async def borrar_stream(self, nombre: str) -> None:
+        """Saca un stream de la memoria de go2rtc. Nunca lanza."""
+        await self._borrar(nombre)
+
     async def limpiar_huerfanos(self) -> int:
         """
         Borra streams `_sondeo_*` que hayan quedado de un sondeo interrumpido.

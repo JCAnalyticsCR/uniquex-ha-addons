@@ -113,7 +113,9 @@ def redactar(texto: str) -> str:
     return _CREDENCIAL_EN_QUERY.sub(r"\1=***", texto)
 
 
-def debe_integrarse(*, go2rtc_base_url: str | None, streams: dict[str, object]) -> bool:
+def debe_integrarse(
+    *, go2rtc_base_url: str | None, streams: dict[str, object], siempre: bool = False
+) -> bool:
     """
     ¿Hay que levantar go2rtc adentro del Mirror?
 
@@ -122,10 +124,14 @@ def debe_integrarse(*, go2rtc_base_url: str | None, streams: dict[str, object]) 
     solo los streams, una actualización del Mirror le levantaría un segundo
     go2rtc peleándole las sesiones RTSP al NVR — que tiene pocas, y ya se midió
     que perderlas es lo que le congela el video.
+
+    `siempre`: las casas de la plataforma lo levantan sin streams, para que las
+    cámaras se puedan sumar desde la app (ver `camaras_directas.py`). Igual
+    pierde contra un go2rtc externo.
     """
     if go2rtc_base_url:
         return False
-    return bool(streams)
+    return bool(streams) or siempre
 
 
 @dataclass(frozen=True)

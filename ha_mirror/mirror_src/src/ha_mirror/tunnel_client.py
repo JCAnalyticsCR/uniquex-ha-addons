@@ -76,6 +76,25 @@ class TunnelClient:
         # Sin esta distinción, la salida del proceso se leería como una caída:
         # warning de alarma y backoff creciente para algo que hicimos nosotros.
         self._parada_intencional = False
+        # Se levanta cuando llega un token NUEVO con cloudflared corriendo: se lo
+        # baja para que arranque otra vez leyendo el token nuevo. Tampoco es una
+        # caída: ni warning ni backoff.
+        self._reinicio_por_token = False
+
+    async def token_actualizado(self) -> None:
+        """
+        Llegó un token distinto: cloudflared tiene que arrancar con el nuevo.
+
+        Si está corriendo se lo baja y el bucle lo vuelve a levantar leyendo el
+        disco. Si no está corriendo no hace falta nada: el bucle lee el token
+        cada vez que arranca. Ver `announce.on_tunnel_token`.
+        """
+        proc = self._proc
+        if proc is None or proc.returncode is not None:
+            return
+        self._reinicio_por_token = True
+        logger.info("tunnel.token_nuevo", msg="Reiniciando cloudflared con el token nuevo.")
+        await self._terminar()
 
     async def detener_por_desemparejo(self) -> None:
         """
@@ -127,6 +146,12 @@ class TunnelClient:
                 raise
 
             vivio = asyncio.get_running_loop().time() - arrancado
+
+            if self._reinicio_por_token:
+                # Lo bajamos nosotros para que lea el token nuevo: se relanza ya.
+                self._reinicio_por_token = False
+                backoff = _BACKOFF_BASE
+                continue
 
             if self._parada_intencional:
                 # Lo bajamos nosotros. Ni warning ni backoff: se vuelve al

@@ -33,6 +33,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 
 from ha_mirror.api.areas import router as areas_router
+from ha_mirror.api.camaras_directas import router as camaras_directas_router
 from ha_mirror.api.camera_media import router as camera_media_router
 from ha_mirror.api.camera_ws import router as camera_ws_router
 from ha_mirror.api.canales import router as canales_router
@@ -283,7 +284,17 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     camera_streams = settings.camera_streams
     streams_integrados = settings.go2rtc_stream_sources
 
-    if debe_integrarse(go2rtc_base_url=go2rtc_base_url, streams=streams_integrados):
+    # 🔪 EN UNA CASA DE LA PLATAFORMA go2rtc ARRANCA AUNQUE NO HAYA NINGUNA
+    # CÁMARA TODAVÍA. Antes solo arrancaba si el complemento traía
+    # `go2rtc_streams`, que se escriben dentro de Home Assistant — o sea que
+    # una casa sin técnico con acceso nunca iba a tener dónde sumar una cámara
+    # desde la app. Ocioso pesa unos MB. Fortunatta tiene `go2rtc_base_url`
+    # y no cambia nada: esa condición manda primero.
+    if debe_integrarse(
+        go2rtc_base_url=go2rtc_base_url,
+        streams=streams_integrados,
+        siempre=bool(settings.platform_base_url),
+    ):
         candidato = Go2rtcIntegrado(
             ruta_config=settings.mirror_db_path.parent / "go2rtc" / "go2rtc.yaml",
             streams=streams_integrados,
@@ -341,11 +352,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     #
     # Si go2rtc no contesta, se sigue igual: es preferible arrancar sin las
     # camaras propias que no arrancar.
+    # Nombre visible de cada cámara sumada desde la app (la API la arma por
+    # entity_id). Se llena al restaurar y al dar de alta o de baja.
+    app.state.etiquetas_camaras = {}
+
     async def restaurar_camaras_propias() -> None:
         from ha_mirror.sondeo_canales import SondeoCanales
 
-        propias = await db.listar_camaras_propias(getattr(settings, "tenant_id", 1))
-        if not propias or not camera_media.webrtc_enabled:
+        tenant = getattr(settings, "tenant_id", 1)
+        propias = await db.listar_camaras_propias(tenant)
+        # Las sumadas por dirección traen su fuente (con la clave): solo acá,
+        # para entregársela a go2rtc. Ver `listar_camaras_directas`.
+        directas = await db.listar_camaras_directas(tenant, con_fuente=True)
+        etiquetas = app.state.etiquetas_camaras
+        for c in [*propias, *directas]:
+            etiquetas[c["entity_id"]] = c["label"]
+        if not (propias or directas) or not camera_media.webrtc_enabled:
             return
         registrador = SondeoCanales(
             base_url=camera_media._go2rtc_base_url,  # noqa: SLF001
@@ -355,7 +377,13 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         for c in propias:
             camera_media.agregar_stream(c["entity_id"], c["stream_name"])
             await registrador.registrar_permanente(c["stream_name"], c["canal"])
-        logger.info("camaras.propias_restauradas", cuantas=len(propias))
+        for c in directas:
+            camera_media.agregar_stream(c["entity_id"], c["stream_name"])
+            try:
+                await registrador.registrar_fuente(c["stream_name"], c["fuente"])
+            except Exception:  # noqa: BLE001 — el error puede traer la dirección con la clave
+                logger.warning("camaras.directa_no_restaurada", entity_id=c["entity_id"])
+        logger.info("camaras.propias_restauradas", cuantas=len(propias), directas=len(directas))
 
     if go2rtc_integrado is not None:
         go2rtc_integrado.al_estar_listo = restaurar_camaras_propias
@@ -527,6 +555,9 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 # fue borrado por el propio cliente de anuncio, así que el
                 # supervisor vuelve a quedar esperando uno nuevo.
                 on_unpaired=lambda _identidad: tunnel_client.detener_por_desemparejo(),
+                # Token NUEVO con cloudflared corriendo: reiniciarlo para que lo
+                # lea. Ver `TunnelClient.token_actualizado`.
+                on_tunnel_token=lambda: tunnel_client.token_actualizado(),
             )
             # El tunel corre EN PARALELO al anuncio, no despues: el token puede
             # llegar en cualquier momento (cuando alguien escanee el QR) y
@@ -666,6 +697,7 @@ def create_app() -> FastAPI:
     app.include_router(service_router)
     app.include_router(iframe_router)
     app.include_router(camera_media_router)
+    app.include_router(camaras_directas_router)
     app.include_router(scenes_router)
     # Pronóstico: solo lectura y con caché propia. Endpoint dedicado a propósito,
     # NO un flag en el proxy de servicios — ver la cabecera de pronostico.py.
