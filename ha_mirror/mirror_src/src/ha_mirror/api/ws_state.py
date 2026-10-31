@@ -30,6 +30,7 @@ from typing import Any
 import structlog
 from fastapi import APIRouter, Query, WebSocket, WebSocketDisconnect
 
+from ha_mirror.filtro_ws import FiltroWs, preparar_mensaje
 from ha_mirror.models import WsSnapshot
 from ha_mirror.prometheus_metrics import WS_CLIENTS_CONNECTED, WS_MESSAGES_SENT
 
@@ -89,12 +90,27 @@ async def ws_state(
         # authenticate_ws ya cerró el WebSocket con el código correspondiente.
         return
 
+    # (0.53.0) Qué ve este cliente. El filtro viaja firmado en el ticket; si el
+    # ticket TRAE filtro y no se puede leer, se cierra — nunca se degrada a
+    # "ve todo". La llave maestra por query (camino viejo) no lleva filtro.
+    filtro: FiltroWs | None = None
+    if ticket is not None:
+        from ha_mirror.config import get_settings
+        from ha_mirror.ws_ticket import filtro_del_ticket
+
+        try:
+            filtro = filtro_del_ticket(get_settings(), ticket)
+        except ValueError:
+            logger.warning("ws.filtro_ilegible")
+            await websocket.close(code=4001, reason="Ticket invalido o vencido")
+            return
+
     await websocket.accept()
 
     store = websocket.app.state.store
     client_id = str(uuid.uuid4())[:8]
 
-    logger.info("ws.client_connected", client_id=client_id)
+    logger.info("ws.client_connected", client_id=client_id, filtrado=filtro is not None)
     WS_CLIENTS_CONNECTED.inc()
 
     # Registrar suscriptor y obtener su queue
@@ -102,12 +118,12 @@ async def ws_state(
 
     try:
         # Enviar snapshot inicial con el estado completo
-        await _send_snapshot(websocket, store, client_id)
+        await _send_snapshot(websocket, store, client_id, filtro)
 
         # Lanzar ambas corutinas como tasks concurrentes.
         # Usamos gather con return_exceptions=False: la primera que falla cancela la otra.
         stream_task = asyncio.create_task(
-            _stream_events(websocket, queue, client_id),
+            _stream_events(websocket, queue, client_id, filtro),
             name=f"ws_stream_{client_id}",
         )
         recv_task = asyncio.create_task(
@@ -142,8 +158,10 @@ async def ws_state(
         WS_CLIENTS_CONNECTED.dec()
 
 
-async def _send_snapshot(websocket: WebSocket, store: Any, client_id: str) -> None:
-    """Envía el snapshot completo del estado actual al cliente."""
+async def _send_snapshot(
+    websocket: WebSocket, store: Any, client_id: str, filtro: FiltroWs | None = None
+) -> None:
+    """Envía el snapshot del estado actual al cliente — lo que su filtro le deja ver."""
     states = store.get_all_entity_summaries()
     areas = store.get_areas_enriched()
     services = store.get_services()
@@ -155,13 +173,15 @@ async def _send_snapshot(websocket: WebSocket, store: Any, client_id: str) -> No
         cache_version=store.cache_version,
     )
 
-    payload = snapshot.model_dump(mode="json")
+    payload = preparar_mensaje(snapshot.model_dump(mode="json"), filtro)
+    if payload is None:  # un snapshot nunca se descarta entero; por las dudas
+        return
     await websocket.send_text(json.dumps(payload, default=_json_seguro))
 
     logger.info(
         "ws.snapshot_sent",
         client_id=client_id,
-        entity_count=len(states),
+        entity_count=len(payload.get("states", {})),
         cache_version=store.cache_version,
     )
     WS_MESSAGES_SENT.labels(type="snapshot").inc()
@@ -171,13 +191,18 @@ async def _stream_events(
     websocket: WebSocket,
     queue: asyncio.Queue[dict[str, Any]],
     client_id: str,
+    filtro: FiltroWs | None = None,
 ) -> None:
-    """Lee eventos de la queue y los envía al cliente WS."""
+    """Lee eventos de la queue y los envía al cliente WS — solo los que su filtro deja ver."""
     while True:
         try:
-            msg = await asyncio.wait_for(queue.get(), timeout=60.0)
+            crudo = await asyncio.wait_for(queue.get(), timeout=60.0)
         except asyncio.TimeoutError:
             # Keepalive: si no hay eventos en 60s, ping interno
+            continue
+
+        msg = preparar_mensaje(crudo, filtro)
+        if msg is None:
             continue
 
         try:

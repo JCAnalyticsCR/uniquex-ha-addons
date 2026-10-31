@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import re
+import unicodedata
 from collections.abc import AsyncIterator
+from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from ha_mirror.auth import require_api_key
-from ha_mirror.camera_media import CameraMediaError, _SEG_REF_MAX_LEN, _SEG_REF_RE
+from ha_mirror.camera_media import _SEG_REF_MAX_LEN, _SEG_REF_RE, CameraMediaError
 
 router = APIRouter(prefix="/api/cameras", tags=["cameras"])
 
@@ -57,6 +59,35 @@ def _derive_name(entity_id: str) -> str:
     return slug.replace("_", " ").strip().upper() or entity_id
 
 
+def _grupo(nombre: str) -> str:
+    """'Casa Jorgito 11' -> 'casa jorgito'. El grabador al que pertenece la cámara."""
+    plano = unicodedata.normalize("NFD", nombre).encode("ascii", "ignore").decode().lower()
+    return re.sub(r"[\s_-]*\d+\s*$", "", " ".join(plano.split())).strip()
+
+
+def _camaras_ha_no_cubiertas(
+    ha_cameras: dict[str, Any], mapped: list[str], propias: dict[str, str]
+) -> list[str]:
+    """
+    Las `camera.*` de Home Assistant cuyo grabador todavía no pasó a go2rtc.
+
+    Al cargar un grabador entero, sus cámaras se llaman "<Nombre> <canal>" —el
+    mismo patrón con el que se renombraron las de ONVIF—. Si el grupo ya está en
+    go2rtc, las de HA de ese grupo son las mismas cámaras vistas por otro lado y
+    se esconden. Las de un grupo que nadie cargó todavía, se muestran.
+    """
+    cubiertos = {_grupo(propias.get(eid, "")) for eid in mapped} - {""}
+    visibles: list[str] = []
+    for entity_id in sorted(ha_cameras):
+        if entity_id in mapped:
+            continue
+        nombre = getattr(ha_cameras[entity_id], "friendly_name", None) or ""
+        if _grupo(nombre) in cubiertos:
+            continue
+        visibles.append(entity_id)
+    return visibles
+
+
 @router.get("", response_model=CameraListResponse, summary="Camaras disponibles")
 async def list_cameras(
     request: Request,
@@ -87,7 +118,20 @@ async def list_cameras(
     propias: dict[str, str] = getattr(request.app.state, "etiquetas_camaras", None) or {}
 
     mapped = media.list_stream_entities()
-    entity_ids = sorted(mapped) if mapped else sorted(ha_cameras)
+    if not mapped:
+        entity_ids = sorted(ha_cameras)
+    elif all(eid in propias for eid in mapped):
+        # 🔪 (0.53.0) Toda cámara de go2rtc la sumó el cliente desde la app
+        # (grabador entero o por dirección): no hay un mapa curado que cubra la
+        # casa. Mostrar SOLO esas escondía todo lo demás — en casa 2, cargar el
+        # grabador de Casa Jorgito (11) hizo desaparecer las otras 32 que
+        # seguían entrando por ONVIF de Home Assistant. Ahora se suman las de
+        # HA de los grupos que todavía no pasaron a go2rtc.
+        entity_ids = sorted(mapped) + _camaras_ha_no_cubiertas(ha_cameras, mapped, propias)
+    else:
+        # Mapa curado (la primera casa): manda él, como siempre. Sus `camera.*`
+        # de HA son el mismo grabador visto por otro lado y saldrían repetidas.
+        entity_ids = sorted(mapped)
     cameras: list[CameraInfo] = []
     for entity_id in entity_ids:
         summary = ha_cameras.get(entity_id)

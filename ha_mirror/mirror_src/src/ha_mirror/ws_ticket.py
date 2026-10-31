@@ -30,6 +30,9 @@ El Mirror emite el ticket; el navegador nunca recibe un secreto de larga vida.
     tickets vivos — que es el comportamiento correcto.
   - El ticket lleva scope y entity_id: un ticket de `state` no abre
     `/ws/cameras/*`, y uno de `camera.sala` no abre `camera.dormitorio`.
+  - (0.53.0) Un ticket de `state` puede llevar además un FILTRO firmado: qué
+    dominios y qué cámaras ve quien lo usa (ver `filtro_ws.py`). Sin filtro =
+    ve todo, como siempre.
 """
 
 from __future__ import annotations
@@ -38,6 +41,7 @@ import structlog
 from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 
 from ha_mirror.config import Settings
+from ha_mirror.filtro_ws import FiltroWs
 
 logger: structlog.stdlib.BoundLogger = structlog.get_logger(__name__)
 
@@ -57,21 +61,52 @@ def issue_ticket(
     settings: Settings,
     scope: str,
     entity_id: str | None = None,
+    filtro: FiltroWs | None = None,
 ) -> tuple[str, int]:
     """
     Emite un ticket firmado para un WebSocket.
 
-    Retorna (ticket, ttl_segundos). Lanza ValueError si el scope no es valido.
+    Retorna (ticket, ttl_segundos). Lanza ValueError si el scope no es valido
+    o si se pide un filtro para algo que no es el WS de estado.
     """
     if scope not in VALID_SCOPES:
         raise ValueError(f"scope invalido: {scope!r}")
+    if filtro is not None and scope != "state":
+        raise ValueError("solo el WS de estado admite filtro")
 
-    payload = {"s": scope, "e": entity_id}
+    payload: dict[str, object] = {"s": scope, "e": entity_id}
+    if filtro is not None:
+        payload["f"] = filtro.a_payload()
     ticket: str = _get_serializer(settings).dumps(payload)
 
     # entity_id no es secreto; se loguea para poder auditar el uso.
-    logger.info("ws_ticket.issued", scope=scope, entity_id=entity_id)
+    logger.info(
+        "ws_ticket.issued",
+        scope=scope,
+        entity_id=entity_id,
+        filtrado=filtro is not None,
+        camaras=len(filtro.camaras) if filtro is not None else None,
+    )
     return ticket, settings.ws_ticket_ttl_seconds
+
+
+def filtro_del_ticket(settings: Settings, ticket: str) -> FiltroWs | None:
+    """
+    El filtro firmado de un ticket YA verificado con `verify_ticket`.
+
+    `None` = sin filtro (ve todo). Lanza ValueError si el ticket TRAE filtro pero
+    no se puede leer: ahí no se degrada a "ve todo" — se rechaza la conexión.
+    """
+    try:
+        payload = _get_serializer(settings).loads(ticket, max_age=settings.ws_ticket_ttl_seconds)
+    except (SignatureExpired, BadSignature) as exc:
+        raise ValueError("ticket invalido") from exc
+    if not isinstance(payload, dict) or "f" not in payload:
+        return None
+    filtro = FiltroWs.desde_payload(payload["f"])
+    if filtro is None:
+        raise ValueError("filtro ilegible en el ticket")
+    return filtro
 
 
 def verify_ticket(
