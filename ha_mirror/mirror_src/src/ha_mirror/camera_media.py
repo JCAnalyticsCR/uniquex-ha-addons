@@ -481,6 +481,18 @@ class CameraMediaClient:
     def webrtc_enabled(self) -> bool:
         return self._go2rtc_base_url is not None and bool(self._camera_streams)
 
+    @property
+    def go2rtc_disponible(self) -> bool:
+        """
+        Hay go2rtc al que sumarle cámaras, tenga o no alguna todavía.
+
+        🔪 NO es `webrtc_enabled`. Ese pide además que ya haya cámaras, y el alta
+        desde la app lo usaba para decidir si podía agregar: en una casa sin
+        cámaras —justo la que más lo necesita— contestaba "el servicio de video
+        no está encendido" y nunca dejaba agregar la primera. Visto en casa 2.
+        """
+        return self._go2rtc_base_url is not None
+
     def has_stream(self, entity_id: str) -> bool:
         return self.webrtc_enabled and entity_id in self._camera_streams
 

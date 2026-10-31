@@ -247,7 +247,8 @@ def _sondeo(cliente: Any) -> SondeoCanales:
 
 def _cliente_con_video(estado: Any) -> Any:
     cliente = getattr(estado, "camera_media", None)
-    if cliente is None or not getattr(cliente, "webrtc_enabled", False):
+    # `go2rtc_disponible`, NO `webrtc_enabled`: ese pide que ya haya cámaras.
+    if cliente is None or not getattr(cliente, "go2rtc_disponible", False):
         raise _error(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "sin_video",
@@ -622,7 +623,7 @@ async def quitar(entity_id: str, request: Request, _: None = Depends(require_api
     cliente = getattr(estado, "camera_media", None)
     if cliente is not None:
         cliente.quitar_stream(entity_id)
-        if getattr(cliente, "webrtc_enabled", False):
+        if getattr(cliente, "go2rtc_disponible", False):
             await _sondeo(cliente).borrar_stream(borrada["stream_name"])
     _etiquetas(estado).pop(entity_id, None)
     logger.info("camara_directa.baja", entity_id=entity_id)
