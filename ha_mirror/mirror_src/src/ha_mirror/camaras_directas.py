@@ -56,7 +56,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import structlog
 
@@ -204,6 +204,51 @@ def armar_fuente(
     return f"rtsp://{quote(usuario, safe='')}:{quote(clave, safe='')}@{ip}:{puerto}{camino}"
 
 
+#: Cuántos canales puede tener un grabador. Son los tamaños que se fabrican;
+#: pedir 32 en uno de 16 solo agrega 16 pruebas vacías.
+CANALES_POR_GRABADOR = (4, 8, 16, 32, 64)
+
+#: Marcas cuyos grabadores publican cada canal en una ruta conocida.
+MARCAS_GRABADOR = ("dahua", "hikvision", "reolink")
+
+
+def ruta_de_canal(marca: str, canal: int) -> str:
+    """
+    La ruta de video del canal `canal` de un grabador de esa marca.
+
+    El canal 1 de Dahua es justo `RUTAS_POR_MARCA["dahua"]`: una cámara suelta
+    es un grabador de un canal, y así un canal y una cámara suelta con la misma
+    dirección y ruta se reconocen como la misma (ver `destino`).
+    """
+    if marca not in MARCAS_GRABADOR:
+        raise ValueError("Esa marca no tiene grabadores con canales conocidos.")
+    if not 1 <= canal <= max(CANALES_POR_GRABADOR):
+        raise ValueError("Canal fuera de rango.")
+    if marca == "dahua":
+        return f"/cam/realmonitor?channel={canal}&subtype=0"
+    if marca == "hikvision":
+        return f"/Streaming/Channels/{canal}01"
+    return f"/h264Preview_{canal:02d}_main"
+
+
+def destino(fuente: str) -> str:
+    """
+    A dónde apunta una fuente, SIN usuario ni clave: `ip:puerto/ruta?consulta`.
+
+    Es lo que define si dos cámaras son la misma. Antes se comparaba solo la
+    dirección, y entonces de un grabador se podía agregar un único canal: el
+    segundo salía como "ya agregada". La ruta alternativa de Reolink se lleva a
+    la principal para que la misma cámara no entre dos veces por dos rutas.
+    """
+    partes = urlsplit(fuente)
+    camino = partes.path
+    for marca, alternativa in RUTA_ALTERNATIVA.items():
+        if camino == alternativa:
+            camino = RUTAS_POR_MARCA[marca]
+    consulta = f"?{partes.query}" if partes.query else ""
+    return f"{partes.hostname}:{partes.port or 554}{camino}{consulta}"
+
+
 def con_otra_ruta(fuente: str, marca: str) -> str | None:
     """La misma fuente con la ruta alternativa de la marca, si tiene una."""
     alternativa = RUTA_ALTERNATIVA.get(marca)
@@ -241,13 +286,21 @@ def clasificar(codigo: int | None, salida: str, error: str) -> Resultado:
         return Resultado.OK if "video" in salida.lower() else Resultado.SIN_VIDEO
     if any(
         señal in texto
-        for señal in ("connection refused", "no route to host", "timed out", "timeout", "unreachable")
+        for señal in (
+            "connection refused",
+            "no route to host",
+            "timed out",
+            "timeout",
+            "unreachable",
+        )
     ):
         return Resultado.NO_RESPONDE
     return Resultado.ERROR
 
 
-async def probar(fuente: str, *, binario: str = "ffprobe", timeout_s: float = TIMEOUT_PRUEBA_S) -> Resultado:
+async def probar(
+    fuente: str, *, binario: str = "ffprobe", timeout_s: float = TIMEOUT_PRUEBA_S
+) -> Resultado:
     """
     Le pide a la cámara su primer stream de video. Nunca lanza.
 
@@ -257,13 +310,19 @@ async def probar(fuente: str, *, binario: str = "ffprobe", timeout_s: float = TI
     try:
         proc = await asyncio.create_subprocess_exec(
             binario,
-            "-v", "error",
-            "-rtsp_transport", "tcp",
+            "-v",
+            "error",
+            "-rtsp_transport",
+            "tcp",
             # Microsegundos. Tope de cada lectura del socket, no de la prueba entera.
-            "-timeout", str(int(timeout_s * 1_000_000)),
-            "-select_streams", "v:0",
-            "-show_entries", "stream=codec_type",
-            "-of", "csv=p=0",
+            "-timeout",
+            str(int(timeout_s * 1_000_000)),
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=codec_type",
+            "-of",
+            "csv=p=0",
             fuente,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
