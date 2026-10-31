@@ -1475,7 +1475,15 @@ class OnboardingService:
                 "tipo": str(bruto.get("type") or "string"),
                 "obligatorio": bool(bruto.get("required")),
             }
-            if "default" in bruto:
+            # HA marca asi los campos de contraseña. La app tiene que pintarlos
+            # ocultos: en una tablet en la cocina, una clave en claro se lee
+            # desde el otro lado de la mesa.
+            secreto = bruto.get("format") == "password" or "password" in str(nombre).lower()
+            # 🔪 Y NUNCA SE DEVUELVE SU VALOR SUGERIDO. Cuando un formulario
+            # falla, HA lo vuelve a mostrar con lo escrito como `default`,
+            # contraseña incluida: la segunda casa devolvía, en el JSON, la clave
+            # que se había probado días antes en una cámara Reolink.
+            if "default" in bruto and not secreto:
                 campo["valor_inicial"] = bruto["default"]
             if bruto.get("options"):
                 campo["opciones"] = bruto["options"]
@@ -1492,10 +1500,7 @@ class OnboardingService:
                     campo["tipo"] = "qr"
                     campo["obligatorio"] = False
                     campo["qr"] = _qr_como_imagen(datos_qr)
-            # HA marca asi los campos de contraseña. La app tiene que pintarlos
-            # ocultos: en una tablet en la cocina, una clave en claro se lee
-            # desde el otro lado de la mesa.
-            if bruto.get("format") == "password" or "password" in str(nombre).lower():
+            if secreto:
                 campo["secreto"] = True
             campos.append(campo)
         return campos

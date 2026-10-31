@@ -39,6 +39,7 @@ from ha_mirror.api.camera_ws import router as camera_ws_router
 from ha_mirror.api.canales import router as canales_router
 from ha_mirror.api.costumbres import router as costumbres_router
 from ha_mirror.api.entities import router as entities_router
+from ha_mirror.api.guia_ewelink import router as guia_ewelink_router
 from ha_mirror.api.health import router as health_router
 from ha_mirror.api.iframe_token import router as iframe_router
 from ha_mirror.api.mantenimiento import router as mantenimiento_router
@@ -726,6 +727,8 @@ def create_app() -> FastAPI:
     app.include_router(canales_router)
     app.include_router(preferences_router)
     app.include_router(onboarding_router)
+    # Avance de la guía eWeLink: solo lectura, ver `guia_ewelink.py`.
+    app.include_router(guia_ewelink_router)
     # Emisor de tickets de WebSocket (0.21.0). Lo llama el frontend desde el
     # servidor con X-API-Key; el navegador nunca recibe la key.
     app.include_router(ws_ticket_router)

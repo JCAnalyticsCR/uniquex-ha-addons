@@ -105,7 +105,7 @@ _SOLO_TECNICO: tuple[tuple[re.Pattern[str], str], ...] = (
     ),
     (
         re.compile(r"ewelink", re.I),
-        "Es el puente de los 245 apagadores de la casa. Si no vuelve a levantar, "
+        "Es el puente de los apagadores eWeLink de la casa. Si no vuelve a levantar, "
         "se quedan todos sin responder hasta que alguien lo reinicie.",
     ),
     (
