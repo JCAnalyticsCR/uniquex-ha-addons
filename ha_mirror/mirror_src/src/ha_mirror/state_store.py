@@ -527,6 +527,41 @@ class StateStore:
         """
         return len(self.listar_dispositivos_configurados())
 
+    def aparatos_de_entradas(self, entry_ids: set[str]) -> list[dict[str, Any]]:
+        """
+        Los aparatos que Home Assistant tiene de esas integraciones (0.54.0).
+
+        🔪 INCLUYE LOS QUE NO TIENEN NINGÚN CONTROL. Es lo que faltaba para
+        entender la caja de arena de casa 2: un aparato que entra a la cuenta de
+        Smart Life pero cuyo tipo HA no sabe manejar queda en el registro de
+        aparatos SIN entidades, y como la app solo veía entidades, era invisible.
+        Acá sale con `controles: 0`.
+
+        Las entidades deshabilitadas no cuentan como control: no se ven en la app.
+        """
+        controles: dict[str, int] = {}
+        for entry in self._entities.values():
+            if entry.device_id and entry.disabled_by is None:
+                controles[entry.device_id] = controles.get(entry.device_id, 0) + 1
+        salida: list[dict[str, Any]] = []
+        for device in self._devices.values():
+            extras = device.model_extra or {}
+            entradas = extras.get("config_entries") or []
+            if not isinstance(entradas, list) or not entry_ids.intersection(entradas):
+                continue
+            salida.append(
+                {
+                    "device_id": device.id,
+                    "nombre": extras.get("name_by_user") or device.name or device.id,
+                    "fabricante": device.manufacturer,
+                    "modelo": device.model,
+                    "area_id": device.area_id,
+                    "controles": controles.get(device.id, 0),
+                    "deshabilitado": extras.get("disabled_by") is not None,
+                }
+            )
+        return sorted(salida, key=lambda a: (a["controles"] > 0, str(a["nombre"]).lower()))
+
     def get_services(self) -> dict[str, Any]:
         return dict(self._services)
 

@@ -729,6 +729,11 @@ def create_app() -> FastAPI:
     app.include_router(onboarding_router)
     # Avance de la guía eWeLink: solo lectura, ver `guia_ewelink.py`.
     app.include_router(guia_ewelink_router)
+    # Canal técnico (0.54.0): mantenimiento remoto con firma de la plataforma.
+    # Sin identidad de caja (modo artesanal) todas sus rutas contestan 401.
+    from ha_mirror.api.tecnico import router as tecnico_router
+
+    app.include_router(tecnico_router)
     # Emisor de tickets de WebSocket (0.21.0). Lo llama el frontend desde el
     # servidor con X-API-Key; el navegador nunca recibe la key.
     app.include_router(ws_ticket_router)

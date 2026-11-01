@@ -883,3 +883,54 @@ async def post_rescan(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=str(exc),
         ) from None
+
+
+# ---------------------------------------------------------------------------
+# Endpoints — Aparatos de una integración (0.54.0)
+# ---------------------------------------------------------------------------
+
+_RE_DOMINIO = re.compile(r"^[a-z0-9_]{2,40}$")
+
+
+@router.get(
+    "/aparatos",
+    summary="Los aparatos de una integración, incluidos los que no tienen controles",
+)
+async def get_aparatos(
+    request: Request,
+    dominio: str,
+    _: None = Depends(require_api_key),
+) -> dict[str, Any]:
+    """
+    Lo que la casa ve de una cuenta (Smart Life, eWeLink…): cada aparato con
+    cuántos controles le creó Home Assistant.
+
+    🔪 LOS QUE TIENEN 0 CONTROLES SON EL PUNTO. La caja de arena de casa 2 entró
+    a Smart Life y no aparecía en ningún lado: la app solo ve entidades, y un
+    aparato cuyo tipo HA no maneja queda en el registro SIN entidades. Acá sale,
+    con `controles: 0`, para que la persona sepa que no es su cuenta: es el tipo.
+
+    `cuentas` dice cuántas conexiones de esa integración tiene la casa (con su
+    título), para responder "¿con qué cuenta está conectada la casa?".
+    """
+    if not _RE_DOMINIO.fullmatch(dominio):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Integración inválida")
+    try:
+        resp = await request.app.state.upstream.send_command({"type": "config_entries/get"}, timeout=15.0)
+    except UpstreamNotReadyError:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="Upstream HA desconectado") from None
+    except HaProtocolError as exc:
+        if "unauthorized" in str(exc).lower():
+            raise HTTPException(
+                status_code=status.HTTP_501_NOT_IMPLEMENTED,
+                detail="Se requieren permisos admin en HA",
+            ) from None
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail="HA no contestó") from None
+    entradas = [e for e in (resp.get("result") or []) if e.get("domain") == dominio]
+    aparatos = request.app.state.store.aparatos_de_entradas({str(e.get("entry_id")) for e in entradas})
+    return {
+        "dominio": dominio,
+        "cuentas": [{"titulo": e.get("title"), "estado": e.get("state")} for e in entradas],
+        "aparatos": aparatos,
+        "sin_controles": sum(1 for a in aparatos if a["controles"] == 0),
+    }
