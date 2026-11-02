@@ -1,5 +1,5 @@
 """
-Canal técnico (0.54.0): el mantenimiento remoto que solo podemos hacer NOSOTROS.
+Canal técnico (0.54.1): el mantenimiento remoto que solo podemos hacer NOSOTROS.
 
 POR QUÉ EXISTE
 --------------
@@ -38,11 +38,22 @@ QUÉ FIRMA (en este orden exacto, cada campo con su largo de 4 bytes delante)
 QUÉ HACE (y nada más)
 ---------------------
 Ver el estado y las actualizaciones · refrescar la tienda del Supervisor ·
-actualizar el Mirror, HACS y las integraciones de la lista, con respaldo (Core,
-el sistema operativo y los demás complementos, NO: se hacen a mano) · reiniciar Home
-Assistant · correr formularios de integraciones de una lista cerrada (HACS,
-Xtend Tuya, Smart Life, SonoffLAN) · descargar integraciones de la comunidad de
-una lista cerrada de repositorios. No es una consola: no hay paso genérico.
+guardar un respaldo completo · instalar CUALQUIER actualización (Core, sistema
+operativo, Supervisor, complementos, integraciones, el propio Mirror) menos
+Dahua · reiniciar Home Assistant · correr formularios de integraciones de una
+lista cerrada (HACS, Xtend Tuya, Smart Life, SonoffLAN) · descargar integraciones
+de la comunidad de una lista cerrada de repositorios. No es una consola: no hay
+paso genérico.
+
+La administración remota ES el producto (Jeyrell, 2026-11-01: "el cliente nos
+encargó este proyecto para administrarle todo remotamente"). La única excepción
+es Dahua, y es técnica: su versión nueva importa `async_timeout`, que Home
+Assistant ya no trae, y al reiniciar no carga — se apagan las cámaras.
+
+🔪 TODO LO QUE TARDA SE CONTESTA ANTES DE HACERLO. Cloudflare corta a los 100 s
+un pedido sin respuesta, y una actualización tarda minutos (el sistema operativo
+además reinicia la caja, y el Mirror se apaga a sí mismo). El avance se sigue
+con `estado`; `fabrica_api.tecnico actualizar-todo` lo hace solo.
 """
 
 from __future__ import annotations
@@ -83,11 +94,10 @@ REPOS_PERMITIDOS: dict[str, str] = {
     "rroller/dahua": "integration",
 }
 
-#: Además del propio Mirror, lo único que el canal puede actualizar: HACS y las
-#: integraciones de la lista (se reconocen por el repositorio de su `release_url`).
-#: Core, el sistema operativo, el Supervisor y los demás complementos tardan
-#: minutos y, si algo sale mal, hace falta alguien en la casa: van a mano.
-REPOS_ACTUALIZABLES: frozenset[str] = frozenset({*REPOS_PERMITIDOS, "hacs/integration"})
+#: Lo único que el canal NUNCA instala (ver el docstring). Se busca en el id, en
+#: el nombre visible y en el repositorio de su `release_url`: el id de un
+#: complemento no siempre dice de qué es, y el nombre se puede cambiar en HA.
+_NUNCA_ACTUALIZAR = re.compile(r"dahua", re.I)
 
 #: Bit BACKUP de `supported_features` de las entidades `update.*`.
 _SOPORTA_RESPALDO = 8
@@ -201,6 +211,12 @@ def repo_de_la_actualizacion(attrs: Any) -> str | None:
     return m.group(1).lower() if m else None
 
 
+def _campo_de(entity_id: str, attrs: Any) -> str:
+    """Id + nombre visible + repositorio: donde se busca qué es una actualización."""
+    nombre = _leer(attrs, "friendly_name") or _leer(attrs, "title") or ""
+    return f"{entity_id} {nombre} {repo_de_la_actualizacion(attrs) or ''}"
+
+
 def es_el_mirror(entity_id: str, nombre: str) -> bool:
     """La actualización del propio Mirror: hay que contestar ANTES de lanzarla."""
     return bool(re.search(r"uniquexcr|\bmirror\b", f"{entity_id} {nombre}", re.I))
@@ -241,7 +257,7 @@ class CanalTecnico:
 
     async def estado(self) -> dict[str, Any]:
         entradas = await self._ws({"type": "config_entries/get"})
-        actualizaciones = []
+        actualizaciones: list[dict[str, Any]] = []
         for entity_id, st in self._store.get_all_states().items():
             if not entity_id.startswith("update."):
                 continue
@@ -253,6 +269,8 @@ class CanalTecnico:
                     "instalada": _leer(attrs, "installed_version"),
                     "disponible": _leer(attrs, "latest_version"),
                     "hay_novedad": getattr(st, "state", None) == "on",
+                    "en_curso": bool(_leer(attrs, "in_progress")),
+                    "nunca": bool(_NUNCA_ACTUALIZAR.search(_campo_de(entity_id, attrs))),
                 }
             )
         return {
@@ -271,6 +289,25 @@ class CanalTecnico:
             "actualizaciones": sorted(
                 actualizaciones, key=lambda a: (not a["hay_novedad"], a["entity_id"])
             ),
+            "respaldos": await self._respaldos(),
+        }
+
+    async def _respaldos(self) -> dict[str, Any]:
+        """Los últimos respaldos, para saber cuándo terminó el que se pidió."""
+        try:
+            datos = await self._ws({"type": "backup/info"}, timeout=15.0) or {}
+        except Exception:  # noqa: BLE001 — un Core viejo no tiene `backup/*`
+            return {"disponible": False, "generando": False, "recientes": []}
+        lista = [
+            {"nombre": b.get("name"), "fecha": b.get("date")}
+            for b in datos.get("backups") or []
+            if isinstance(b, dict)
+        ]
+        lista.sort(key=lambda b: str(b["fecha"] or ""), reverse=True)
+        return {
+            "disponible": True,
+            "generando": bool(datos.get("generating")) or datos.get("state") not in (None, "idle"),
+            "recientes": lista[:5],
         }
 
     # ── Supervisor ──────────────────────────────────────────────────────────
@@ -282,6 +319,33 @@ class CanalTecnico:
         )
         return {"ok": True}
 
+    def _instalando(self) -> str | None:
+        """La actualización que se está instalando ahora, si hay una."""
+        for entity_id, st in self._store.get_all_states().items():
+            if entity_id.startswith("update.") and _leer(
+                getattr(st, "attributes", None), "in_progress"
+            ):
+                return entity_id
+        return None
+
+    async def respaldo(self) -> dict[str, Any]:
+        """Un respaldo completo. Se contesta antes: tarda minutos."""
+        nombre = time.strftime("UniquexCR %Y-%m-%d %H:%M UTC", time.gmtime())
+        self._despues(
+            lambda: self._ws(
+                {
+                    "type": "call_service",
+                    "domain": "hassio",
+                    "service": "backup_full",
+                    "service_data": {"name": nombre},
+                },
+                timeout=3600.0,
+            ),
+            demora=0.5,
+        )
+        logger.warning("tecnico.respaldo_programado", nombre=nombre)
+        return {"programado": True, "nombre": nombre}
+
     async def actualizar(self, entity_id: str, respaldo: bool = True) -> dict[str, Any]:
         if not entity_id.startswith("update."):
             raise TecnicoProhibido("eso no es una actualización")
@@ -289,10 +353,15 @@ class CanalTecnico:
         if st is None:
             raise TecnicoProhibido(f"no existe {entity_id!r}")
         attrs = getattr(st, "attributes", None) or {}
-        nombre = str(_leer(attrs, "friendly_name") or entity_id)
-        el_mirror = es_el_mirror(entity_id, nombre)
-        if not el_mirror and repo_de_la_actualizacion(attrs) not in REPOS_ACTUALIZABLES:
-            raise TecnicoProhibido(f"{entity_id!r} no se actualiza por este canal: va a mano")
+        if _NUNCA_ACTUALIZAR.search(_campo_de(entity_id, attrs)):
+            raise TecnicoProhibido(
+                "Dahua no se actualiza: la versión nueva no arranca en esta casa y apaga las cámaras"
+            )
+        if getattr(st, "state", None) != "on":
+            raise TecnicoProhibido(f"{entity_id!r} ya está al día")
+        otra = self._instalando()
+        if otra is not None:
+            raise TecnicoProhibido(f"ya se está instalando {otra!r}: esperá a que termine")
         datos: dict[str, Any] = {"entity_id": entity_id}
         if respaldo and int(_leer(attrs, "supported_features") or 0) & _SOPORTA_RESPALDO:
             datos["backup"] = True
@@ -305,21 +374,20 @@ class CanalTecnico:
                     "service": "install",
                     "service_data": datos,
                 },
-                timeout=900.0,
+                timeout=3600.0,
             )
 
-        if el_mirror:
-            # Al actualizarse, el Supervisor apaga ESTE proceso: se contesta primero.
-            self._despues(llamada, demora=2.0)
-            logger.warning(
-                "tecnico.actualizar_mirror_programado",
-                entity_id=entity_id,
-                respaldo="backup" in datos,
-            )
-            return {"programado": True, "respaldo": "backup" in datos}
-        await llamada()
-        logger.warning("tecnico.actualizado", entity_id=entity_id, respaldo="backup" in datos)
-        return {"programado": False, "respaldo": "backup" in datos}
+        # Siempre se contesta primero (ver el docstring del módulo): el Mirror se
+        # apaga a sí mismo, el sistema operativo reinicia la caja, y lo demás tarda
+        # más que los 100 s que Cloudflare espera.
+        self._despues(llamada, demora=2.0)
+        logger.warning(
+            "tecnico.actualizacion_programada",
+            entity_id=entity_id,
+            el_mirror=es_el_mirror(entity_id, str(_leer(attrs, "friendly_name") or "")),
+            respaldo="backup" in datos,
+        )
+        return {"programado": True, "respaldo": "backup" in datos}
 
     async def reiniciar_ha(self) -> dict[str, Any]:
         self._despues(

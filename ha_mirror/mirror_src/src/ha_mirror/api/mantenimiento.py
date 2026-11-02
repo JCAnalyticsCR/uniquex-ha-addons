@@ -29,7 +29,10 @@ El segundo grupo es distinto y también importa: Core, el sistema operativo, el
 Supervisor, el túnel Cloudflared, el puente eWeLink y go2rtc no son peligrosos
 por estar rotos — son peligrosos porque si uno falla, **la casa queda
 incomunicada o ciega y el dueño no tiene cómo recuperarla desde el teléfono**.
-Esos los instala quien pueda llegar a la cajita.
+Esos los instalamos NOSOTROS, a distancia, por el canal técnico (`tecnico.py`,
+0.54.1+): el dueño no los toca, pero nadie tiene que ir a la casa. Antes decía
+"los instala quien pueda llegar a la cajita" — esa barrera no la pidió nadie
+(Jeyrell, 2026-11-01: la administración remota ES el producto).
 
 ── EL RESPALDO VA ANTES, DONDE SE PUEDE ──────────────────────────────────────
 `update.install` acepta `backup: true` y acá no es opcional. Una actualización
@@ -85,48 +88,49 @@ _PROHIBIDAS: tuple[tuple[re.Pattern[str], str], ...] = (
     ),
 )
 
-#: Se muestran, pero las instala quien pueda llegar a la cajita. Si una de
-#: estas falla, la casa queda incomunicada o ciega y la app no puede rescatarla.
+#: Se muestran, pero no las instala el dueño desde el teléfono: las instala el
+#: equipo de UniquexCR a distancia, por el canal técnico. Si una de estas falla,
+#: la casa queda incomunicada o ciega, y eso lo atiende quien la puede rescatar.
 _SOLO_TECNICO: tuple[tuple[re.Pattern[str], str], ...] = (
     (
         re.compile(r"cloudflared|t[úu]nel", re.I),
-        "Es la única puerta de entrada a la casa. Si la actualización sale mal, "
-        "la app deja de alcanzarla y hay que ir en persona.",
+        "Es la única puerta de entrada a la casa. "
+        "La instala el equipo de UniquexCR a distancia, con un respaldo antes.",
     ),
     (
         re.compile(r"home_assistant_core|_core_actualizar|\bcore\b", re.I),
-        "Es el motor de la casa. Un salto de versión puede dejar integraciones "
-        "sin cargar; lo hace el técnico con un respaldo verificado a mano.",
+        "Es el motor de la casa: un salto de versión puede dejar integraciones "
+        "sin cargar. La instala el equipo de UniquexCR a distancia, con un respaldo antes.",
     ),
     (
         re.compile(r"operating_system|supervisor", re.I),
-        "Toca el sistema de la cajita. Si algo sale mal no arranca, y desde el "
-        "teléfono no hay cómo recuperarla.",
+        "Toca el sistema de la cajita y la reinicia. "
+        "La instala el equipo de UniquexCR a distancia, con un respaldo antes.",
     ),
     (
         re.compile(r"ewelink", re.I),
-        "Es el puente de los apagadores eWeLink de la casa. Si no vuelve a levantar, "
-        "se quedan todos sin responder hasta que alguien lo reinicie.",
+        "Es el puente de los apagadores eWeLink de la casa. La instala el equipo "
+        "de UniquexCR a distancia y revisa que vuelvan todos.",
     ),
     (
         re.compile(r"go2rtc", re.I),
-        "Es lo que convierte las cámaras en video para la app. Si falla, se "
-        "apaga la sección Cámaras entera.",
+        "Es lo que convierte las cámaras en video para la app. La instala el "
+        "equipo de UniquexCR a distancia y revisa que vuelvan las cámaras.",
     ),
     (
         re.compile(r"\bhacs\b|get_hacs", re.I),
-        "Administra las integraciones de la comunidad. Lo actualiza el técnico "
-        "junto con lo que dependa de él.",
+        "Administra las integraciones de la comunidad. La actualiza el equipo "
+        "de UniquexCR a distancia, junto con lo que dependa de ella.",
     ),
     (
         re.compile(r"uniquexcr|\bmirror\b", re.I),
-        "Es el servidor que conecta esta app con la casa. Si la actualización "
-        "falla, la app deja de ver la casa y no puede arreglarse a sí misma.",
+        "Es el servidor que conecta esta app con la casa. La instala el equipo "
+        "de UniquexCR a distancia.",
     ),
     (
         re.compile(r"matter", re.I),
-        "Es lo que empareja los aparatos nuevos por código QR. Se actualiza "
-        "cuando no haya un alta en curso.",
+        "Es lo que empareja los aparatos nuevos por código QR. La instala el "
+        "equipo de UniquexCR a distancia, cuando no haya un alta en curso.",
     ),
 )
 

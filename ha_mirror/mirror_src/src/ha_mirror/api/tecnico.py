@@ -131,6 +131,11 @@ async def recargar_tienda(request: Request) -> dict[str, Any]:
     return await _hacer(_canal(request).recargar_tienda())
 
 
+@router.post("/respaldo", dependencies=DEPENDENCIAS, summary="Guarda un respaldo completo")
+async def respaldo(request: Request) -> dict[str, Any]:
+    return await _hacer(_canal(request).respaldo())
+
+
 @router.post(
     "/actualizar", dependencies=DEPENDENCIAS, summary="Instala una actualización (con respaldo)"
 )
